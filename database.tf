@@ -13,11 +13,11 @@ resource "aws_db_instance" "cv" {
   engine_version = "8.0"
 
   # Free Tier: db.t3.micro / db.t2.micro, up to 20GB gp2 storage, single-AZ.
-  instance_class        = "db.t3.micro"
-  allocated_storage     = 20
-  storage_type          = "gp2"
-  multi_az              = false
-  publicly_accessible   = false
+  instance_class      = "db.t3.micro"
+  allocated_storage   = 20
+  storage_type        = "gp2"
+  multi_az            = false
+  publicly_accessible = false
 
   db_name  = var.db_name
   username = var.db_username

@@ -39,8 +39,3 @@ variable "domain_service_instance_type" {
   type        = string
   default     = "t3.micro"
 }
-
-variable "key_pair_name" {
-  description = "Existing EC2 key pair name for SSH access"
-  type        = string
-}

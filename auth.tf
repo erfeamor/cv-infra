@@ -20,7 +20,7 @@ resource "aws_cognito_user_pool_client" "admin_react" {
   name         = "${var.project_name}-admin-react"
   user_pool_id = aws_cognito_user_pool.cv.id
 
-  generate_secret                     = false
+  generate_secret                      = false
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]

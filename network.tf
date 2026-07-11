@@ -26,13 +26,8 @@ resource "aws_security_group" "domain_service" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # No SSH ingress: shell access goes through SSM Session Manager, which
+  # needs only the instance profile (see iam.tf) and outbound HTTPS.
 
   egress {
     from_port   = 0

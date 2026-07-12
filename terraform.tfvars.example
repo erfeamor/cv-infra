@@ -1,4 +1,4 @@
-aws_region   = "us-east-1"
+aws_region   = "eu-west-3"
 project_name = "cv-project"
 environment  = "dev"
 

@@ -12,7 +12,7 @@ terraform {
   # backend "s3" {
   #   bucket = "cv-project-tfstate"
   #   key    = "cv-infra/terraform.tfstate"
-  #   region = "us-east-1"
+  #   region = "eu-west-3"
   # }
 }
 

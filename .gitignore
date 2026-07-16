@@ -8,3 +8,7 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# Terraform plan files embed variable values, including secrets — never commit
+*.tfplan
+tfplan*

@@ -3,6 +3,10 @@
 resource "aws_s3_bucket" "frontend" {
   bucket = "${var.project_name}-frontend-${var.environment}"
 
+  # Demo project: let terraform destroy remove the bucket even when it
+  # holds deployed frontend builds.
+  force_destroy = true
+
   tags = {
     Project = var.project_name
   }
@@ -50,6 +54,17 @@ resource "aws_cloudfront_origin_access_control" "frontend" {
   signing_protocol                  = "sigv4"
 }
 
+# Routes the two SPAs sharing this distribution: extension-less URIs rewrite
+# to the owning app's index.html (see functions/spa-router.js). A blanket
+# 403/404→/index.html error response would serve the *public* shell for
+# admin deep links, so routing happens per-request instead.
+resource "aws_cloudfront_function" "spa_router" {
+  name    = "${var.project_name}-spa-router"
+  runtime = "cloudfront-js-2.0"
+  publish = true
+  code    = file("${path.module}/functions/spa-router.js")
+}
+
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
   default_root_object = "index.html"
@@ -72,20 +87,11 @@ resource "aws_cloudfront_distribution" "frontend" {
         forward = "none"
       }
     }
-  }
 
-  # SPA fallback: React Router deep links hit S3 keys that don't exist;
-  # serve index.html instead so the client-side router can take over.
-  custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-
-  custom_error_response {
-    error_code         = 404
-    response_code      = 200
-    response_page_path = "/index.html"
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.spa_router.arn
+    }
   }
 
   restrictions {

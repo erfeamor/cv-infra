@@ -39,3 +39,32 @@ variable "domain_service_instance_type" {
   type        = string
   default     = "t3.micro"
 }
+
+variable "drone_instance_type" {
+  description = "EC2 instance type for the Drone CI host (Free Tier: t2.micro/t3.micro)"
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "drone_admin_username" {
+  description = "GitHub username granted Drone admin and allowed to log in"
+  type        = string
+  default     = "erfeamor"
+}
+
+variable "drone_rpc_secret" {
+  description = "Shared secret between the Drone server and runner (openssl rand -hex 16)"
+  type        = string
+  sensitive   = true
+}
+
+variable "drone_github_client_id" {
+  description = "Client ID of the GitHub OAuth app used by Drone"
+  type        = string
+}
+
+variable "drone_github_client_secret" {
+  description = "Client secret of the GitHub OAuth app used by Drone"
+  type        = string
+  sensitive   = true
+}

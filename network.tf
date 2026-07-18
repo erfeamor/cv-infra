@@ -41,6 +41,42 @@ resource "aws_security_group" "domain_service" {
   }
 }
 
+resource "aws_security_group" "drone" {
+  name        = "${var.project_name}-drone"
+  description = "Allows inbound HTTP(S) from GitHub (webhooks, OAuth callback) to the Drone CI host"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "Drone web UI / webhooks"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS (when TLS is added in front of Drone)"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # No SSH ingress: shell access goes through SSM Session Manager, same as the
+  # domain service instance.
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
 resource "aws_security_group" "database" {
   name        = "${var.project_name}-database"
   description = "Allows inbound MySQL from the domain service security group"

@@ -23,7 +23,10 @@ mock_provider "aws" {
 }
 
 variables {
-  db_password = "test-password-not-real"
+  db_password                = "test-password-not-real"
+  drone_rpc_secret           = "test-rpc-secret-not-real"
+  drone_github_client_id     = "test-client-id"
+  drone_github_client_secret = "test-client-secret-not-real"
 }
 
 run "plan_succeeds" {
@@ -42,5 +45,20 @@ run "plan_succeeds" {
   assert {
     condition     = aws_instance.domain_service.iam_instance_profile == aws_iam_instance_profile.domain_service.name
     error_message = "EC2 must carry the instance profile that grants SSM access"
+  }
+
+  assert {
+    condition     = aws_instance.drone.instance_type == var.drone_instance_type
+    error_message = "Drone instance type should come from var.drone_instance_type (Free Tier)"
+  }
+
+  assert {
+    condition     = aws_instance.drone.iam_instance_profile == aws_iam_instance_profile.drone.name
+    error_message = "Drone host must carry the instance profile that grants SSM access"
+  }
+
+  assert {
+    condition     = !contains([for rule in aws_security_group.drone.ingress : rule.from_port], 22)
+    error_message = "No SSH ingress on the Drone host — shell access is SSM Session Manager only"
   }
 }

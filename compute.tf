@@ -1,13 +1,16 @@
 # Runs cv-domain-service and cv-bff-node. Kept to a single Free Tier
 # t2/t3.micro instance for the demo rather than one EC2 per service.
 
+# The name pattern must pin the *standard* AL2023 image: a looser
+# "al2023-ami-*" also matches the ECS-optimized variant
+# (al2023-ami-ecs-hvm-…), which does not run our cloud-init user_data.
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["al2023-ami-*-x86_64"]
+    values = ["al2023-ami-2023.*-x86_64"]
   }
 }
 
@@ -45,6 +48,13 @@ resource "aws_instance" "domain_service" {
     aws_ssm_parameter.db_password,
     aws_ssm_parameter.cognito_issuer_uri,
   ]
+
+  # Amazon publishes new AL2023 AMIs continually; without this every apply
+  # after a release would replace the instance. Rebuild deliberately with
+  # `terraform apply -replace=aws_instance.domain_service`.
+  lifecycle {
+    ignore_changes = [ami]
+  }
 
   tags = {
     Name    = "${var.project_name}-domain-service"

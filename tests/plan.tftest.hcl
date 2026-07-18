@@ -61,4 +61,14 @@ run "plan_succeeds" {
     condition     = !contains([for rule in aws_security_group.drone.ingress : rule.from_port], 22)
     error_message = "No SSH ingress on the Drone host — shell access is SSM Session Manager only"
   }
+
+  assert {
+    condition     = aws_ecr_repository.domain_service.name == "${var.project_name}-domain-service"
+    error_message = "ECR repository name must follow the project prefix convention"
+  }
+
+  assert {
+    condition     = contains([for b in aws_cloudfront_distribution.frontend.ordered_cache_behavior : b.path_pattern], "/api/*")
+    error_message = "CloudFront must route /api/* to the domain service (mixed-content fix for the SPAs)"
+  }
 }

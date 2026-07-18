@@ -40,6 +40,12 @@ resource "aws_instance" "drone" {
     aws_ssm_parameter.drone_github_client_secret,
   ]
 
+  # AMI churn must never replace this host: Drone's state (repo activations,
+  # secrets) is SQLite on the instance volume.
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
   tags = {
     Name    = "${var.project_name}-drone"
     Project = var.project_name

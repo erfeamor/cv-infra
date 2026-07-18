@@ -75,6 +75,44 @@ resource "aws_cloudfront_distribution" "frontend" {
     origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
   }
 
+  # The SPAs are HTTPS, the domain service is plain HTTP:8080 — calling it
+  # directly would be blocked as mixed content. Routing /api/* through the
+  # distribution keeps the browser on HTTPS (and same-origin, so no CORS);
+  # CloudFront talks HTTP to the instance edge-to-origin.
+  origin {
+    domain_name = aws_eip.domain_service.public_dns
+    origin_id   = "domain-service-api"
+
+    custom_origin_config {
+      http_port              = 8080
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  # API passthrough: no caching (TTLs 0), Authorization forwarded for the
+  # Cognito JWTs. Must be declared before the default behavior catches /.
+  ordered_cache_behavior {
+    path_pattern           = "/api/*"
+    target_origin_id       = "domain-service-api"
+    viewer_protocol_policy = "https-only"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+
+    forwarded_values {
+      query_string = true
+      headers      = ["Authorization", "Content-Type", "Accept"]
+      cookies {
+        forward = "none"
+      }
+    }
+  }
+
   default_cache_behavior {
     target_origin_id       = "frontend-s3"
     viewer_protocol_policy = "redirect-to-https"

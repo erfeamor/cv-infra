@@ -23,6 +23,12 @@ resource "aws_iam_role_policy_attachment" "ssm_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Boot script pulls the cv-domain-service image from ECR.
+resource "aws_iam_role_policy_attachment" "ecr_read" {
+  role       = aws_iam_role.domain_service.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
 # Lets the services read their secrets from SSM Parameter Store at runtime.
 resource "aws_iam_role_policy" "read_parameters" {
   name = "read-cv-parameters"

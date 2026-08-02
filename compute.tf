@@ -42,6 +42,12 @@ resource "aws_instance" "domain_service" {
     cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name
   })
 
+  # A user_data edit changes how the box bootstraps, so it must actually
+  # re-provision the instance — without this, a plain `apply` updates user_data
+  # in state only and the new bootstrap never runs (AMI churn stays ignored and
+  # rebuilt deliberately via -replace, see the lifecycle block below).
+  user_data_replace_on_change = true
+
   # user_data reads these parameters at first boot, so they must exist first.
   depends_on = [
     aws_ssm_parameter.db_password,

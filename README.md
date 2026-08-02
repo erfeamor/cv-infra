@@ -11,8 +11,7 @@ Part of the [cv-project](../README.md) multi-repo. No dedicated pipeline yet (Te
 
 ## Resources
 
-- **EC2 t3.micro** — runs `cv-domain-service` (and `cv-bff-node` alongside it for the demo)
-- **RDS MySQL (Free Tier, db.t3.micro)** — backs `cv-database`
+- **EC2 t3.micro** — runs `cv-domain-service` **and a self-hosted MySQL 8.4 container** (Flyway-migrated at boot), plus `cv-bff-node` alongside it for the demo
 - **S3 + CloudFront** — hosts the built `cv-admin-react` / `cv-public-vanilla` static assets
 - **Cognito user pool + Hosted UI domain** — auth for `cv-admin-react`
 - **CloudWatch log groups** — one per backend service

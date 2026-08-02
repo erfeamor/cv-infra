@@ -77,27 +77,6 @@ resource "aws_security_group" "drone" {
   }
 }
 
-resource "aws_security_group" "database" {
-  name        = "${var.project_name}-database"
-  description = "Allows inbound MySQL from the domain service security group"
-  vpc_id      = data.aws_vpc.default.id
-
-  ingress {
-    description     = "MySQL from domain service"
-    from_port       = 3306
-    to_port         = 3306
-    protocol        = "tcp"
-    security_groups = [aws_security_group.domain_service.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Project = var.project_name
-  }
-}
+# MySQL is now self-hosted in a container on the domain-service instance
+# (localhost, docker `cv` network) rather than RDS, so no dedicated database
+# security group is needed — nothing outside the box reaches port 3306.

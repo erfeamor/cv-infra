@@ -14,11 +14,12 @@ terraform plan             # needs real AWS credentials + terraform.tfvars
 
 ## Layout
 
-One root module, one file per concern: `providers.tf`, `variables.tf`, `network.tf` (default VPC + SGs), `compute.tf` (EC2), `database.tf` (RDS), `frontend.tf` (S3+CloudFront), `auth.tf` (Cognito), `iam.tf`, `observability.tf` (log groups), `ssm.tf` (parameters), `outputs.tf`. New resources join the matching file or get a new single-concern file.
+One root module, one file per concern: `providers.tf`, `variables.tf`, `network.tf` (default VPC + SGs), `compute.tf` (EC2), `frontend.tf` (S3+CloudFront), `auth.tf` (Cognito), `iam.tf`, `observability.tf` (log groups), `ssm.tf` (parameters), `outputs.tf`. New resources join the matching file or get a new single-concern file. **MySQL is self-hosted** in a container on the domain-service EC2 (`templates/domain-service-user-data.sh`), not RDS — see the decision below.
 
 ## Binding constraints & decisions
 
-- **Free Tier**: EC2 `t2/t3.micro`, RDS `db.t3.micro` single-AZ ≤20GB gp2, default VPC (**no NAT gateway — not free**), CloudFront default cert. `terraform test` asserts the instance classes — keep those assertions passing.
+- **Free Tier**: EC2 `t2/t3.micro`, default VPC (**no NAT gateway — not free**), CloudFront default cert. `terraform test` asserts the EC2 instance types — keep those assertions passing.
+- **No RDS — MySQL is self-hosted** on the domain-service EC2 (MySQL 8.4 container, Flyway-migrated at boot, data on a host volume). This was a deliberate move off `db.t3.micro` RDS: it removed the instance cost **and** the MySQL 8.0 Extended Support per-vCPU charge that began Aug 2026. Trade-off: no managed backups/patching/HA — durability rests on the instance's volume, and a `mysqldump→S3` job is the intended backup. A `t3.small` is recommended over `t3.micro` for the DB+app box for RAM headroom.
 - **No SSH anywhere.** Shell access is SSM Session Manager via the instance profile in `iam.tf`. Do not add port-22 ingress or key pairs back.
 - Secrets flow: values land in SSM Parameter Store (`/cv-project/<env>/…`); services read them at runtime via the instance role. Never put secrets in tfvars committed files — `terraform.tfvars` is gitignored, `.example` carries placeholders.
 - `.terraform.lock.hcl` **is committed** (HashiCorp guidance). Provider/version bumps are their own PR.

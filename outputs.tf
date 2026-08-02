@@ -10,10 +10,6 @@ output "cognito_admin_client_id" {
   value = aws_cognito_user_pool_client.admin_react.id
 }
 
-output "database_endpoint" {
-  value = aws_db_instance.cv.endpoint
-}
-
 output "frontend_bucket_name" {
   value = aws_s3_bucket.frontend.bucket
 }

@@ -37,7 +37,6 @@ resource "aws_instance" "domain_service" {
     project_name      = var.project_name
     environment       = var.environment
     image             = "${aws_ecr_repository.domain_service.repository_url}:latest"
-    db_endpoint       = aws_db_instance.cv.endpoint
     db_name           = var.db_name
     db_username       = var.db_username
     cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name

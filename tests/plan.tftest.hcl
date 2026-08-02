@@ -32,11 +32,9 @@ variables {
 run "plan_succeeds" {
   command = plan
 
-  assert {
-    condition     = aws_db_instance.cv.instance_class == "db.t3.micro"
-    error_message = "RDS instance must stay on the Free Tier db.t3.micro class"
-  }
-
+  # MySQL is self-hosted on the domain-service EC2 (see compute.tf /
+  # templates/domain-service-user-data.sh) — there is no RDS instance to
+  # assert on anymore.
   assert {
     condition     = aws_instance.domain_service.instance_type == var.domain_service_instance_type
     error_message = "EC2 instance type should come from var.domain_service_instance_type"

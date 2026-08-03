@@ -29,6 +29,19 @@ One root module, one file per concern: `providers.tf`, `variables.tf`, `network.
 
 `tests/plan.tftest.hcl` uses `mock_provider "aws"` with mocked data sources so plans run without credentials — extend the mocks when you add data sources, and add an assertion when a task pins a resource property (e.g. Free Tier classes).
 
+## Code review guidance
+
+Priorities, ranked:
+
+1. **Security exposure.** Any new ingress rule wider than the resource needs (especially `0.0.0.0/0` on a non-web port), SSH/port-22 ingress or key pairs reintroduced, or a secret placed in a committed file rather than SSM Parameter Store / `terraform.tfvars` (gitignored).
+2. **Free Tier drift.** A resized instance class, added NAT gateway, or any resource that isn't Free-Tier-eligible without an explicit, deliberate note — `terraform test` assertions must be updated in the same PR if a class changes.
+3. **`user_data` changes without `user_data_replace_on_change`.** A bootstrap-script edit that doesn't force instance replacement will silently update Terraform state without ever re-provisioning the box (this exact bug shipped once — see git history on `compute.tf`).
+4. IAM policy changes broader than least-privilege (e.g. `Resource: "*"` where a scoped ARN would do).
+
+Don't flag:
+- Self-hosted MySQL 8.4 on the domain-service EC2 instead of RDS, or the lack of managed backups/HA for it — a deliberate, documented cost/lifecycle trade-off (mysqldump→S3 is the planned mitigation, tracked separately).
+- `lifecycle { ignore_changes = [ami] }` on the EC2 resources — intentional, rebuilt deliberately via `-replace`.
+
 ## Git workflow
 
 `master` is protected — feature branch (`feat/…`) → push → PR via `gh`. Definition of done: fmt + validate + test all pass offline.

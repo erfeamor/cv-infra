@@ -6,6 +6,18 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    # T-002: null_resource.jenkins_provision (ci.tf) drives the out-of-band
+    # SSM provisioning step; local_file stages its rendered script on disk
+    # so it can be handed to the AWS CLI without nested-heredoc quoting
+    # hazards.
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.4"
+    }
   }
 
   # Uncomment once a state bucket exists; local state is fine for the demo.

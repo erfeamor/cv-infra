@@ -12,3 +12,8 @@ override.tf.json
 # Terraform plan files embed variable values, including secrets — never commit
 *.tfplan
 tfplan*
+
+# T-002: local_file.jenkins_provision_script stages the rendered
+# provisioning script here for the out-of-band SSM apply step — generated,
+# never authored, never committed.
+/generated/

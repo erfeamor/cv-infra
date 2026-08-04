@@ -2,6 +2,12 @@
 # Bootstraps the Drone CI host: swap, Docker, then the Drone server and docker
 # runner containers. Secrets are fetched from SSM Parameter Store at boot via
 # the instance role, so nothing sensitive is baked into this script.
+#
+# T-002: Drone no longer publishes host port 80 directly. A reverse proxy
+# (templates/jenkins-provision.sh, appended after this script in user_data)
+# now owns 80/443 and fronts both Drone and Jenkins over the shared "drone"
+# docker network, so the SG's existing 80/443 rule keeps serving both
+# services without a new ingress rule or a new internet-facing port.
 set -euo pipefail
 
 # 1 GB of swap: parallel node builds OOM a bare t3.micro (1 GB RAM) without it.
@@ -28,7 +34,6 @@ docker network create drone
 
 docker run -d --name drone-server --restart unless-stopped \
   --network drone \
-  -p 80:80 \
   -v /var/lib/drone:/data \
   -e DRONE_GITHUB_CLIENT_ID="$GITHUB_CLIENT_ID" \
   -e DRONE_GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \

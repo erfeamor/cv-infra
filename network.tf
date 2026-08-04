@@ -43,11 +43,16 @@ resource "aws_security_group" "domain_service" {
 
 resource "aws_security_group" "drone" {
   name        = "${var.project_name}-drone"
-  description = "Allows inbound HTTP(S) from GitHub (webhooks, OAuth callback) to the Drone CI host"
+  description = "Allows inbound HTTP(S) from GitHub (webhooks, OAuth callback) to the Drone + Jenkins CI host"
   vpc_id      = data.aws_vpc.default.id
 
+  # T-002: since the reverse proxy went in (templates/jenkins-provision.sh),
+  # this single rule fronts both Drone (/) and Jenkins (/jenkins/). No new
+  # rule and no new internet-facing port were added for Jenkins -- it is
+  # reachable only via the proxy over the internal "drone" docker network,
+  # never on its own port.
   ingress {
-    description = "Drone web UI / webhooks"
+    description = "Drone + Jenkins web UI / webhooks, via the on-host reverse proxy"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"

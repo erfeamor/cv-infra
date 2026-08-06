@@ -95,6 +95,32 @@ run "plan_succeeds" {
     error_message = "The Jenkins GitHub PAT must follow the existing /project/env/ci/... SSM naming convention"
   }
 
+  # Review finding N5: catches a copy-paste that assigns the wrong variable
+  # to a secret parameter -- it would otherwise pass every assertion above.
+  assert {
+    condition     = aws_ssm_parameter.github_pat_ci.value == var.github_pat_ci
+    error_message = "aws_ssm_parameter.github_pat_ci must store var.github_pat_ci, not some other variable"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.jenkins_admin_password.value == var.jenkins_admin_password
+    error_message = "aws_ssm_parameter.jenkins_admin_password must store var.jenkins_admin_password, not some other variable"
+  }
+
+  # Review finding N5: this is the single load-bearing invariant of the
+  # whole out-of-band-provisioning approach (H1 decision 1) -- if this ever
+  # flips to true, aws_instance.drone gets destroyed/recreated on every
+  # user_data edit instead of being provisioned out-of-band, wiping Drone's
+  # SQLite state. Assert it explicitly so a future edit can't reintroduce it
+  # silently.
+  assert {
+    # Left unset in config, this attribute plans as null rather than a
+    # resolved false -- assert it's not explicitly true rather than
+    # requiring exact equality with false.
+    condition     = aws_instance.drone.user_data_replace_on_change != true
+    error_message = "aws_instance.drone must NOT set user_data_replace_on_change -- Jenkins is provisioned out-of-band via SSM specifically so this box is never replaced (H1 decision 1)"
+  }
+
   assert {
     condition     = aws_ecr_repository.domain_service.name == "${var.project_name}-domain-service"
     error_message = "ECR repository name must follow the project prefix convention"

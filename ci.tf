@@ -68,6 +68,14 @@ resource "aws_instance" "drone" {
   # user_data_replace_on_change (see header comment) -- on the box that is
   # live today this changes Terraform state only; Jenkins gets installed on
   # it via null_resource.jenkins_provision instead.
+  #
+  # Size: rendered, this comes to ~14.8 KB against EC2's 16 KB user_data
+  # limit (~90%) -- measured by hand outside this repo, since this worktree
+  # has no state to `terraform console` against. That's real but not
+  # generous headroom; templates/jenkins-provision.sh comments were already
+  # trimmed once to fit (see its own header) -- a future addition to either
+  # template should re-measure before assuming there's room, and trim
+  # comments rather than logic if it doesn't fit.
   user_data = join("\n", [
     templatefile("${path.module}/templates/drone-user-data.sh", {
       aws_region     = var.aws_region
@@ -124,14 +132,30 @@ resource "local_file" "jenkins_provision_script" {
 # Runs the exact same script as the user_data path above via SSM Run
 # Command instead of relying on cloud-init re-executing, which it will not
 # (see header comment). Idempotent: the script itself guards every
-# docker/network operation, so re-running this -- e.g. after editing the
-# script and re-applying -- never fails on "container name already in use"
-# and never duplicates state.
+# docker/network operation (and now takes a local flock -- see the script --
+# so a reflexive re-apply can't race a still-running first invocation), so
+# re-running this -- e.g. after editing the script and re-applying -- never
+# fails on "container name already in use" and never duplicates state.
 #
 # Requires the AWS CLI and jq on the machine running `terraform apply`
-# (not the instance role) with ssm:SendCommand / ssm:GetCommandInvocation
-# permission. Provisioners only run on apply, never on plan/test, so this
-# is inert for the offline gates.
+# (not the instance role) with ssm:SendCommand / ssm:GetCommandInvocation /
+# ssm:DescribeInstanceInformation permission. Provisioners only run on
+# apply, never on plan/test, so this is inert for the offline gates.
+#
+# Review findings B3 and B4, both about the exact apply this PR exists to
+# perform:
+#   B4 -- this same apply resizes aws_instance.drone (t3.micro -> t3.small),
+#   an in-place stop/modify/start. The AWS API returns once the instance is
+#   `running`, but the SSM agent only re-registers 30-90s later; sending the
+#   command immediately would hit InvalidInstanceId. So: wait for the agent
+#   to report Online via describe-instance-information before sending
+#   anything.
+#   B3 -- `aws ssm wait command-executed` uses botocore's fixed
+#   delay=5/maxAttempts=20 (100s) waiter, but the first real run pulls two
+#   multi-hundred-MB images, runs jenkins-plugin-cli over several plugins,
+#   and builds a custom image, comfortably past 100s on a t3.small. Poll
+#   get-command-invocation directly instead, with a timeout sized for a
+#   cold image cache.
 resource "null_resource" "jenkins_provision" {
   triggers = {
     script_sha  = sha256(local.jenkins_provision_script)
@@ -141,16 +165,65 @@ resource "null_resource" "jenkins_provision" {
   provisioner "local-exec" {
     command = <<-EOT
       set -euo pipefail
+      region="${var.aws_region}"
+      instance_id="${aws_instance.drone.id}"
+
+      echo "Waiting for the SSM agent to report Online on $instance_id (this apply's own stop/modify/start needs it to re-register)..."
+      agent_elapsed=0
+      agent_timeout_s=300
+      agent_poll_s=10
+      while :; do
+        ping_status=$(aws ssm describe-instance-information --region "$region" \
+          --filters "Key=InstanceIds,Values=$instance_id" \
+          --query "InstanceInformationList[0].PingStatus" --output text 2>/dev/null || echo "None")
+        if [ "$ping_status" = "Online" ]; then
+          break
+        fi
+        if [ "$agent_elapsed" -ge "$agent_timeout_s" ]; then
+          echo "SSM agent on $instance_id did not report Online within $${agent_timeout_s}s (last status: $ping_status)" >&2
+          exit 1
+        fi
+        sleep "$agent_poll_s"
+        agent_elapsed=$((agent_elapsed + agent_poll_s))
+      done
+
       payload_file=$(mktemp)
       trap 'rm -f "$payload_file"' EXIT
-      jq -n --rawfile s "${local_file.jenkins_provision_script.filename}" --arg iid "${aws_instance.drone.id}" \
+      jq -n --rawfile s "${local_file.jenkins_provision_script.filename}" --arg iid "$instance_id" \
         '{"InstanceIds":[$iid],"DocumentName":"AWS-RunShellScript","Comment":"cv-infra T-002: provision Jenkins + reverse proxy","Parameters":{"commands":[$s]}}' \
         >"$payload_file"
-      cmd_id=$(aws ssm send-command --region "${var.aws_region}" \
+      cmd_id=$(aws ssm send-command --region "$region" \
         --cli-input-json "file://$payload_file" \
         --query "Command.CommandId" --output text)
-      aws ssm wait command-executed --region "${var.aws_region}" \
-        --command-id "$cmd_id" --instance-id "${aws_instance.drone.id}"
+      echo "SSM command $cmd_id sent to $instance_id, polling for completion..."
+
+      cmd_elapsed=0
+      cmd_timeout_s=1800
+      cmd_poll_s=15
+      while :; do
+        status=$(aws ssm get-command-invocation --region "$region" \
+          --command-id "$cmd_id" --instance-id "$instance_id" \
+          --query "Status" --output text 2>/dev/null || echo "Pending")
+        case "$status" in
+          Success)
+            echo "SSM command $cmd_id succeeded."
+            break
+            ;;
+          Failed | Cancelled | TimedOut | Undeliverable | Terminated)
+            echo "SSM command $cmd_id ended with status $status; stderr:" >&2
+            aws ssm get-command-invocation --region "$region" \
+              --command-id "$cmd_id" --instance-id "$instance_id" \
+              --query "StandardErrorContent" --output text >&2 || true
+            exit 1
+            ;;
+        esac
+        if [ "$cmd_elapsed" -ge "$cmd_timeout_s" ]; then
+          echo "SSM command $cmd_id did not finish within $${cmd_timeout_s}s (last status: $status)" >&2
+          exit 1
+        fi
+        sleep "$cmd_poll_s"
+        cmd_elapsed=$((cmd_elapsed + cmd_poll_s))
+      done
     EOT
   }
 

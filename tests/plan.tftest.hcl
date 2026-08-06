@@ -95,6 +95,23 @@ run "plan_succeeds" {
     error_message = "The Jenkins GitHub PAT must follow the existing /project/env/ci/... SSM naming convention"
   }
 
+  # NOT tested here, deliberately: whether the Jenkins multibranch job
+  # configs declare traits{} (and never gitHubForkDiscovery) lives inside
+  # local.jenkins_provision_script, which embeds aws_eip.drone.public_ip
+  # (via templatefile's server_host argument). That EIP doesn't exist yet
+  # in this run's plan, so its public_ip -- and therefore the whole
+  # rendered string -- is unknown-until-apply, not just at this specific
+  # spot but for the entire templatefile() output. Terraform test's
+  # `command = plan` cannot evaluate a condition against an unknown value
+  # (confirmed by trying: "Condition expression could not be evaluated...
+  # execute an `apply` command from this `run` block"), so no assertion
+  # against this local's content -- strong or weak -- has purchase here.
+  # A real check would need a `command = apply` run (safe under
+  # mock_provider, since nothing real gets created, but a bigger change to
+  # this test file's structure than this directed fix warrants) or a
+  # parallel test-only render that doesn't actually verify the deployed
+  # artifact. Left for a future task rather than invented here.
+
   # Review finding N5: catches a copy-paste that assigns the wrong variable
   # to a secret parameter -- it would otherwise pass every assertion above.
   assert {

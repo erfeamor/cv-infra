@@ -103,6 +103,18 @@ jobs:
                 repoOwner('erfeamor')
                 repository('cv-domain-service')
                 credentialsId('github-pat')
+                // Public repo + mounted docker.sock: an untrusted
+                // Jenkinsfile is RCE-on-host. Explicit traits pin this --
+                // branches + origin PRs on, fork PRs deliberately absent.
+                // Not boilerplate; do not delete.
+                traits {
+                  gitHubBranchDiscovery {
+                    strategyId(1) // exclude branches also filed as a PR
+                  }
+                  gitHubPullRequestDiscovery {
+                    strategyId(1) // merge PR with target branch, then build
+                  }
+                }
               }
             }
           }
@@ -121,6 +133,15 @@ jobs:
                 repoOwner('erfeamor')
                 repository('cv-database')
                 credentialsId('github-pat')
+                // Same reasoning as cv-domain-service above -- not boilerplate.
+                traits {
+                  gitHubBranchDiscovery {
+                    strategyId(1)
+                  }
+                  gitHubPullRequestDiscovery {
+                    strategyId(1)
+                  }
+                }
               }
             }
           }

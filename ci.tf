@@ -69,13 +69,16 @@ resource "aws_instance" "drone" {
   # live today this changes Terraform state only; Jenkins gets installed on
   # it via null_resource.jenkins_provision instead.
   #
-  # Size: rendered, this comes to ~14.8 KB against EC2's 16 KB user_data
-  # limit (~90%) -- measured by hand outside this repo, since this worktree
-  # has no state to `terraform console` against. That's real but not
-  # generous headroom; templates/jenkins-provision.sh comments were already
-  # trimmed once to fit (see its own header) -- a future addition to either
-  # template should re-measure before assuming there's room, and trim
-  # comments rather than logic if it doesn't fit.
+  # Size: rendered, this comes to roughly 14 KB against EC2's 16 KB
+  # user_data limit (~86%) -- measured by hand outside this repo, since this
+  # worktree has no state to `terraform console` against, so treat the
+  # exact figure as approximate and re-measure after any edit. Two rounds of
+  # review findings each grew jenkins-provision.sh enough to push the render
+  # over budget; both times its own comments (not its logic) were cut back
+  # to fit, which is why they read tersely -- that's deliberate. A future
+  # addition to either template should re-measure before assuming there's
+  # room, and expect to trim comments again rather than logic if it doesn't
+  # fit.
   user_data = join("\n", [
     templatefile("${path.module}/templates/drone-user-data.sh", {
       aws_region     = var.aws_region
@@ -200,16 +203,51 @@ resource "null_resource" "jenkins_provision" {
       cmd_elapsed=0
       cmd_timeout_s=1800
       cmd_poll_s=15
+      consecutive_errors=0
+      max_consecutive_errors=5
       while :; do
-        status=$(aws ssm get-command-invocation --region "$region" \
+        # get-command-invocation legitimately 404s (InvocationDoesNotExist)
+        # for a few seconds right after send-command, before AWS finishes
+        # propagating the record -- that's the only error worth swallowing
+        # as "still pending". Anything else (expired creds, throttling) is a
+        # real failure and must not be silently retried for the full
+        # timeout, so errors are counted and capped separately from it.
+        # The `if` condition here is exempt from `set -e` -- a plain
+        # `var=$(cmd)` assignment is NOT, and would otherwise abort the
+        # whole script the moment the AWS CLI call fails once, before this
+        # error-counting logic ever runs.
+        if invocation_output=$(aws ssm get-command-invocation --region "$region" \
           --command-id "$cmd_id" --instance-id "$instance_id" \
-          --query "Status" --output text 2>/dev/null || echo "Pending")
+          --query "Status" --output text 2>&1); then
+          rc=0
+        else
+          rc=$?
+        fi
+        if [ "$rc" -ne 0 ]; then
+          if echo "$invocation_output" | grep -q "InvocationDoesNotExist"; then
+            status="Pending"
+            consecutive_errors=0
+          else
+            consecutive_errors=$((consecutive_errors + 1))
+            echo "get-command-invocation failed (attempt $consecutive_errors/$max_consecutive_errors): $invocation_output" >&2
+            if [ "$consecutive_errors" -ge "$max_consecutive_errors" ]; then
+              echo "Giving up after $max_consecutive_errors consecutive get-command-invocation errors on $cmd_id" >&2
+              exit 1
+            fi
+            sleep "$cmd_poll_s"
+            cmd_elapsed=$((cmd_elapsed + cmd_poll_s))
+            continue
+          fi
+        else
+          status="$invocation_output"
+          consecutive_errors=0
+        fi
         case "$status" in
           Success)
             echo "SSM command $cmd_id succeeded."
             break
             ;;
-          Failed | Cancelled | TimedOut | Undeliverable | Terminated)
+          Failed | Cancelled | Cancelling | TimedOut | Undeliverable | Terminated)
             echo "SSM command $cmd_id ended with status $status; stderr:" >&2
             aws ssm get-command-invocation --region "$region" \
               --command-id "$cmd_id" --instance-id "$instance_id" \

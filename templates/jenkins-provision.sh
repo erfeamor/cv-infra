@@ -1,18 +1,14 @@
 #!/bin/bash
-# T-002: provisions Jenkins + reverse proxy on the Drone host. Used both
-# appended to aws_instance.drone's user_data (future boots) and pushed
-# out-of-band via SSM to the live instance (see ci.tf header for the full
-# rationale -- kept out of this file to stay under the EC2 user_data size
-# limit). All docker/network ops below are convergent and idempotent:
-# re-running never fails on "name already in use" and corrects drift.
+# T-002: Jenkins + reverse proxy on the Drone host. Used both in user_data
+# (future boots) and pushed via SSM to the live instance (rationale in
+# ci.tf, kept out of here for user_data size). All ops are convergent and
+# idempotent.
 set -euo pipefail
 
-# Concurrency guard: two invocations (out-of-band + a future user_data boot,
-# or two reflexive re-applies) must not race two `docker run --name X` calls
-# for the same container.
+# Concurrency guard; waits (not fail-fast) since both paths are idempotent.
 exec 200>/var/lock/cv-ci-provision.lock
-if ! flock -n 200; then
-  echo "jenkins-provision: another run is already in progress -- exiting" >&2
+if ! flock -w 1500 200; then
+  echo "jenkins-provision: another run held the lock for over 1500s -- exiting" >&2
   exit 1
 fi
 
@@ -22,10 +18,7 @@ param() {
     --query Parameter.Value --output text
 }
 
-# Recreates container $1 (rest of args = `docker run` opts, image last)
-# whenever it's missing, not running, its image digest no longer matches
-# $2, or its mounted config has drifted from the fingerprint in $3 (config
-# edits don't change the image, so image-drift alone would miss them).
+# Recreates $1 (opts.., image last) when missing/stopped/drifted ($2 image, $3 config hash).
 recreate_if_needed() {
   local name="$1" image="$2" config_hash="$3"
   shift 3
@@ -39,21 +32,18 @@ recreate_if_needed() {
       return 0
     fi
     echo "recreate_if_needed: recreating $name (running=$running, image-drift=$([ "$current_id" != "$wanted_id" ] && echo yes || echo no), config-drift=$([ "$current_hash" != "$config_hash" ] && echo yes || echo no))"
-    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker rm -f -v "$name" >/dev/null 2>&1 || true # -v: drop anon volumes too
   fi
   docker run -d --name "$name" --label "cv_config_hash=$config_hash" "$@" "$image"
 }
 
 docker network inspect drone >/dev/null 2>&1 || docker network create drone
 
-# --- Jenkins: files/image first, containers last; Drone is untouched until
-# the remediation block near the end, to keep its outage window tight. ----
-#
-# JENKINS_HOME is a host bind mount kept at an *identical path* inside and
-# outside the container: sibling containers Jenkins launches over the
-# mounted docker socket are resolved by the *host* daemon against the host
-# filesystem, so "$WORKSPACE/x" only maps to a real host dir if $WORKSPACE
-# means the same path on both sides.
+# Jenkins: files/image first, containers last (Drone untouched till the end).
+# JENKINS_HOME mounted at an identical host/container path -- sibling
+# containers launched via the socket resolve host paths, so $WORKSPACE
+# must mean the same thing both sides. HOME overridden too (image bakes
+# HOME=/var/jenkins_home) so ~/.m2 isn't a discarded anon volume.
 JENKINS_HOME_DIR=/var/lib/jenkins
 mkdir -p "$JENKINS_HOME_DIR" "$JENKINS_HOME_DIR/init.groovy.d"
 mkdir -p /var/lib/jenkins-casc
@@ -61,20 +51,12 @@ mkdir -p /var/lib/jenkins-casc
 JENKINS_ADMIN_PASSWORD=$(param jenkins-admin-password)
 GITHUB_PAT=$(param github-pat)
 
-# Escaping: this file is rendered by Terraform's templatefile() before it
-# reaches the instance. Any dollar-brace pair below meant to resolve later
-# (JCasC reading its own container env; Docker expanding ENV at image build)
-# is written doubled ($${...}) so templatefile emits a literal single-dollar
-# form instead of trying to resolve it as an HCL var now. Plain single-$
-# references like aws_region are genuine template vars and stay unescaped.
-#
-# Security does NOT depend on this YAML applying cleanly: a configurator
-# error aborts the whole JCasC document, and runSetupWizard=false with no
-# realm applied means an unauthenticated Jenkins. init.groovy.d below sets
-# the same realm/authorization via the Jenkins API directly (core, plugin-
-# independent), so lockdown holds even if this YAML fails outright.
-# JDK/Maven use fixed `home:` paths, not auto-installer plugins, since none
-# ship in plugins.txt.
+# Doubled-dollar placeholders below resolve later (JCasC/Docker env), not
+# now via templatefile(). Security doesn't depend on this YAML applying
+# cleanly -- a configurator error aborts the whole doc, so init.groovy.d
+# below sets the same realm/authorization via the Jenkins API directly
+# (plugin-independent) as a fail-closed fallback. JDK/Maven use fixed
+# `home:` paths, not auto-installer plugins (none in plugins.txt).
 cat >/var/lib/jenkins-casc/jenkins.yaml <<'CASC_EOF'
 jenkins:
   systemMessage: "cv-project Jenkins -- provisioned by cv-infra (T-002)"
@@ -100,11 +82,15 @@ tool:
 credentials:
   system:
     domainCredentials:
+      # usernamePassword, NOT Secret Text: github-branch-source looks up
+      # StandardUsernamePasswordCredentials specifically and silently falls
+      # back to anonymous (no commit-status POST) otherwise.
       - credentials:
-          - string:
+          - usernamePassword:
               scope: GLOBAL
               id: "github-pat"
-              secret: "$${GITHUB_PAT}"
+              username: "x-access-token"
+              password: "$${GITHUB_PAT}"
               description: "cv-project GitHub PAT (commit-status only, T-002)"
 jobs:
   - script: |
@@ -145,9 +131,6 @@ jobs:
       }
 CASC_EOF
 
-# Fail-closed security fallback (see note above): runs on every Jenkins
-# startup regardless of JCasC's own success. Reads the same env, never a
-# literal secret.
 cat >"$JENKINS_HOME_DIR/init.groovy.d/basic-security.groovy" <<'GROOVY_EOF'
 import jenkins.model.*
 import hudson.security.*
@@ -176,15 +159,9 @@ job-dsl
 pipeline-stage-view
 PLUGINS_EOF
 
-# Bind mounts don't inherit image ownership: JENKINS_HOME must be owned by
-# the image's uid/gid 1000 ("jenkins") or the container fails to write
-# config.xml on first start. Do this last, after every file above exists.
+# Bind mounts don't inherit image ownership -- chown to uid/gid 1000 or
+# the container fails to write config.xml on first start.
 chown -R 1000:1000 "$JENKINS_HOME_DIR"
-
-# Custom image: plugins baked in at build (`docker cp` after start is too
-# late), Maven at a fixed path (no auto-installer plugin/runtime download),
-# and the docker CLI for both Jenkinsfiles' `agent any` stages to call the
-# mounted host socket. `docker build` is cache-idempotent, cheap to re-run.
 mkdir -p /opt/jenkins-image
 cp /var/lib/jenkins-casc/plugins.txt /opt/jenkins-image/plugins.txt
 cat >/opt/jenkins-image/Dockerfile <<'DOCKERFILE_EOF'
@@ -193,10 +170,13 @@ COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
 RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
 
 USER root
-RUN curl -fsSL -o /tmp/maven.tar.gz https://dlcdn.apache.org/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz \
+# archive.apache.org (immutable; dlcdn 404s once superseded), sha512-verified.
+RUN curl -fsSL -o /tmp/maven.tar.gz https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz \
+  && curl -fsSL -o /tmp/maven.tar.gz.sha512 https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz.sha512 \
+  && echo "$(awk '{print $1}' /tmp/maven.tar.gz.sha512)  /tmp/maven.tar.gz" | sha512sum -c - \
   && tar -xzf /tmp/maven.tar.gz -C /opt \
   && ln -s /opt/apache-maven-3.9.9 /opt/maven \
-  && rm -f /tmp/maven.tar.gz \
+  && rm -f /tmp/maven.tar.gz /tmp/maven.tar.gz.sha512 \
   && apt-get update \
   && apt-get install -y --no-install-recommends docker.io \
   && rm -rf /var/lib/apt/lists/*
@@ -206,14 +186,14 @@ USER jenkins
 DOCKERFILE_EOF
 docker build -t cv-jenkins:local /opt/jenkins-image
 
-# Host docker.sock GID is only known at run time -- granted as a
-# supplementary group on the container's uid-1000 user, not baked into the
-# image (accepted trade-off, recorded in the PR body).
+# Host docker.sock GID known only at run time (accepted trade-off, PR body).
 DRONE_HOST_DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
 
-# Fingerprint the mounted JCasC/groovy config so recreate_if_needed also
-# catches a config-only edit (it doesn't change the image digest).
-JENKINS_CONFIG_HASH=$(sha256sum /var/lib/jenkins-casc/jenkins.yaml "$JENKINS_HOME_DIR/init.groovy.d/basic-security.groovy" | sha256sum | awk '{print $1}')
+# Fingerprints config + GID + secrets (via process substitution, never a
+# file) so a rotated secret/changed GID isn't missed by image-digest alone.
+JENKINS_CONFIG_HASH=$(cat /var/lib/jenkins-casc/jenkins.yaml "$JENKINS_HOME_DIR/init.groovy.d/basic-security.groovy" \
+  <(echo "$DRONE_HOST_DOCKER_GID") <(echo "$JENKINS_ADMIN_PASSWORD") <(echo "$GITHUB_PAT") \
+  | sha256sum | awk '{print $1}')
 
 recreate_if_needed jenkins cv-jenkins:local "$JENKINS_CONFIG_HASH" \
   --restart unless-stopped \
@@ -221,6 +201,7 @@ recreate_if_needed jenkins cv-jenkins:local "$JENKINS_CONFIG_HASH" \
   --group-add "$DRONE_HOST_DOCKER_GID" \
   -v "$JENKINS_HOME_DIR:$JENKINS_HOME_DIR" \
   -e JENKINS_HOME="$JENKINS_HOME_DIR" \
+  -e HOME="$JENKINS_HOME_DIR" \
   -v /var/lib/jenkins-casc/jenkins.yaml:/var/jenkins_casc/jenkins.yaml:ro \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e JAVA_OPTS="-Djenkins.install.runSetupWizard=false" \
@@ -229,14 +210,11 @@ recreate_if_needed jenkins cv-jenkins:local "$JENKINS_CONFIG_HASH" \
   -e JENKINS_ADMIN_USER="${jenkins_admin_username}" \
   -e JENKINS_ADMIN_PASSWORD="$JENKINS_ADMIN_PASSWORD" \
   -e GITHUB_PAT="$GITHUB_PAT"
-# No -p 8080:8080 anywhere: Jenkins is reachable only over the "drone"
-# docker network, from the proxy container below -- no SG change needed.
+# No -p 8080:8080: Jenkins is reachable only over "drone", via the proxy.
 
-# --- Reverse proxy: fronts Drone (/) and Jenkins (/jenkins/) on 80/443 ---
-# `resolver` + variable proxy_pass targets force nginx to re-resolve
-# container names per request via Docker's embedded DNS instead of caching
-# an IP once at config load, so recreating an upstream doesn't 502 the proxy
-# until it's restarted too.
+# Reverse proxy fronts Drone (/) and Jenkins (/jenkins/) on 80/443.
+# resolver + variable proxy_pass re-resolve container names per request
+# instead of caching an IP, so an upstream recreate doesn't 502.
 mkdir -p /etc/ci-proxy
 cat >/etc/ci-proxy/nginx.conf <<'NGINX_EOF'
 events {}
@@ -247,8 +225,12 @@ http {
     listen 80;
 
     location /jenkins/ {
+      # No URI part after the variable: with one, nginx replaces the whole
+      # request URI with it on every request (collapsing every path to a
+      # bare /jenkins/); with none, the original URI passes through, which
+      # --prefix=/jenkins expects.
       set $jenkins_upstream http://jenkins:8080;
-      proxy_pass $jenkins_upstream/jenkins/;
+      proxy_pass $jenkins_upstream;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -259,9 +241,7 @@ http {
       proxy_request_buffering off;
     }
 
-    # Everything else (GitHub's /hook POSTs, Drone's OAuth login/callback)
-    # goes to Drone untouched: no path prefix, no Host rewrite -- the OAuth
-    # callback URL stays byte-for-byte what it was when Drone bound :80.
+    # Everything else (GitHub /hook, Drone OAuth) goes to Drone untouched.
     location / {
       set $drone_upstream http://drone-server:80;
       proxy_pass $drone_upstream;
@@ -274,12 +254,9 @@ http {
 }
 NGINX_EOF
 
-# --- Remediate a drone-server still publishing host :80 directly ---------
-# Kept last and as tight as possible: secrets fetched right before use, and
-# the only work between `docker rm` and the new container being `Up` is the
-# `docker run` call itself. Drone's SQLite state lives on the /var/lib/drone
-# bind mount, not the container, so this is safe and idempotent -- once
-# done, the port binding below is gone and every later run is a no-op.
+# Remediates a drone-server still publishing :80 directly; kept last and
+# tight (secrets fetched right before use). State is on the bind mount, so
+# recreation is safe and this is a no-op once done.
 if docker inspect drone-server >/dev/null 2>&1; then
   drone_port80_binding=$(docker inspect -f '{{index .HostConfig.PortBindings "80/tcp"}}' drone-server 2>/dev/null || echo "")
   if [ -n "$drone_port80_binding" ] && [ "$drone_port80_binding" != "<no value>" ] && [ "$drone_port80_binding" != "[]" ] && [ "$drone_port80_binding" != "map[]" ]; then
@@ -308,3 +285,21 @@ recreate_if_needed ci-proxy nginx:alpine "$CI_PROXY_CONFIG_HASH" \
   --network drone \
   -p 80:80 \
   -v /etc/ci-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+
+# Health check: `docker run -d` only proves creation, not serving.
+docker exec ci-proxy nginx -t
+health_elapsed=0
+health_timeout_s=120
+health_poll_s=5
+while :; do
+  if curl -sf -o /dev/null "http://localhost/jenkins/login"; then
+    echo "jenkins-provision: ci-proxy is serving Jenkins."
+    break
+  fi
+  if [ "$health_elapsed" -ge "$health_timeout_s" ]; then
+    echo "jenkins-provision: /jenkins/login never came up through ci-proxy within $${health_timeout_s}s" >&2
+    exit 1
+  fi
+  sleep "$health_poll_s"
+  health_elapsed=$((health_elapsed + health_poll_s))
+done

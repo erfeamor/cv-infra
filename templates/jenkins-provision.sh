@@ -92,6 +92,10 @@ credentials:
               username: "x-access-token"
               password: "$${GITHUB_PAT}"
               description: "cv-project GitHub PAT (commit-status only, T-002)"
+unclassified:
+  # Empty root URL => no target URL on the commit status github-branch-source posts.
+  location:
+    url: "http://${server_host}/jenkins/"
 jobs:
   - script: |
       multibranchPipelineJob('cv-domain-service') {
@@ -102,6 +106,10 @@ jobs:
                 id('cv-domain-service')
                 repoOwner('erfeamor')
                 repository('cv-domain-service')
+                // Both REQUIRED by the plugin ctor; omitting them aborts
+                // JCasC and Jenkins never boots. false => repoOwner wins.
+                repositoryUrl('https://github.com/erfeamor/cv-domain-service')
+                configuredByUrl(false)
                 credentialsId('github-pat')
                 // Public repo + mounted docker.sock: an untrusted
                 // Jenkinsfile is RCE-on-host. Explicit traits pin this --
@@ -132,6 +140,8 @@ jobs:
                 id('cv-database')
                 repoOwner('erfeamor')
                 repository('cv-database')
+                repositoryUrl('https://github.com/erfeamor/cv-database')
+                configuredByUrl(false)
                 credentialsId('github-pat')
                 // Same reasoning as cv-domain-service above -- not boilerplate.
                 traits {

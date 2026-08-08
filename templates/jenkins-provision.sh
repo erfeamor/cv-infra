@@ -188,6 +188,7 @@ github-branch-source
 credentials-binding
 job-dsl
 pipeline-stage-view
+junit
 PLUGINS_EOF
 
 # Bind mounts don't inherit image ownership -- chown to uid/gid 1000 or
@@ -201,6 +202,9 @@ COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
 RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
 
 USER root
+# docker-cli NOT docker.io: on Debian 13 the latter only *Recommends* the
+# client, so --no-install-recommends yields no /usr/bin/docker. Client is
+# all we want anyway -- the daemon is the host's, via the socket.
 # archive.apache.org (immutable; dlcdn 404s once superseded), sha512-verified.
 RUN curl -fsSL -o /tmp/maven.tar.gz https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz \
   && curl -fsSL -o /tmp/maven.tar.gz.sha512 https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz.sha512 \
@@ -209,7 +213,7 @@ RUN curl -fsSL -o /tmp/maven.tar.gz https://archive.apache.org/dist/maven/maven-
   && ln -s /opt/apache-maven-3.9.9 /opt/maven \
   && rm -f /tmp/maven.tar.gz /tmp/maven.tar.gz.sha512 \
   && apt-get update \
-  && apt-get install -y --no-install-recommends docker.io \
+  && apt-get install -y --no-install-recommends docker-cli \
   && rm -rf /var/lib/apt/lists/*
 ENV MAVEN_HOME=/opt/maven
 ENV PATH="$${MAVEN_HOME}/bin:$${PATH}"

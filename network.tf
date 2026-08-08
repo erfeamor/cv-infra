@@ -42,8 +42,14 @@ resource "aws_security_group" "domain_service" {
 }
 
 resource "aws_security_group" "drone" {
-  name        = "${var.project_name}-drone"
-  description = "Allows inbound HTTP(S) from GitHub (webhooks, OAuth callback) to the Drone + Jenkins CI host"
+  name = "${var.project_name}-drone"
+  # Deliberately still says "Drone CI host" even though Jenkins now sits behind
+  # the same rule: aws_security_group.description is ForceNew (AWS has no
+  # modify-description API) and this group has no create_before_destroy, so
+  # editing this string alone would destroy a group still attached to
+  # aws_instance.drone -- DependencyViolation, mid-apply, on a live CI box. The
+  # comment below carries the meaning instead. Do not "fix" this wording.
+  description = "Allows inbound HTTP(S) from GitHub (webhooks, OAuth callback) to the Drone CI host"
   vpc_id      = data.aws_vpc.default.id
 
   # T-002: since the reverse proxy went in (templates/jenkins-provision.sh),

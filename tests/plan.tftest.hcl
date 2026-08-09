@@ -20,6 +20,15 @@ mock_provider "aws" {
       id = "ami-00000000000000000"
     }
   }
+
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "123456789012"
+      arn        = "arn:aws:iam::123456789012:root"
+      id         = "123456789012"
+      user_id    = "AIDACKCEVSQ6C2EXAMPLE"
+    }
+  }
 }
 
 variables {
@@ -29,6 +38,11 @@ variables {
   drone_github_client_secret = "test-client-secret-not-real"
   jenkins_admin_password     = "test-jenkins-password-not-real"
   github_pat_ci              = "test-github-pat-not-real"
+
+  # T-011: no defaults on these two by design (see variables.tf) -- test
+  # values only, never a number that could pass for the real T-010 figure.
+  budget_limit_amount        = "1"
+  budget_notification_emails = ["test-budget-alerts@example.com"]
 }
 
 run "plan_succeeds" {
@@ -146,5 +160,94 @@ run "plan_succeeds" {
   assert {
     condition     = contains([for b in aws_cloudfront_distribution.frontend.ordered_cache_behavior : b.path_pattern], "/api/*")
     error_message = "CloudFront must route /api/* to the domain service (mixed-content fix for the SPAs)"
+  }
+
+  # --- T-011: budget alarm that fires on gross usage, not net-of-credit ---
+
+  # O1 -- the crux. A regression here silently makes the whole feature a
+  # no-op: aws_budgets_budget defaults include_credit = true (net cost),
+  # which reads $0 on this account until the credit pool is exhausted.
+  assert {
+    condition     = aws_budgets_budget.gross_usage.cost_types[0].include_credit == false
+    error_message = "aws_budgets_budget must track GROSS usage (cost_types.include_credit = false) -- net cost reads $0 on this account until credits run out"
+  }
+
+  # O2 -- resource shape.
+  assert {
+    condition     = aws_budgets_budget.gross_usage.budget_type == "COST" && aws_budgets_budget.gross_usage.limit_unit == "USD"
+    error_message = "Budget must be a COST budget denominated in USD"
+  }
+
+  # O3 -- limit must trace to a variable, not a literal baked into the
+  # resource block (the real figure is T-010's measured console read).
+  assert {
+    condition     = aws_budgets_budget.gross_usage.limit_amount == var.budget_limit_amount
+    error_message = "limit_amount must come from var.budget_limit_amount, not a literal in budgets.tf"
+  }
+
+  # O4 -- both notification types must be present: forecast buys warning
+  # time at the known ~$0.92/day burn rate, actual confirms it.
+  assert {
+    condition = (
+      contains([for n in aws_budgets_budget.gross_usage.notification : n.notification_type], "ACTUAL") &&
+      contains([for n in aws_budgets_budget.gross_usage.notification : n.notification_type], "FORECASTED")
+    )
+    error_message = "Budget must have at least one ACTUAL and one FORECASTED notification"
+  }
+
+  # O5 -- wrong operator here fires immediately (LESS_THAN) or never
+  # (a stray EQUAL_TO) -- classic copy-paste bug.
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.gross_usage.notification : n.comparison_operator == "GREATER_THAN"])
+    error_message = "Every notification must use comparison_operator = GREATER_THAN"
+  }
+
+  # O6 -- a budget alarm that notifies nobody is worse than no budget.
+  # Checked at both ends: the human-facing subscriber list is non-empty and
+  # sourced from a variable (not hardcoded), and it actually drives an SNS
+  # subscription per address (DoR decision 3: SNS over a bare email
+  # subscriber, because its confirmation state is CLI-queryable).
+  assert {
+    condition     = length(var.budget_notification_emails) > 0
+    error_message = "budget_notification_emails must be non-empty"
+  }
+
+  assert {
+    condition     = length(aws_sns_topic_subscription.budget_alerts_email) == length(var.budget_notification_emails)
+    error_message = "One aws_sns_topic_subscription must exist per address in var.budget_notification_emails"
+  }
+
+  # O7 -- NOT tested here, deliberately, same documented limitation as
+  # aws_eip.drone.public_ip above: aws_sns_topic.budget_alerts.arn is
+  # unknown-until-apply under `command = plan`, and it feeds
+  # subscriber_sns_topic_arns on every notification block, so nothing
+  # downstream of that ARN is assertable under mock_provider's plan output
+  # either. A real check needs a `command = apply` run (safe under
+  # mock_provider) or S1/S5 at stage 4 against the live account -- not
+  # invented here, per the task's own instruction not to add one.
+
+  # O8 -- thresholds must be > 0 and ascending, catching an
+  # inverted/duplicate threshold. The notification block is a TypeSet
+  # (confirmed via `terraform providers schema -json`), so its plan-output
+  # order is not guaranteed to reflect declaration order -- asserting
+  # "ascending" against that iteration order would be asserting on
+  # undefined behaviour. Instead this asserts ascending against
+  # var.budget_notification_thresholds itself (also enforced by its own
+  # `validation` block in variables.tf, so this is redundant-on-purpose
+  # belt-and-braces) -- the source local.budget_notifications, and
+  # therefore every notification block, is built directly from that list --
+  # plus a direct, order-independent check that every threshold reaching
+  # the resource is > 0.
+  assert {
+    condition = alltrue([
+      for i in range(length(var.budget_notification_thresholds) - 1) :
+      var.budget_notification_thresholds[i] < var.budget_notification_thresholds[i + 1]
+    ])
+    error_message = "budget_notification_thresholds must be strictly ascending -- an inverted or duplicate threshold either fires immediately or never"
+  }
+
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.gross_usage.notification : n.threshold > 0])
+    error_message = "Every notification threshold must be > 0"
   }
 }

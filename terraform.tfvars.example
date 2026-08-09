@@ -20,3 +20,13 @@ drone_github_client_secret = "REPLACE_ME"
 jenkins_admin_username = "erfeamor"
 jenkins_admin_password = "REPLACE_ME" # openssl rand -base64 24
 github_pat_ci          = "REPLACE_ME" # repo:status scope only (classic) or fine-grained Commit-statuses:read/write on cv-domain-service + cv-database
+
+# T-011: budget alarm on gross usage (include_credit = false, see budgets.tf).
+# REPLACE_ME_MEASURED_USD is a deliberate, obviously-fake placeholder -- do
+# not treat it as a real limit. The real figure is T-010's console read of
+# measured gross usage (as of this task, burn is ~$0.92/day, ~$28/month, but
+# that number was NOT ratified at H1 as the limit and must not be baked in
+# here as if it were).
+budget_limit_amount            = "REPLACE_ME_MEASURED_USD"
+budget_notification_thresholds = [50, 80, 100]
+budget_notification_emails     = ["REPLACE_ME@example.com"]

@@ -94,3 +94,47 @@ variable "github_pat_ci" {
   type        = string
   sensitive   = true
 }
+
+# T-011: budget alarm that fires on gross usage, not net-of-credit cost --
+# see budgets.tf for the include_credit = false crux this task exists for.
+
+variable "budget_limit_amount" {
+  # H1 DoR decision 2: no default on purpose. The real figure is T-010's
+  # console read of measured gross usage, not a guess invented here --
+  # terraform.tfvars.example ships an obvious placeholder, never a number
+  # that could pass for a measured one.
+  description = "Monthly gross-usage budget limit, in USD (aws_budgets_budget.limit_amount). Must come from T-010's measured console figure -- do not invent a value here."
+  type        = string
+}
+
+variable "budget_notification_thresholds" {
+  description = "Ascending, strictly increasing list of percentage-of-limit thresholds (of budget_limit_amount) at which both an ACTUAL and a FORECASTED notification fire (aws_budgets_budget notification.threshold, threshold_type = PERCENTAGE)."
+  type        = list(number)
+  default     = [50, 80, 100]
+
+  validation {
+    condition = alltrue([
+      for i in range(length(var.budget_notification_thresholds) - 1) :
+      var.budget_notification_thresholds[i] < var.budget_notification_thresholds[i + 1]
+    ])
+    error_message = "budget_notification_thresholds must be strictly ascending with no duplicates -- an inverted or repeated threshold either fires immediately or never."
+  }
+
+  validation {
+    condition     = alltrue([for t in var.budget_notification_thresholds : t > 0])
+    error_message = "budget_notification_thresholds must all be > 0."
+  }
+}
+
+variable "budget_notification_emails" {
+  # H1 DoR decision 2/3: no default on purpose -- this must be an address a
+  # human actually reads, not a placeholder that silently ships as if it
+  # were real. terraform.tfvars.example carries an obvious REPLACE_ME.
+  description = "Email addresses subscribed (via SNS, DoR decision 3) to the budget-alerts topic. Must be non-empty -- a budget that notifies nobody is worse than no budget."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.budget_notification_emails) > 0
+    error_message = "budget_notification_emails must not be empty -- a budget alarm with no subscriber notifies nobody."
+  }
+}

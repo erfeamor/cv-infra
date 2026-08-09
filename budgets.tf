@@ -27,6 +27,17 @@ resource "aws_sns_topic" "budget_alerts" {
 }
 
 resource "aws_sns_topic_policy" "budget_alerts" {
+  # Non-blocking (review round 1): both reviewers independently raised
+  # adding an aws:SourceArn condition alongside aws:SourceAccount, and
+  # neither judged it exploitable given the account condition already in
+  # place. Not added here: aws_budgets_budget.gross_usage now has an
+  # explicit depends_on this policy (finding 1), so scoping SourceArn to
+  # that budget's ARN would create a cycle (policy needing the budget's
+  # ARN, budget needing the policy applied first). Logged, not acted on.
+  #
+  # Also non-blocking, informational only: this policy replaces SNS's
+  # __default_statement_ID rather than appending to it -- no default
+  # statement existed on a freshly created topic, so there is nothing lost.
   arn = aws_sns_topic.budget_alerts.arn
 
   policy = jsonencode({
@@ -85,8 +96,15 @@ resource "aws_budgets_budget" "gross_usage" {
   time_unit    = "MONTHLY"
 
   # The crux -- see file header. Non-negotiable per H1 DoR decision 1.
+  # include_refund is set false alongside include_credit for the same
+  # reason: every cost_types sub-attribute defaults to true independently,
+  # and a refund posted to the account nets against tracked spend exactly
+  # like a credit does -- same metric-masking failure mode, in a file whose
+  # entire purpose is un-netting the metric. Fixing one and not the other
+  # would be an inconsistency, not a deliberate choice.
   cost_types {
     include_credit = false
+    include_refund = false
   }
 
   dynamic "notification" {
@@ -99,4 +117,12 @@ resource "aws_budgets_budget" "gross_usage" {
       subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
     }
   }
+
+  # Finding 1 (review round 1): aws_budgets_budget only *references*
+  # aws_sns_topic.budget_alerts.arn, which makes it a graph sibling of
+  # aws_sns_topic_policy.budget_alerts, not a dependent -- Terraform would
+  # otherwise be free to create the budget before the policy attaches.
+  # AWS validates publish permission at CreateBudget time, so that ordering
+  # makes a fresh apply fail nondeterministically. Force the policy first.
+  depends_on = [aws_sns_topic_policy.budget_alerts]
 }

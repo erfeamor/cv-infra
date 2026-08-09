@@ -105,6 +105,27 @@ variable "budget_limit_amount" {
   # that could pass for a measured one.
   description = "Monthly gross-usage budget limit, in USD (aws_budgets_budget.limit_amount). Must come from T-010's measured console figure -- do not invent a value here."
   type        = string
+
+  # Finding 4 (review round 1): without this, an operator who fills in the
+  # secrets but leaves the tfvars.example placeholder ("REPLACE_ME_...")
+  # gets a clean plan and an apply that creates the SNS topic (and fires
+  # real confirmation emails) before failing at CreateBudget -- leaving a
+  # confirmed topic with no budget behind it. Fail this at plan instead.
+  validation {
+    # Two gotchas found while writing this, both confirmed empirically:
+    # `&&` does not short-circuit in Terraform, so
+    # `can(tonumber(x)) && tonumber(x) > 0` still evaluates the second
+    # tonumber(x) and raises an uncaught conversion error instead of
+    # cleanly failing validation when x isn't numeric. And can() discards
+    # the wrapped expression's *value*, only reporting whether it errored
+    # -- so `can(tonumber(x) > 0)` is true for x = "-5" (tonumber succeeds,
+    # the comparison just evaluates to false without erroring), silently
+    # accepting a non-positive limit. The ternary below short-circuits
+    # correctly: the false branch is a literal, so it never re-evaluates
+    # tonumber() on a value already known not to convert.
+    condition     = can(tonumber(var.budget_limit_amount)) ? tonumber(var.budget_limit_amount) > 0 : false
+    error_message = "budget_limit_amount must be a positive number encoded as a string (e.g. \"50\"), not a placeholder -- fill in T-010's measured console figure."
+  }
 }
 
 variable "budget_notification_thresholds" {
@@ -112,9 +133,22 @@ variable "budget_notification_thresholds" {
   type        = list(number)
   default     = [50, 80, 100]
 
+  # Finding 5 (review round 1): an empty list must fail here, explicitly --
+  # not just because a zero-notification budget applies cleanly, reads
+  # green, and never fires (the exact outcome this task exists to prevent),
+  # but because range(length(x) - 1) is not empty-safe: range(-1) returns
+  # [0], not [], so an empty list would otherwise index element 0 of an
+  # empty list in the ascending check below and abort with a confusing
+  # "Invalid index" instead of either authored validation message. Guard
+  # both.
+  validation {
+    condition     = length(var.budget_notification_thresholds) > 0
+    error_message = "budget_notification_thresholds must not be empty -- zero notification blocks means the budget applies cleanly and never fires."
+  }
+
   validation {
     condition = alltrue([
-      for i in range(length(var.budget_notification_thresholds) - 1) :
+      for i in range(max(length(var.budget_notification_thresholds) - 1, 0)) :
       var.budget_notification_thresholds[i] < var.budget_notification_thresholds[i + 1]
     ])
     error_message = "budget_notification_thresholds must be strictly ascending with no duplicates -- an inverted or repeated threshold either fires immediately or never."

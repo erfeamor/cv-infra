@@ -202,19 +202,34 @@ run "plan_succeeds" {
     error_message = "Every notification must use comparison_operator = GREATER_THAN"
   }
 
+  # Finding 7 (review round 1): if threshold_type were flipped to
+  # ABSOLUTE_VALUE, threshold 50 would silently mean $50 instead of 50%,
+  # and against a ~$28/month budget nothing would ever fire -- without this
+  # assert, none of O1-O6/O8 would have caught it.
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.gross_usage.notification : n.threshold_type == "PERCENTAGE"])
+    error_message = "Every notification must use threshold_type = PERCENTAGE, not ABSOLUTE_VALUE"
+  }
+
   # O6 -- a budget alarm that notifies nobody is worse than no budget.
   # Checked at both ends: the human-facing subscriber list is non-empty and
   # sourced from a variable (not hardcoded), and it actually drives an SNS
-  # subscription per address (DoR decision 3: SNS over a bare email
+  # subscription for each address (DoR decision 3: SNS over a bare email
   # subscriber, because its confirmation state is CLI-queryable).
   assert {
     condition     = length(var.budget_notification_emails) > 0
     error_message = "budget_notification_emails must be non-empty"
   }
 
+  # Finding 2 (review round 1): a prior version of this assert compared
+  # cardinality only (length == length), which passes identically whether
+  # aws_sns_topic_subscription.budget_alerts_email's for_each is keyed by
+  # var.budget_notification_emails or by an equally-sized but wrong,
+  # hardcoded set of addresses -- QA proved this empirically. Compare
+  # identity (the actual key sets), not just count.
   assert {
-    condition     = length(aws_sns_topic_subscription.budget_alerts_email) == length(var.budget_notification_emails)
-    error_message = "One aws_sns_topic_subscription must exist per address in var.budget_notification_emails"
+    condition     = toset(keys(aws_sns_topic_subscription.budget_alerts_email)) == toset(var.budget_notification_emails)
+    error_message = "aws_sns_topic_subscription.budget_alerts_email must have exactly one entry per address in var.budget_notification_emails -- same addresses, not just same count"
   }
 
   # O7 -- NOT tested here, deliberately, same documented limitation as
@@ -231,19 +246,33 @@ run "plan_succeeds" {
   # (confirmed via `terraform providers schema -json`), so its plan-output
   # order is not guaranteed to reflect declaration order -- asserting
   # "ascending" against that iteration order would be asserting on
-  # undefined behaviour. Instead this asserts ascending against
-  # var.budget_notification_thresholds itself (also enforced by its own
-  # `validation` block in variables.tf, so this is redundant-on-purpose
-  # belt-and-braces) -- the source local.budget_notifications, and
-  # therefore every notification block, is built directly from that list --
-  # plus a direct, order-independent check that every threshold reaching
-  # the resource is > 0.
+  # undefined behaviour (QA confirmed: the unknown SNS topic ARN feeding
+  # subscriber_sns_topic_arns on every notification block makes ordered
+  # iteration over that set unreliable). So the ascending check below runs
+  # against var.budget_notification_thresholds -- also enforced by its own
+  # `validation` block in variables.tf, kept here too as a directed
+  # regression check, not "redundant-on-purpose belt-and-braces": on its
+  # own, asserting ascending-ness of the *variable* proves nothing about
+  # the *resource* it's meant to feed (review round 1, finding 3 -- QA
+  # proved this empirically by swapping the loop source for a literal
+  # [1, 2, 3] while the variable stayed [50, 80, 100] and the suite still
+  # passed). The set-equality assert immediately below is what actually
+  # ties the two together, order-independently and plan-evaluably.
   assert {
     condition = alltrue([
-      for i in range(length(var.budget_notification_thresholds) - 1) :
+      for i in range(max(length(var.budget_notification_thresholds) - 1, 0)) :
       var.budget_notification_thresholds[i] < var.budget_notification_thresholds[i + 1]
     ])
     error_message = "budget_notification_thresholds must be strictly ascending -- an inverted or duplicate threshold either fires immediately or never"
+  }
+
+  # Order-independent identity check: the set of threshold values actually
+  # reaching the resource must equal the set from the variable -- this is
+  # what proves local.budget_notifications wasn't built from some other
+  # source (a stray literal, a stale copy, etc).
+  assert {
+    condition     = toset([for n in aws_budgets_budget.gross_usage.notification : n.threshold]) == toset(var.budget_notification_thresholds)
+    error_message = "Notification thresholds on the resource must be exactly the set of values in var.budget_notification_thresholds"
   }
 
   assert {

@@ -1,6 +1,6 @@
 # CLAUDE.md — cv-infra
 
-Infrastructure as code for cv-project: Terraform (AWS provider ~>5.0), targeting **AWS Free Tier only** — that constraint is binding on every resource choice. Never applied to a real account yet. Cross-repo context: meta repo CLAUDE.md one directory up.
+Infrastructure as code for cv-project: Terraform (AWS provider ~>5.0), **cost-constrained but credit-funded — see "Cost model" below; the old "Free Tier only" rule does not apply to this account.** Applied for real to account `760904708057`, eu-west-3. Cross-repo context: meta repo CLAUDE.md one directory up.
 
 ## Commands
 
@@ -18,7 +18,9 @@ One root module, one file per concern: `providers.tf`, `variables.tf`, `network.
 
 ## Binding constraints & decisions
 
-- **Free Tier**: EC2 `t2/t3.micro`, default VPC (**no NAT gateway — not free**), CloudFront default cert. `terraform test` asserts the EC2 instance types — keep those assertions passing. **Exception (T-002, ratified):** `aws_instance.drone` is `t3.small`, not `t2/t3.micro` — it now co-hosts Jenkins alongside Drone, which needs the extra RAM headroom for Maven builds; net cost delta is ~+$8/mo, recorded in `variables.tf` and the T-002 PR body. This is a deliberate, one-resource carve-out, not a general licence to resize other instances.
+- **Cost model — read this before citing "Free Tier".** This account was created 2026-07-12, so it is on AWS's **post-July-2025 Free Tier**: a fixed pot of signup credits and a 6-month window, **not** the legacy 12-month allowance. Verified: `aws freetier get-free-tier-usage` returns only `Always Free` entries (Glue, SQS, KMS) — there is **no 750 h/month EC2 allowance on this account**, so every instance-hour bills and is paid from credits. Actual run rate is **~$0.92/day ≈ $28/month**, fully credit-covered (net invoice $0 in both July and August 2026). The binding constraint is therefore **credit runway and the 6-month cliff, not instance class** — tracked as T-010. Keep resources modest because credits are finite, not because a class is "free".
+  - Still true regardless: **no NAT gateway** (~$32/mo, dwarfs everything else here), CloudFront default cert, and note that **every public IPv4 costs ~$3.60/mo** — the two EIPs are ~26% of the current bill.
+  - `aws_instance.drone` is `t3.small` (T-002) for Maven headroom. `terraform test` asserts instance classes; those assertions now encode a cost-discipline convention rather than a Free Tier boundary.
 - **No RDS — MySQL is self-hosted** on the domain-service EC2 (MySQL 8.4 container, Flyway-migrated at boot, data on a host volume). This was a deliberate move off `db.t3.micro` RDS: it removed the instance cost **and** the MySQL 8.0 Extended Support per-vCPU charge that began Aug 2026. Trade-off: no managed backups/patching/HA — durability rests on the instance's volume, and a `mysqldump→S3` job is the intended backup. A `t3.small` is recommended over `t3.micro` for the DB+app box for RAM headroom.
 - **No SSH anywhere.** Shell access is SSM Session Manager via the instance profile in `iam.tf`. Do not add port-22 ingress or key pairs back.
 - Secrets flow: values land in SSM Parameter Store (`/cv-project/<env>/…`); services read them at runtime via the instance role. Never put secrets in tfvars committed files — `terraform.tfvars` is gitignored, `.example` carries placeholders.
@@ -27,14 +29,14 @@ One root module, one file per concern: `providers.tf`, `variables.tf`, `network.
 
 ## Testing convention
 
-`tests/plan.tftest.hcl` uses `mock_provider "aws"` with mocked data sources so plans run without credentials — extend the mocks when you add data sources, and add an assertion when a task pins a resource property (e.g. Free Tier classes).
+`tests/plan.tftest.hcl` uses `mock_provider "aws"` with mocked data sources so plans run without credentials — extend the mocks when you add data sources, and add an assertion when a task pins a resource property (e.g. instance classes).
 
 ## Code review guidance
 
 Priorities, ranked:
 
 1. **Security exposure.** Any new ingress rule wider than the resource needs (especially `0.0.0.0/0` on a non-web port), SSH/port-22 ingress or key pairs reintroduced, or a secret placed in a committed file rather than SSM Parameter Store / `terraform.tfvars` (gitignored).
-2. **Free Tier drift.** A resized instance class, added NAT gateway, or any resource that isn't Free-Tier-eligible without an explicit, deliberate note — `terraform test` assertions must be updated in the same PR if a class changes.
+2. **Cost drift.** A resized instance class, an added NAT gateway, an extra public IPv4, or any materially expensive resource without an explicit, deliberate note — `terraform test` assertions must be updated in the same PR if a class changes. Judge this against **credit burn** (~$28/mo today, finite pot, 6-month cliff — see the cost model above and T-010), not against Free Tier eligibility.
 3. **`user_data` changes without `user_data_replace_on_change`.** A bootstrap-script edit that doesn't force instance replacement will silently update Terraform state without ever re-provisioning the box (this exact bug shipped once — see git history on `compute.tf`).
 4. IAM policy changes broader than least-privilege (e.g. `Resource: "*"` where a scoped ARN would do).
 

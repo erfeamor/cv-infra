@@ -97,20 +97,33 @@ variable "github_pat_ci" {
 
 # T-011: budget alarm that fires on gross usage, not net-of-credit cost --
 # see budgets.tf for the include_credit = false crux this task exists for.
+#
+# Scope amendment (H1, ratified 2026-08-09): the original single
+# budget_limit_amount was a MONTHLY limit compared against a CUMULATIVE
+# credit pot -- $121.03 of remaining credit is ~4.3x the ~$28/month burn, so
+# a monthly budget set to that figure reads at ~23% and never crosses even
+# the lowest 50% threshold while the pot drains to zero. That is the exact
+# never-fires failure class this task exists to prevent, just relocated one
+# level up. Fix: two budgets, two variables, two questions -- see budgets.tf
+# for aws_budgets_budget.credit_runway (ANNUALLY, tracks the credit pot) and
+# aws_budgets_budget.gross_usage (MONTHLY, now an anomaly detector). The two
+# MUST NOT share a limit variable -- that sharing was the bug.
 
-variable "budget_limit_amount" {
-  # H1 DoR decision 2: no default on purpose. The real figure is T-010's
-  # console read of measured gross usage, not a guess invented here --
+variable "budget_credit_balance_amount" {
+  # H1 DoR decision 2, still binding under the amendment: no default on
+  # purpose. The real figure is a console read (Billing -> Credits) of the
+  # REMAINING credit balance, not a guess invented here --
   # terraform.tfvars.example ships an obvious placeholder, never a number
   # that could pass for a measured one.
-  description = "Monthly gross-usage budget limit, in USD (aws_budgets_budget.limit_amount). Must come from T-010's measured console figure -- do not invent a value here."
+  description = "Remaining AWS Free Tier credit balance, in USD (aws_budgets_budget.credit_runway.limit_amount) -- a CUMULATIVE pot tracked by an ANNUALLY budget, not a monthly figure. Must come from a measured console read -- do not invent a value here."
   type        = string
 
-  # Finding 4 (review round 1): without this, an operator who fills in the
-  # secrets but leaves the tfvars.example placeholder ("REPLACE_ME_...")
-  # gets a clean plan and an apply that creates the SNS topic (and fires
-  # real confirmation emails) before failing at CreateBudget -- leaving a
-  # confirmed topic with no budget behind it. Fail this at plan instead.
+  # Finding 4 (review round 1), still applicable: without this, an operator
+  # who fills in the secrets but leaves the tfvars.example placeholder
+  # ("REPLACE_ME_...") gets a clean plan and an apply that creates the SNS
+  # topic (and fires real confirmation emails) before failing at
+  # CreateBudget -- leaving a confirmed topic with no budget behind it.
+  # Fail this at plan instead.
   validation {
     # Two gotchas found while writing this, both confirmed empirically:
     # `&&` does not short-circuit in Terraform, so
@@ -123,13 +136,31 @@ variable "budget_limit_amount" {
     # accepting a non-positive limit. The ternary below short-circuits
     # correctly: the false branch is a literal, so it never re-evaluates
     # tonumber() on a value already known not to convert.
-    condition     = can(tonumber(var.budget_limit_amount)) ? tonumber(var.budget_limit_amount) > 0 : false
-    error_message = "budget_limit_amount must be a positive number encoded as a string (e.g. \"50\"), not a placeholder -- fill in T-010's measured console figure."
+    condition     = can(tonumber(var.budget_credit_balance_amount)) ? tonumber(var.budget_credit_balance_amount) > 0 : false
+    error_message = "budget_credit_balance_amount must be a positive number encoded as a string (e.g. \"121.03\"), not a placeholder -- fill in a measured console figure."
+  }
+}
+
+variable "budget_monthly_limit_amount" {
+  # Unlike budget_credit_balance_amount, this DOES get a default: it is not
+  # a cumulative pot that needs a fresh console read, it is a design margin
+  # over a known, already-measured baseline (~$0.92/day, ~$28/month -- see
+  # the task doc) ratified in the scope amendment itself, the same way
+  # budget_notification_thresholds ships a ratified default. Still
+  # overridable, and still validated the same way so a bad override fails
+  # at plan, not at CreateBudget.
+  description = "Monthly gross-usage budget limit, in USD (aws_budgets_budget.gross_usage.limit_amount) -- an anomaly detector sized slightly above the known ~$28/month baseline so it fires when burn accelerates, not on ordinary usage. Independent of budget_credit_balance_amount on purpose: the two budgets must never share a limit variable."
+  type        = string
+  default     = "35"
+
+  validation {
+    condition     = can(tonumber(var.budget_monthly_limit_amount)) ? tonumber(var.budget_monthly_limit_amount) > 0 : false
+    error_message = "budget_monthly_limit_amount must be a positive number encoded as a string (e.g. \"35\"), not a placeholder."
   }
 }
 
 variable "budget_notification_thresholds" {
-  description = "Ascending, strictly increasing list of percentage-of-limit thresholds (of budget_limit_amount) at which both an ACTUAL and a FORECASTED notification fire (aws_budgets_budget notification.threshold, threshold_type = PERCENTAGE)."
+  description = "Ascending, strictly increasing list of percentage-of-limit thresholds at which both an ACTUAL and a FORECASTED notification fire, shared by both aws_budgets_budget.gross_usage (percent of budget_monthly_limit_amount) and aws_budgets_budget.credit_runway (percent of budget_credit_balance_amount) (notification.threshold, threshold_type = PERCENTAGE)."
   type        = list(number)
   default     = [50, 80, 100]
 

@@ -18,7 +18,7 @@ One root module, one file per concern: `providers.tf`, `variables.tf`, `network.
 
 ## Binding constraints & decisions
 
-- **Free Tier**: EC2 `t2/t3.micro`, default VPC (**no NAT gateway — not free**), CloudFront default cert. `terraform test` asserts the EC2 instance types — keep those assertions passing.
+- **Free Tier**: EC2 `t2/t3.micro`, default VPC (**no NAT gateway — not free**), CloudFront default cert. `terraform test` asserts the EC2 instance types — keep those assertions passing. **Exception (T-002, ratified):** `aws_instance.drone` is `t3.small`, not `t2/t3.micro` — it now co-hosts Jenkins alongside Drone, which needs the extra RAM headroom for Maven builds; net cost delta is ~+$8/mo, recorded in `variables.tf` and the T-002 PR body. This is a deliberate, one-resource carve-out, not a general licence to resize other instances.
 - **No RDS — MySQL is self-hosted** on the domain-service EC2 (MySQL 8.4 container, Flyway-migrated at boot, data on a host volume). This was a deliberate move off `db.t3.micro` RDS: it removed the instance cost **and** the MySQL 8.0 Extended Support per-vCPU charge that began Aug 2026. Trade-off: no managed backups/patching/HA — durability rests on the instance's volume, and a `mysqldump→S3` job is the intended backup. A `t3.small` is recommended over `t3.micro` for the DB+app box for RAM headroom.
 - **No SSH anywhere.** Shell access is SSM Session Manager via the instance profile in `iam.tf`. Do not add port-22 ingress or key pairs back.
 - Secrets flow: values land in SSM Parameter Store (`/cv-project/<env>/…`); services read them at runtime via the instance role. Never put secrets in tfvars committed files — `terraform.tfvars` is gitignored, `.example` carries placeholders.

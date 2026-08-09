@@ -1,6 +1,9 @@
-# Drone CI host for cv-admin-react pipelines: one Free Tier instance running
-# the Drone 2.x server and a docker runner. GitHub must reach it for webhooks
-# and the OAuth callback, so it keeps a stable Elastic IP.
+# CI host for the demo: Drone (cv-admin-react) and, since T-002, Jenkins
+# (cv-domain-service, cv-database) co-located on the same instance rather
+# than a third box. GitHub must reach it for webhooks and Drone's OAuth
+# callback, so it keeps a stable Elastic IP. A reverse proxy container
+# fronts both services on the existing 80/443 ingress -- see
+# templates/jenkins-provision.sh.
 #
 # Manual steps Terraform cannot do:
 #   1. Create a GitHub OAuth app (org erfeamor) with authorization callback
@@ -8,6 +11,41 @@
 #   2. After first login, activate cv-admin-react in the Drone UI.
 #   3. Create an access key for the drone-deploy IAM user (see iam.tf) and
 #      store it as Drone secrets for the deploy step.
+#   4. Create the GitHub PAT for Jenkins (repo:status only, or fine-grained
+#      Commit-statuses:read/write on cv-domain-service + cv-database) and
+#      put it in terraform.tfvars as github_pat_ci -- it lands in SSM as a
+#      SecureString (see ssm.tf), never committed.
+#   5. Add a webhook on cv-domain-service and cv-database (Settings ->
+#      Webhooks) pointing at http://<drone_server_url>/jenkins/github-webhook/
+#      for events push + pull_request -- mirrors the cv-admin-react -> Drone
+#      hook. This needs a token/user with hook-admin rights; the PAT above
+#      is deliberately scoped to repo:status only and cannot create hooks
+#      itself, so this step stays manual by design (least privilege).
+#
+# T-002 (H1 decision 1): Jenkins is installed on the *live* instance
+# out-of-band via SSM Run Command (null_resource.jenkins_provision below),
+# not by editing user_data alone -- aws_instance.drone has no
+# user_data_replace_on_change, so a user_data-only edit updates Terraform
+# state without cloud-init ever re-running on a box that's already up (see
+# compute.tf; this exact bug shipped once). user_data is still updated, in
+# parallel, purely so a *future* replacement instance self-provisions
+# Jenkins from a clean boot -- these two paths are a deliberate split, not
+# an inconsistency.
+
+locals {
+  # Same template rendered twice (see the header comment): once concatenated
+  # into user_data for a future clean boot, once pushed out-of-band via SSM
+  # to the box that's live today. Single source of truth, no drift between
+  # the two paths.
+  jenkins_provision_script = templatefile("${path.module}/templates/jenkins-provision.sh", {
+    aws_region             = var.aws_region
+    project_name           = var.project_name
+    environment            = var.environment
+    server_host            = aws_eip.drone.public_ip
+    admin_username         = var.drone_admin_username
+    jenkins_admin_username = var.jenkins_admin_username
+  })
+}
 
 resource "aws_eip" "drone" {
   domain = "vpc"
@@ -25,19 +63,40 @@ resource "aws_instance" "drone" {
   vpc_security_group_ids = [aws_security_group.drone.id]
   iam_instance_profile   = aws_iam_instance_profile.drone.name
 
-  user_data = templatefile("${path.module}/templates/drone-user-data.sh", {
-    aws_region     = var.aws_region
-    project_name   = var.project_name
-    environment    = var.environment
-    server_host    = aws_eip.drone.public_ip
-    admin_username = var.drone_admin_username
-  })
+  # Concatenated so a *future* replacement instance boots straight into
+  # Drone + Jenkins + proxy. Deliberately NOT paired with
+  # user_data_replace_on_change (see header comment) -- on the box that is
+  # live today this changes Terraform state only; Jenkins gets installed on
+  # it via null_resource.jenkins_provision instead.
+  #
+  # Size: rendered, this comes to roughly 14 KB against EC2's 16 KB
+  # user_data limit (~86%) -- measured by hand outside this repo, since this
+  # worktree has no state to `terraform console` against, so treat the
+  # exact figure as approximate and re-measure after any edit. Two rounds of
+  # review findings each grew jenkins-provision.sh enough to push the render
+  # over budget; both times its own comments (not its logic) were cut back
+  # to fit, which is why they read tersely -- that's deliberate. A future
+  # addition to either template should re-measure before assuming there's
+  # room, and expect to trim comments again rather than logic if it doesn't
+  # fit.
+  user_data = join("\n", [
+    templatefile("${path.module}/templates/drone-user-data.sh", {
+      aws_region     = var.aws_region
+      project_name   = var.project_name
+      environment    = var.environment
+      server_host    = aws_eip.drone.public_ip
+      admin_username = var.drone_admin_username
+    }),
+    local.jenkins_provision_script,
+  ])
 
   # user_data reads the CI parameters at first boot, so they must exist first.
   depends_on = [
     aws_ssm_parameter.drone_rpc_secret,
     aws_ssm_parameter.drone_github_client_id,
     aws_ssm_parameter.drone_github_client_secret,
+    aws_ssm_parameter.jenkins_admin_password,
+    aws_ssm_parameter.github_pat_ci,
   ]
 
   # AMI churn must never replace this host: Drone's state (repo activations,
@@ -55,4 +114,161 @@ resource "aws_instance" "drone" {
 resource "aws_eip_association" "drone" {
   instance_id   = aws_instance.drone.id
   allocation_id = aws_eip.drone.id
+}
+
+# Stages the rendered script on disk (gitignored, see .gitignore) so the
+# local-exec command below never has to embed a large multi-line value
+# inside a shell heredoc -- nesting a Terraform heredoc around a bash
+# heredoc around a script that itself contains heredocs is a quoting trap
+# (Terraform's indentation dedent is keyed off the *smallest* indentation
+# across every line, including this script's own column-0 lines, so it
+# would silently fail to strip the surrounding wrapper's indentation and
+# could desync the inner heredoc terminator). A real file + --rawfile
+# sidesteps all of that.
+resource "local_file" "jenkins_provision_script" {
+  filename        = "${path.module}/generated/jenkins-provision.sh"
+  content         = local.jenkins_provision_script
+  file_permission = "0600"
+}
+
+# T-002 (H1 decision 1): out-of-band provisioning of the *live* instance.
+# Runs the exact same script as the user_data path above via SSM Run
+# Command instead of relying on cloud-init re-executing, which it will not
+# (see header comment). Idempotent: the script itself guards every
+# docker/network operation (and now takes a local flock -- see the script --
+# so a reflexive re-apply can't race a still-running first invocation), so
+# re-running this -- e.g. after editing the script and re-applying -- never
+# fails on "container name already in use" and never duplicates state.
+#
+# Requires the AWS CLI and jq on the machine running `terraform apply`
+# (not the instance role) with ssm:SendCommand / ssm:GetCommandInvocation /
+# ssm:DescribeInstanceInformation permission. Provisioners only run on
+# apply, never on plan/test, so this is inert for the offline gates.
+#
+# Review findings B3 and B4, both about the exact apply this PR exists to
+# perform:
+#   B4 -- this same apply resizes aws_instance.drone (t3.micro -> t3.small),
+#   an in-place stop/modify/start. The AWS API returns once the instance is
+#   `running`, but the SSM agent only re-registers 30-90s later; sending the
+#   command immediately would hit InvalidInstanceId. So: wait for the agent
+#   to report Online via describe-instance-information before sending
+#   anything.
+#   B3 -- `aws ssm wait command-executed` uses botocore's fixed
+#   delay=5/maxAttempts=20 (100s) waiter, but the first real run pulls two
+#   multi-hundred-MB images, runs jenkins-plugin-cli over several plugins,
+#   and builds a custom image, comfortably past 100s on a t3.small. Poll
+#   get-command-invocation directly instead, with a timeout sized for a
+#   cold image cache.
+resource "null_resource" "jenkins_provision" {
+  triggers = {
+    script_sha  = sha256(local.jenkins_provision_script)
+    instance_id = aws_instance.drone.id
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -euo pipefail
+      region="${var.aws_region}"
+      instance_id="${aws_instance.drone.id}"
+
+      echo "Waiting for the SSM agent to report Online on $instance_id (this apply's own stop/modify/start needs it to re-register)..."
+      agent_elapsed=0
+      agent_timeout_s=300
+      agent_poll_s=10
+      while :; do
+        ping_status=$(aws ssm describe-instance-information --region "$region" \
+          --filters "Key=InstanceIds,Values=$instance_id" \
+          --query "InstanceInformationList[0].PingStatus" --output text 2>/dev/null || echo "None")
+        if [ "$ping_status" = "Online" ]; then
+          break
+        fi
+        if [ "$agent_elapsed" -ge "$agent_timeout_s" ]; then
+          echo "SSM agent on $instance_id did not report Online within $${agent_timeout_s}s (last status: $ping_status)" >&2
+          exit 1
+        fi
+        sleep "$agent_poll_s"
+        agent_elapsed=$((agent_elapsed + agent_poll_s))
+      done
+
+      payload_file=$(mktemp)
+      trap 'rm -f "$payload_file"' EXIT
+      jq -n --rawfile s "${local_file.jenkins_provision_script.filename}" --arg iid "$instance_id" \
+        '{"InstanceIds":[$iid],"DocumentName":"AWS-RunShellScript","Comment":"cv-infra T-002: provision Jenkins + reverse proxy","Parameters":{"commands":[$s]}}' \
+        >"$payload_file"
+      cmd_id=$(aws ssm send-command --region "$region" \
+        --cli-input-json "file://$payload_file" \
+        --query "Command.CommandId" --output text)
+      echo "SSM command $cmd_id sent to $instance_id, polling for completion..."
+
+      cmd_elapsed=0
+      cmd_timeout_s=1800
+      cmd_poll_s=15
+      consecutive_errors=0
+      max_consecutive_errors=5
+      while :; do
+        # get-command-invocation legitimately 404s (InvocationDoesNotExist)
+        # for a few seconds right after send-command, before AWS finishes
+        # propagating the record -- that's the only error worth swallowing
+        # as "still pending". Anything else (expired creds, throttling) is a
+        # real failure and must not be silently retried for the full
+        # timeout, so errors are counted and capped separately from it.
+        # The `if` condition here is exempt from `set -e` -- a plain
+        # `var=$(cmd)` assignment is NOT, and would otherwise abort the
+        # whole script the moment the AWS CLI call fails once, before this
+        # error-counting logic ever runs.
+        if invocation_output=$(aws ssm get-command-invocation --region "$region" \
+          --command-id "$cmd_id" --instance-id "$instance_id" \
+          --query "Status" --output text 2>&1); then
+          rc=0
+        else
+          rc=$?
+        fi
+        if [ "$rc" -ne 0 ]; then
+          if echo "$invocation_output" | grep -q "InvocationDoesNotExist"; then
+            status="Pending"
+            consecutive_errors=0
+          else
+            consecutive_errors=$((consecutive_errors + 1))
+            echo "get-command-invocation failed (attempt $consecutive_errors/$max_consecutive_errors): $invocation_output" >&2
+            if [ "$consecutive_errors" -ge "$max_consecutive_errors" ]; then
+              echo "Giving up after $max_consecutive_errors consecutive get-command-invocation errors on $cmd_id" >&2
+              exit 1
+            fi
+            sleep "$cmd_poll_s"
+            cmd_elapsed=$((cmd_elapsed + cmd_poll_s))
+            continue
+          fi
+        else
+          status="$invocation_output"
+          consecutive_errors=0
+        fi
+        case "$status" in
+          Success)
+            echo "SSM command $cmd_id succeeded."
+            break
+            ;;
+          Failed | Cancelled | Cancelling | TimedOut | Undeliverable | Terminated)
+            echo "SSM command $cmd_id ended with status $status; stderr:" >&2
+            aws ssm get-command-invocation --region "$region" \
+              --command-id "$cmd_id" --instance-id "$instance_id" \
+              --query "StandardErrorContent" --output text >&2 || true
+            exit 1
+            ;;
+        esac
+        if [ "$cmd_elapsed" -ge "$cmd_timeout_s" ]; then
+          echo "SSM command $cmd_id did not finish within $${cmd_timeout_s}s (last status: $status)" >&2
+          exit 1
+        fi
+        sleep "$cmd_poll_s"
+        cmd_elapsed=$((cmd_elapsed + cmd_poll_s))
+      done
+    EOT
+  }
+
+  depends_on = [
+    aws_eip_association.drone,
+    aws_ssm_parameter.jenkins_admin_password,
+    aws_ssm_parameter.github_pat_ci,
+    local_file.jenkins_provision_script,
+  ]
 }

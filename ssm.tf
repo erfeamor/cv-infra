@@ -42,6 +42,33 @@ resource "aws_ssm_parameter" "drone_github_client_secret" {
   }
 }
 
+# Jenkins CI secrets the Drone/Jenkins host reads at boot (see
+# templates/jenkins-provision.sh). Naming and sensitivity mirror the
+# existing Drone CI parameters above -- least privilege enforced at the
+# PAT's GitHub scope, not here.
+resource "aws_ssm_parameter" "jenkins_admin_password" {
+  name  = "/${var.project_name}/${var.environment}/ci/jenkins-admin-password"
+  type  = "SecureString"
+  value = var.jenkins_admin_password
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+# repo:status (classic) or fine-grained Commit-statuses:read/write on
+# cv-domain-service + cv-database only -- see variable description. Bare
+# 'repo' scope is a blocking finding at /security-review.
+resource "aws_ssm_parameter" "github_pat_ci" {
+  name  = "/${var.project_name}/${var.environment}/ci/github-pat"
+  type  = "SecureString"
+  value = var.github_pat_ci
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
 resource "aws_ssm_parameter" "cognito_issuer_uri" {
   name  = "/${var.project_name}/${var.environment}/cognito/issuer-uri"
   type  = "String"

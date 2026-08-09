@@ -39,16 +39,22 @@ variables {
   jenkins_admin_password     = "test-jenkins-password-not-real"
   github_pat_ci              = "test-github-pat-not-real"
 
-  # T-011: no default on budget_credit_balance_amount by design (see
+  # T-011: no default on budget_credit_grant_amount by design (see
   # variables.tf) -- test value only, never a number that could pass for a
   # real measured figure. budget_monthly_limit_amount is given a distinct
-  # test value too (rather than relying on its real default of "35") so a
+  # test value too (rather than relying on its real default of "30") so a
   # regression that wires the SAME variable into both budgets' limit_amount
-  # -- the exact bug this amendment fixes -- makes the O3-equivalent
-  # identity assertions below fail instead of coincidentally matching.
-  budget_credit_balance_amount = "121.03"
-  budget_monthly_limit_amount  = "35"
-  budget_notification_emails   = ["test-budget-alerts@example.com"]
+  # -- a real bug this scope amendment fixed -- makes the identity
+  # assertions below fail instead of coincidentally matching. Same trick
+  # for the two threshold variables: credit_runway's and gross_usage's are
+  # given disjoint test values so a regression that swaps them (the second
+  # real bug this amendment fixed, caught at stage 4 against the live
+  # account) fails loudly too.
+  budget_credit_grant_amount      = "160"
+  budget_monthly_limit_amount     = "30"
+  budget_credit_runway_thresholds = [50, 80, 100]
+  budget_monthly_thresholds       = [100, 120, 150]
+  budget_notification_emails      = ["test-budget-alerts@example.com"]
 }
 
 run "plan_succeeds" {
@@ -186,14 +192,15 @@ run "plan_succeeds" {
 
   # O3 -- limit must trace to gross_usage's OWN variable, not a literal
   # baked into the resource block, and NOT credit_runway's variable -- the
-  # two budgets sharing a limit variable was the bug the 2026-08-09 scope
-  # amendment fixes (a $121.03 monthly limit against ~$28/month burn never
-  # crosses even the 50% threshold). The mock values for the two variables
-  # are deliberately distinct ("35" vs "121.03"), so a regression that
-  # wires the wrong one in fails this instead of passing by coincidence.
+  # two budgets sharing a limit variable was a real bug caught before the
+  # first apply (a credit-pot-sized MONTHLY limit against ~$28/month burn
+  # never crosses even the 50% threshold). The mock values for the two
+  # variables are deliberately distinct ("30" vs "160"), so a regression
+  # that wires the wrong one in fails this instead of passing by
+  # coincidence.
   assert {
     condition     = aws_budgets_budget.gross_usage.limit_amount == var.budget_monthly_limit_amount
-    error_message = "gross_usage.limit_amount must come from var.budget_monthly_limit_amount, not a literal or var.budget_credit_balance_amount"
+    error_message = "gross_usage.limit_amount must come from var.budget_monthly_limit_amount, not a literal or var.budget_credit_grant_amount"
   }
 
   # O2b -- gross_usage must stay MONTHLY: it's the anomaly detector now,
@@ -268,30 +275,36 @@ run "plan_succeeds" {
   # undefined behaviour (QA confirmed: the unknown SNS topic ARN feeding
   # subscriber_sns_topic_arns on every notification block makes ordered
   # iteration over that set unreliable). So the ascending check below runs
-  # against var.budget_notification_thresholds -- also enforced by its own
-  # `validation` block in variables.tf, kept here too as a directed
-  # regression check, not "redundant-on-purpose belt-and-braces": on its
-  # own, asserting ascending-ness of the *variable* proves nothing about
-  # the *resource* it's meant to feed (review round 1, finding 3 -- QA
-  # proved this empirically by swapping the loop source for a literal
-  # [1, 2, 3] while the variable stayed [50, 80, 100] and the suite still
+  # against var.budget_monthly_thresholds (gross_usage's OWN thresholds
+  # variable, not credit_runway's -- see the scope amendment further below)
+  # -- also enforced by its own `validation` block in variables.tf, kept
+  # here too as a directed regression check, not "redundant-on-purpose
+  # belt-and-braces": on its own, asserting ascending-ness of the *variable*
+  # proves nothing about the *resource* it's meant to feed (review round 1,
+  # finding 3 -- QA proved this empirically by swapping the loop source for
+  # a literal while the variable stayed unchanged and the suite still
   # passed). The set-equality assert immediately below is what actually
   # ties the two together, order-independently and plan-evaluably.
   assert {
     condition = alltrue([
-      for i in range(max(length(var.budget_notification_thresholds) - 1, 0)) :
-      var.budget_notification_thresholds[i] < var.budget_notification_thresholds[i + 1]
+      for i in range(max(length(var.budget_monthly_thresholds) - 1, 0)) :
+      var.budget_monthly_thresholds[i] < var.budget_monthly_thresholds[i + 1]
     ])
-    error_message = "budget_notification_thresholds must be strictly ascending -- an inverted or duplicate threshold either fires immediately or never"
+    error_message = "budget_monthly_thresholds must be strictly ascending -- an inverted or duplicate threshold either fires immediately or never"
   }
 
   # Order-independent identity check: the set of threshold values actually
-  # reaching the resource must equal the set from the variable -- this is
-  # what proves local.budget_notifications wasn't built from some other
-  # source (a stray literal, a stale copy, etc).
+  # reaching the resource must equal the set from gross_usage's OWN
+  # variable (budget_monthly_thresholds), and -- because the mock values
+  # for the two threshold variables are deliberately disjoint ([100, 120,
+  # 150] vs [50, 80, 100]) -- NOT equal to credit_runway's
+  # (budget_credit_runway_thresholds). This is what proves
+  # local.gross_usage_notifications wasn't built from some other source (a
+  # stray literal, a stale copy, or -- the real bug this scope amendment
+  # fixes -- credit_runway's thresholds variable).
   assert {
-    condition     = toset([for n in aws_budgets_budget.gross_usage.notification : n.threshold]) == toset(var.budget_notification_thresholds)
-    error_message = "Notification thresholds on the resource must be exactly the set of values in var.budget_notification_thresholds"
+    condition     = toset([for n in aws_budgets_budget.gross_usage.notification : n.threshold]) == toset(var.budget_monthly_thresholds)
+    error_message = "gross_usage notification thresholds must be exactly the set of values in var.budget_monthly_thresholds, not var.budget_credit_runway_thresholds"
   }
 
   assert {
@@ -332,12 +345,13 @@ run "plan_succeeds" {
   }
 
   # limit_amount must trace to credit_runway's OWN variable, not
-  # gross_usage's -- the two sharing one variable was the bug. Mock values
-  # for the two variables are deliberately distinct (see the variables{}
-  # block above), so a regression that wires the wrong one in fails here.
+  # gross_usage's -- the two sharing one variable was a real bug. Mock
+  # values for the two variables are deliberately distinct (see the
+  # variables{} block above), so a regression that wires the wrong one in
+  # fails here.
   assert {
-    condition     = aws_budgets_budget.credit_runway.limit_amount == var.budget_credit_balance_amount
-    error_message = "credit_runway.limit_amount must come from var.budget_credit_balance_amount, not a literal or var.budget_monthly_limit_amount"
+    condition     = aws_budgets_budget.credit_runway.limit_amount == var.budget_credit_grant_amount
+    error_message = "credit_runway.limit_amount must come from var.budget_credit_grant_amount, not a literal or var.budget_monthly_limit_amount"
   }
 
   # time_period_start must be set and in AWS Budgets' documented format
@@ -373,9 +387,17 @@ run "plan_succeeds" {
     error_message = "Every credit_runway notification must use threshold_type = PERCENTAGE, not ABSOLUTE_VALUE"
   }
 
+  # Same shared-variable regression guard as gross_usage's O8-equivalent
+  # above, mirrored: must trace to credit_runway's OWN thresholds variable
+  # (budget_credit_runway_thresholds), NOT gross_usage's
+  # (budget_monthly_thresholds) -- the mock values are deliberately
+  # disjoint ([50, 80, 100] vs [100, 120, 150]), so a regression that swaps
+  # them (the stage-4 finding: a console budget with shared thresholds
+  # stuck permanently in ALARM) fails this instead of passing by
+  # coincidence.
   assert {
-    condition     = toset([for n in aws_budgets_budget.credit_runway.notification : n.threshold]) == toset(var.budget_notification_thresholds)
-    error_message = "credit_runway notification thresholds must be exactly the set of values in var.budget_notification_thresholds"
+    condition     = toset([for n in aws_budgets_budget.credit_runway.notification : n.threshold]) == toset(var.budget_credit_runway_thresholds)
+    error_message = "credit_runway notification thresholds must be exactly the set of values in var.budget_credit_runway_thresholds, not var.budget_monthly_thresholds"
   }
 
   assert {

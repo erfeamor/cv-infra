@@ -16,21 +16,33 @@
 # `describe-notifications-for-budget` reveals it -- see
 # aws_sns_topic_policy.budget_alerts below.
 #
-# Scope amendment (H1, ratified 2026-08-09): the account's remaining credit
-# balance ($121.03, plan = AWS Free plan -- exhaustion PAUSES the account
-# rather than billing it) is a CUMULATIVE pot, not a monthly figure. A
-# single MONTHLY budget set to that amount would read ~23% of limit every
-# month (burn is ~$28/mo) and never cross even the lowest 50% threshold
-# while the pot drains to zero -- the same never-fires failure class this
-# file exists to prevent, one level up. Fix: two budgets that answer two
-# different questions, both tracking gross usage (the crux applies to both):
-#   - aws_budgets_budget.gross_usage   (MONTHLY, below)  -- "did this month's
-#     burn accelerate?" Resized to ~$35, an anomaly-detector margin over the
-#     known ~$28/month baseline, driven by its own var.budget_monthly_limit_amount.
+# Scope amendment (H1, ratified 2026-08-09): the account's credit pot
+# (plan = AWS Free plan -- exhaustion PAUSES the account rather than
+# billing it) is CUMULATIVE, not a monthly figure. A single MONTHLY budget
+# set to a credit-pot-sized amount would read a small fraction of limit
+# every month and never cross even the lowest 50% threshold while the pot
+# drains to zero -- the same never-fires failure class this file exists to
+# prevent, one level up. Fix: two budgets that answer two different
+# questions, both tracking gross usage (the crux applies to both):
+#   - aws_budgets_budget.gross_usage   (MONTHLY, below)  -- "did this
+#     month's burn exceed expectations?" Limit is expected monthly spend
+#     (var.budget_monthly_limit_amount, $30), with its own thresholds
+#     (var.budget_monthly_thresholds, 100/120/150) that fire on deviation,
+#     not on progress toward a ceiling.
 #   - aws_budgets_budget.credit_runway (ANNUALLY, further below) -- "are we
-#     about to run out of credit?" Tracks the $121.03 pot via
-#     var.budget_credit_balance_amount. These two variables are deliberately
-#     separate -- sharing one between the two budgets was the bug.
+#     about to run out of credit?" Tracks the credit pot via
+#     var.budget_credit_grant_amount, with its own thresholds
+#     (var.budget_credit_runway_thresholds, 50/80/100, genuine depletion
+#     milestones).
+# Neither the limit variables nor the threshold variables are shared
+# between the two budgets -- sharing either was a real bug: sharing the
+# limit was caught before the first apply (a credit-pot-sized MONTHLY
+# budget never fires); sharing thresholds was caught AT stage 4 against the
+# live account -- a console-created $5 budget with the shared 50/80/100 set
+# sat permanently in ALARM, because ordinary ~$28/month burn crosses both
+# 50% and 80% of $5 every month. An alarm that always fires is one nobody
+# reads, which is exactly the failure this file exists to prevent, from the
+# opposite direction.
 
 data "aws_caller_identity" "current" {}
 
@@ -90,11 +102,21 @@ resource "aws_sns_topic_subscription" "budget_alerts_email" {
 }
 
 # DoR decision 2 (H1): one ACTUAL and one FORECASTED notification per
-# threshold, built from var.budget_notification_thresholds so ordering
+# threshold, built from each budget's OWN thresholds variable so ordering
 # and value are variable-sourced rather than hand-duplicated per type.
+# Two separate locals, not one shared: gross_usage and credit_runway have
+# different threshold variables (see the file header) and must not
+# accidentally converge on a shared list the way the pre-stage-4 shape did.
 locals {
-  budget_notifications = flatten([
-    for threshold in var.budget_notification_thresholds : [
+  gross_usage_notifications = flatten([
+    for threshold in var.budget_monthly_thresholds : [
+      { threshold = threshold, notification_type = "ACTUAL" },
+      { threshold = threshold, notification_type = "FORECASTED" },
+    ]
+  ])
+
+  credit_runway_notifications = flatten([
+    for threshold in var.budget_credit_runway_thresholds : [
       { threshold = threshold, notification_type = "ACTUAL" },
       { threshold = threshold, notification_type = "FORECASTED" },
     ]
@@ -105,11 +127,11 @@ resource "aws_budgets_budget" "gross_usage" {
   name        = "${var.project_name}-${var.environment}-gross-usage"
   budget_type = "COST"
   # Scope amendment: this is now an ANOMALY DETECTOR, not the credit-runway
-  # tracker -- its limit is var.budget_monthly_limit_amount (~$35, a margin
-  # over the known ~$28/month baseline), deliberately NOT
-  # var.budget_credit_balance_amount. See the file header for why sharing a
-  # limit variable between this and credit_runway (below) was the bug the
-  # amendment fixes.
+  # tracker -- its limit is var.budget_monthly_limit_amount ($30, expected
+  # monthly spend now that burn is back under $1/day post-RDS-teardown),
+  # deliberately NOT var.budget_credit_grant_amount. See the file header
+  # for why sharing a limit variable between this and credit_runway (below)
+  # was a real bug.
   limit_amount = var.budget_monthly_limit_amount
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
@@ -126,8 +148,12 @@ resource "aws_budgets_budget" "gross_usage" {
     include_refund = false
   }
 
+  # Own thresholds (var.budget_monthly_thresholds via
+  # local.gross_usage_notifications, NOT credit_runway's) -- 100/120/150 by
+  # default: at $30 expected spend, only exceeding it is news. Steady-state
+  # ~$28/month burn produces zero notifications here.
   dynamic "notification" {
-    for_each = local.budget_notifications
+    for_each = local.gross_usage_notifications
     content {
       comparison_operator       = "GREATER_THAN"
       threshold                 = notification.value.threshold
@@ -154,11 +180,14 @@ resource "aws_budgets_budget" "gross_usage" {
 resource "aws_budgets_budget" "credit_runway" {
   name        = "${var.project_name}-${var.environment}-credit-runway"
   budget_type = "COST"
-  # The CUMULATIVE remaining credit balance ($121.03 as measured), not a
-  # monthly figure -- see variables.tf. Deliberately NOT
-  # var.budget_monthly_limit_amount; the two budgets must not share a limit
-  # variable.
-  limit_amount = var.budget_credit_balance_amount
+  # The TOTAL credit grant for the calendar year ($160 as measured -- see
+  # variables.tf for why this is the grant, not the remaining balance),
+  # not a monthly figure. Deliberately NOT var.budget_monthly_limit_amount;
+  # the two budgets must not share a limit variable. Expected to become
+  # $200 once two more credit-earning activities complete -- update the
+  # real (gitignored) terraform.tfvars value when that happens, this
+  # comment is a pointer for the next reader, not a trigger to pre-apply it.
+  limit_amount = var.budget_credit_grant_amount
   limit_unit   = "USD"
   # ANNUALLY, not MONTHLY: the thing being tracked is a pot that must last
   # until it's gone, not a per-month allowance. AWS Budgets has no
@@ -166,35 +195,31 @@ resource "aws_budgets_budget" "credit_runway" {
   # -- if the pot is still alive next January the resource keeps working,
   # it just resets to tracking spend against the same limit_amount from the
   # new calendar year's stub period (see time_period_start note below); a
-  # human still has to re-measure and update budget_credit_balance_amount
+  # human still has to re-measure and update budget_credit_grant_amount
   # periodically regardless of window choice, since AWS Budgets has no way
   # to decrement a limit as credits are consumed.
   time_unit = "ANNUALLY"
 
-  # time_period_start: AWS Budgets aligns a budget's periods to calendar
-  # boundaries of its time_unit (year boundaries here) regardless of the
-  # start date supplied -- the *first* period runs from time_period_start to
-  # the end of the current calendar year as a stub, then subsequent periods
-  # are full calendar years. There is no "start tracking exactly at this
-  # instant, carry a clean $0 baseline" option; the only real choice is
-  # which calendar-month boundary to anchor the stub period to. Anchoring to
-  # the 1st of the CURRENT month (2026-08-01) rather than NEXT month
-  # (2026-09-01) is deliberate, not a default-of-convenience:
-  #   - Chose 2026-08-01: this DOUBLE-COUNTS the ~$16.06 of gross usage
-  #     already burned between 2026-08-01 and today (2026-08-09, per the
-  #     task doc's recorded Aug-to-date figure) -- spend that already
-  #     reduced the $121.03 balance before this budget existed. The runway
-  #     budget will therefore read ~$16 higher than the credit pot's actual
-  #     remaining burn at any given moment this month.
-  #   - The alternative, 2026-09-01, UNDER-counts instead: it would ignore
-  #     the ~$20 of expected gross usage between today and end of August
-  #     (~22 remaining days x ~$0.92/day), delaying every threshold crossing
-  #     by roughly that much.
-  # Between over- and under-counting, over-counting is the safer error for
-  # a budget this task exists to make fire reliably: it moves every
-  # threshold crossing slightly EARLIER, not later or not-at-all. Recorded
-  # here rather than silently absorbed so a future reader isn't misled into
-  # thinking this figure is exact.
+  # time_period_start: CORRECTED at stage 4, against the live account.
+  # The original comment here assumed time_period_start constrains what
+  # spend gets counted -- it does not. Applied evidence: with
+  # time_period_start = "2026-08-01_00:00" below, the live budget reported
+  # `actual = $39.339`, not August's $16.435 -- the difference is exactly
+  # July's $22.904. So an ANNUALLY budget accumulates spend over the WHOLE
+  # CALENDAR YEAR (Jan 1 onward) regardless of the time_period_start value
+  # supplied; that value only anchors which day-of-year the period nominally
+  # "starts" for AWS's own bookkeeping (e.g. renewal timing in later years),
+  # it does not gate what spend counts toward `actual`/`forecasted` in the
+  # current period. There is no way to start a clean $0 baseline "from
+  # roughly now" for an ANNUALLY budget -- all 2026 spend counts, full stop.
+  # This is why var.budget_credit_grant_amount must hold the TOTAL grant
+  # ($160), not the remaining balance measured on some later date ($121.03
+  # as of 2026-08-09): against calendar-year spend, only the grant total
+  # makes the percentage thresholds land on true depletion. The instinct to
+  # prefer over- to under-counting (kept as time_period_start's value below,
+  # for whatever marginal effect it has on AWS's internal bookkeeping) was
+  # directionally right and is why this was caught before it caused a
+  # silent under-alarm rather than after.
   time_period_start = "2026-08-01_00:00"
 
   # Same crux as gross_usage, same reasoning (see file header): every
@@ -207,9 +232,12 @@ resource "aws_budgets_budget" "credit_runway" {
   }
 
   # Same notification shape as gross_usage (H1 DoR decision 4): both ACTUAL
-  # and FORECASTED per threshold, same thresholds variable, same topic.
+  # and FORECASTED per threshold, same topic -- but its OWN thresholds
+  # variable (var.budget_credit_runway_thresholds via
+  # local.credit_runway_notifications, NOT gross_usage's), genuine
+  # depletion milestones (50/80/100 by default).
   dynamic "notification" {
-    for_each = local.budget_notifications
+    for_each = local.credit_runway_notifications
     content {
       comparison_operator       = "GREATER_THAN"
       threshold                 = notification.value.threshold

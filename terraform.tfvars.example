@@ -20,3 +20,45 @@ drone_github_client_secret = "REPLACE_ME"
 jenkins_admin_username = "erfeamor"
 jenkins_admin_password = "REPLACE_ME" # openssl rand -base64 24
 github_pat_ci          = "REPLACE_ME" # repo:status scope only (classic) or fine-grained Commit-statuses:read/write on cv-domain-service + cv-database
+
+# T-011: two budget alarms, both tracking gross usage (include_credit =
+# false, see budgets.tf) -- they answer two different questions and must
+# never share a limit variable OR a thresholds variable (both sharings were
+# real bugs: the limit one caught before the first apply, the thresholds
+# one caught at stage 4 against the live account -- a console-created
+# budget with shared 50/80/100 thresholds against ordinary monthly burn sat
+# permanently in ALARM).
+
+# budget_credit_grant_amount: the TOTAL Free Tier credit GRANT for the
+# calendar year, tracked by the ANNUALLY aws_budgets_budget.credit_runway.
+# NOT the remaining balance -- AWS accumulates an ANNUALLY budget's spend
+# over the whole calendar year regardless of time_period_start (confirmed
+# at stage 4), so only the grant total makes the percentage thresholds land
+# on true depletion. REPLACE_ME_MEASURED_USD is a deliberate, obviously-fake
+# placeholder -- do not treat it as a real limit. The real figure is a
+# console read (Billing -> Credits), not a guess. Expected to grow over
+# time as more credit-earning activities complete -- re-measure and update
+# rather than treating any single figure as permanent.
+budget_credit_grant_amount = "REPLACE_ME_MEASURED_USD"
+
+# budget_monthly_limit_amount: the MONTHLY limit for
+# aws_budgets_budget.gross_usage, representing EXPECTED monthly spend (not
+# a margin above it -- budget_monthly_thresholds below is what turns this
+# into an anomaly detector). Ships with a real default (see variables.tf)
+# since it's a ratified design figure over an already-measured baseline,
+# not a value needing a fresh console read -- override here only if the
+# baseline burn rate changes materially.
+budget_monthly_limit_amount = "30"
+
+# budget_credit_runway_thresholds: aws_budgets_budget.credit_runway's OWN
+# thresholds -- genuine milestones on the way to credit depletion.
+budget_credit_runway_thresholds = [50, 80, 100]
+
+# budget_monthly_thresholds: aws_budgets_budget.gross_usage's OWN
+# thresholds -- since budget_monthly_limit_amount represents expected
+# spend, these mark deviation from it (100% = over expectation, 120% =
+# materially over, 150% = something's wrong), not progress toward a
+# ceiling. Steady-state burn produces zero notifications.
+budget_monthly_thresholds = [100, 120, 150]
+
+budget_notification_emails = ["REPLACE_ME@example.com"]

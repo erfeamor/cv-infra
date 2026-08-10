@@ -20,6 +20,15 @@ mock_provider "aws" {
       id = "ami-00000000000000000"
     }
   }
+
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "123456789012"
+      arn        = "arn:aws:iam::123456789012:root"
+      id         = "123456789012"
+      user_id    = "AIDACKCEVSQ6C2EXAMPLE"
+    }
+  }
 }
 
 variables {
@@ -29,6 +38,23 @@ variables {
   drone_github_client_secret = "test-client-secret-not-real"
   jenkins_admin_password     = "test-jenkins-password-not-real"
   github_pat_ci              = "test-github-pat-not-real"
+
+  # T-011: no default on budget_credit_grant_amount by design (see
+  # variables.tf) -- test value only, never a number that could pass for a
+  # real measured figure. budget_monthly_limit_amount is given a distinct
+  # test value too (rather than relying on its real default of "30") so a
+  # regression that wires the SAME variable into both budgets' limit_amount
+  # -- a real bug this scope amendment fixed -- makes the identity
+  # assertions below fail instead of coincidentally matching. Same trick
+  # for the two threshold variables: credit_runway's and gross_usage's are
+  # given disjoint test values so a regression that swaps them (the second
+  # real bug this amendment fixed, caught at stage 4 against the live
+  # account) fails loudly too.
+  budget_credit_grant_amount      = "160"
+  budget_monthly_limit_amount     = "30"
+  budget_credit_runway_thresholds = [50, 80, 100]
+  budget_monthly_thresholds       = [100, 120, 150]
+  budget_notification_emails      = ["test-budget-alerts@example.com"]
 }
 
 run "plan_succeeds" {
@@ -147,4 +173,241 @@ run "plan_succeeds" {
     condition     = contains([for b in aws_cloudfront_distribution.frontend.ordered_cache_behavior : b.path_pattern], "/api/*")
     error_message = "CloudFront must route /api/* to the domain service (mixed-content fix for the SPAs)"
   }
+
+  # --- T-011: budget alarm that fires on gross usage, not net-of-credit ---
+
+  # O1 -- the crux. A regression here silently makes the whole feature a
+  # no-op: aws_budgets_budget defaults include_credit = true (net cost),
+  # which reads $0 on this account until the credit pool is exhausted.
+  assert {
+    condition     = aws_budgets_budget.gross_usage.cost_types[0].include_credit == false
+    error_message = "aws_budgets_budget must track GROSS usage (cost_types.include_credit = false) -- net cost reads $0 on this account until credits run out"
+  }
+
+  # O2 -- resource shape.
+  assert {
+    condition     = aws_budgets_budget.gross_usage.budget_type == "COST" && aws_budgets_budget.gross_usage.limit_unit == "USD"
+    error_message = "Budget must be a COST budget denominated in USD"
+  }
+
+  # O3 -- limit must trace to gross_usage's OWN variable, not a literal
+  # baked into the resource block, and NOT credit_runway's variable -- the
+  # two budgets sharing a limit variable was a real bug caught before the
+  # first apply (a credit-pot-sized MONTHLY limit against ~$28/month burn
+  # never crosses even the 50% threshold). The mock values for the two
+  # variables are deliberately distinct ("30" vs "160"), so a regression
+  # that wires the wrong one in fails this instead of passing by
+  # coincidence.
+  assert {
+    condition     = aws_budgets_budget.gross_usage.limit_amount == var.budget_monthly_limit_amount
+    error_message = "gross_usage.limit_amount must come from var.budget_monthly_limit_amount, not a literal or var.budget_credit_grant_amount"
+  }
+
+  # O2b -- gross_usage must stay MONTHLY: it's the anomaly detector now,
+  # not the credit-runway tracker (credit_runway, asserted further below,
+  # covers ANNUALLY).
+  assert {
+    condition     = aws_budgets_budget.gross_usage.time_unit == "MONTHLY"
+    error_message = "gross_usage must remain a MONTHLY budget -- it detects burn acceleration, not credit exhaustion"
+  }
+
+  # O4 -- both notification types must be present: forecast buys warning
+  # time at the known ~$0.92/day burn rate, actual confirms it.
+  assert {
+    condition = (
+      contains([for n in aws_budgets_budget.gross_usage.notification : n.notification_type], "ACTUAL") &&
+      contains([for n in aws_budgets_budget.gross_usage.notification : n.notification_type], "FORECASTED")
+    )
+    error_message = "Budget must have at least one ACTUAL and one FORECASTED notification"
+  }
+
+  # O5 -- wrong operator here fires immediately (LESS_THAN) or never
+  # (a stray EQUAL_TO) -- classic copy-paste bug.
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.gross_usage.notification : n.comparison_operator == "GREATER_THAN"])
+    error_message = "Every notification must use comparison_operator = GREATER_THAN"
+  }
+
+  # Finding 7 (review round 1): if threshold_type were flipped to
+  # ABSOLUTE_VALUE, threshold 50 would silently mean $50 instead of 50%,
+  # and against a ~$28/month budget nothing would ever fire -- without this
+  # assert, none of O1-O6/O8 would have caught it.
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.gross_usage.notification : n.threshold_type == "PERCENTAGE"])
+    error_message = "Every notification must use threshold_type = PERCENTAGE, not ABSOLUTE_VALUE"
+  }
+
+  # O6 -- a budget alarm that notifies nobody is worse than no budget.
+  # Checked at both ends: the human-facing subscriber list is non-empty and
+  # sourced from a variable (not hardcoded), and it actually drives an SNS
+  # subscription for each address (DoR decision 3: SNS over a bare email
+  # subscriber, because its confirmation state is CLI-queryable).
+  assert {
+    condition     = length(var.budget_notification_emails) > 0
+    error_message = "budget_notification_emails must be non-empty"
+  }
+
+  # Finding 2 (review round 1): a prior version of this assert compared
+  # cardinality only (length == length), which passes identically whether
+  # aws_sns_topic_subscription.budget_alerts_email's for_each is keyed by
+  # var.budget_notification_emails or by an equally-sized but wrong,
+  # hardcoded set of addresses -- QA proved this empirically. Compare
+  # identity (the actual key sets), not just count.
+  assert {
+    condition     = toset(keys(aws_sns_topic_subscription.budget_alerts_email)) == toset(var.budget_notification_emails)
+    error_message = "aws_sns_topic_subscription.budget_alerts_email must have exactly one entry per address in var.budget_notification_emails -- same addresses, not just same count"
+  }
+
+  # O7 -- NOT tested here, deliberately, same documented limitation as
+  # aws_eip.drone.public_ip above: aws_sns_topic.budget_alerts.arn is
+  # unknown-until-apply under `command = plan`, and it feeds
+  # subscriber_sns_topic_arns on every notification block, so nothing
+  # downstream of that ARN is assertable under mock_provider's plan output
+  # either. A real check needs a `command = apply` run (safe under
+  # mock_provider) or S1/S5 at stage 4 against the live account -- not
+  # invented here, per the task's own instruction not to add one.
+
+  # O8 -- thresholds must be > 0 and ascending, catching an
+  # inverted/duplicate threshold. The notification block is a TypeSet
+  # (confirmed via `terraform providers schema -json`), so its plan-output
+  # order is not guaranteed to reflect declaration order -- asserting
+  # "ascending" against that iteration order would be asserting on
+  # undefined behaviour (QA confirmed: the unknown SNS topic ARN feeding
+  # subscriber_sns_topic_arns on every notification block makes ordered
+  # iteration over that set unreliable). So the ascending check below runs
+  # against var.budget_monthly_thresholds (gross_usage's OWN thresholds
+  # variable, not credit_runway's -- see the scope amendment further below)
+  # -- also enforced by its own `validation` block in variables.tf, kept
+  # here too as a directed regression check, not "redundant-on-purpose
+  # belt-and-braces": on its own, asserting ascending-ness of the *variable*
+  # proves nothing about the *resource* it's meant to feed (review round 1,
+  # finding 3 -- QA proved this empirically by swapping the loop source for
+  # a literal while the variable stayed unchanged and the suite still
+  # passed). The set-equality assert immediately below is what actually
+  # ties the two together, order-independently and plan-evaluably.
+  assert {
+    condition = alltrue([
+      for i in range(max(length(var.budget_monthly_thresholds) - 1, 0)) :
+      var.budget_monthly_thresholds[i] < var.budget_monthly_thresholds[i + 1]
+    ])
+    error_message = "budget_monthly_thresholds must be strictly ascending -- an inverted or duplicate threshold either fires immediately or never"
+  }
+
+  # Order-independent identity check: the set of threshold values actually
+  # reaching the resource must equal the set from gross_usage's OWN
+  # variable (budget_monthly_thresholds), and -- because the mock values
+  # for the two threshold variables are deliberately disjoint ([100, 120,
+  # 150] vs [50, 80, 100]) -- NOT equal to credit_runway's
+  # (budget_credit_runway_thresholds). This is what proves
+  # local.gross_usage_notifications wasn't built from some other source (a
+  # stray literal, a stale copy, or -- the real bug this scope amendment
+  # fixes -- credit_runway's thresholds variable).
+  assert {
+    condition     = toset([for n in aws_budgets_budget.gross_usage.notification : n.threshold]) == toset(var.budget_monthly_thresholds)
+    error_message = "gross_usage notification thresholds must be exactly the set of values in var.budget_monthly_thresholds, not var.budget_credit_runway_thresholds"
+  }
+
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.gross_usage.notification : n.threshold > 0])
+    error_message = "Every notification threshold must be > 0"
+  }
+
+  # --- T-011 scope amendment (2026-08-09): aws_budgets_budget.credit_runway,
+  # the cumulative credit-pot tracker added alongside the resized
+  # gross_usage anomaly detector above. Same rigour, same crux, per-resource
+  # rather than assumed-shared. ---
+
+  # Crux, on the new resource too (the task's own instruction, not
+  # optional): a regression here silently makes THIS budget a no-op the
+  # same way it would for gross_usage -- net cost reads $0 against the
+  # credit pot until the pot itself is gone, which is exactly the moment
+  # this budget exists to warn about in advance.
+  assert {
+    condition     = aws_budgets_budget.credit_runway.cost_types[0].include_credit == false
+    error_message = "aws_budgets_budget.credit_runway must track GROSS usage (cost_types.include_credit = false) -- net cost reads $0 against the credit pot until it's already gone"
+  }
+
+  assert {
+    condition     = aws_budgets_budget.credit_runway.cost_types[0].include_refund == false
+    error_message = "aws_budgets_budget.credit_runway must exclude refunds too (cost_types.include_refund = false) -- same metric-masking failure mode as include_credit"
+  }
+
+  # Resource shape, including the amendment's actual point: ANNUALLY, not
+  # MONTHLY -- this tracks a cumulative pot, not a per-month allowance.
+  assert {
+    condition     = aws_budgets_budget.credit_runway.budget_type == "COST" && aws_budgets_budget.credit_runway.limit_unit == "USD"
+    error_message = "credit_runway must be a COST budget denominated in USD"
+  }
+
+  assert {
+    condition     = aws_budgets_budget.credit_runway.time_unit == "ANNUALLY"
+    error_message = "credit_runway must be ANNUALLY -- it tracks the cumulative credit pot, not a monthly allowance (that's gross_usage's job)"
+  }
+
+  # limit_amount must trace to credit_runway's OWN variable, not
+  # gross_usage's -- the two sharing one variable was a real bug. Mock
+  # values for the two variables are deliberately distinct (see the
+  # variables{} block above), so a regression that wires the wrong one in
+  # fails here.
+  assert {
+    condition     = aws_budgets_budget.credit_runway.limit_amount == var.budget_credit_grant_amount
+    error_message = "credit_runway.limit_amount must come from var.budget_credit_grant_amount, not a literal or var.budget_monthly_limit_amount"
+  }
+
+  # time_period_start must be set and in AWS Budgets' documented format
+  # (YYYY-MM-DD_HH:MM). Deliberately NOT pinned to the exact literal chosen
+  # in budgets.tf (2026-08-01_00:00) -- that value is time-relative by
+  # nature (see the honesty comment in budgets.tf) and pinning it here would
+  # make this assertion fail for a reason that has nothing to do with a
+  # regression the day this file is next touched.
+  assert {
+    condition     = aws_budgets_budget.credit_runway.time_period_start != null && can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}:[0-9]{2}$", aws_budgets_budget.credit_runway.time_period_start))
+    error_message = "credit_runway.time_period_start must be set, in AWS Budgets' documented YYYY-MM-DD_HH:MM format"
+  }
+
+  # Notification shape, same as O4/O5/threshold_type on gross_usage: both
+  # ACTUAL and FORECASTED, GREATER_THAN, PERCENTAGE -- not re-derived from
+  # gross_usage's assertions because a regression scoped to just this
+  # resource's dynamic block wouldn't otherwise be caught.
+  assert {
+    condition = (
+      contains([for n in aws_budgets_budget.credit_runway.notification : n.notification_type], "ACTUAL") &&
+      contains([for n in aws_budgets_budget.credit_runway.notification : n.notification_type], "FORECASTED")
+    )
+    error_message = "credit_runway must have at least one ACTUAL and one FORECASTED notification"
+  }
+
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.credit_runway.notification : n.comparison_operator == "GREATER_THAN"])
+    error_message = "Every credit_runway notification must use comparison_operator = GREATER_THAN"
+  }
+
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.credit_runway.notification : n.threshold_type == "PERCENTAGE"])
+    error_message = "Every credit_runway notification must use threshold_type = PERCENTAGE, not ABSOLUTE_VALUE"
+  }
+
+  # Same shared-variable regression guard as gross_usage's O8-equivalent
+  # above, mirrored: must trace to credit_runway's OWN thresholds variable
+  # (budget_credit_runway_thresholds), NOT gross_usage's
+  # (budget_monthly_thresholds) -- the mock values are deliberately
+  # disjoint ([50, 80, 100] vs [100, 120, 150]), so a regression that swaps
+  # them (the stage-4 finding: a console budget with shared thresholds
+  # stuck permanently in ALARM) fails this instead of passing by
+  # coincidence.
+  assert {
+    condition     = toset([for n in aws_budgets_budget.credit_runway.notification : n.threshold]) == toset(var.budget_credit_runway_thresholds)
+    error_message = "credit_runway notification thresholds must be exactly the set of values in var.budget_credit_runway_thresholds, not var.budget_monthly_thresholds"
+  }
+
+  assert {
+    condition     = alltrue([for n in aws_budgets_budget.credit_runway.notification : n.threshold > 0])
+    error_message = "Every credit_runway notification threshold must be > 0"
+  }
+
+  # Not tested here, deliberately, same O7 limitation documented above for
+  # gross_usage: aws_sns_topic.budget_alerts.arn is unknown-until-apply
+  # under `command = plan`, so subscriber_sns_topic_arns on credit_runway's
+  # notification blocks isn't assertable here either. Same S1/S5 stage-4
+  # coverage applies to this resource too.
 }

@@ -132,10 +132,19 @@ variable "budget_credit_grant_amount" {
   #
   # Currently $160 (measured: $160 granted, $39.34 already spent this
   # year, $121.03 remaining -- consistent figures, different question).
-  # Expected to become $200 once two more credit-earning activities are
-  # completed -- this is a known, planned future change to the real
-  # (gitignored) terraform.tfvars value, not something to guess or
-  # pre-apply here.
+  # DO NOT raise this to $200 when the two remaining credit-earning
+  # activities land, even though the grant will genuinely become $200.
+  # Reason (T-010, measured): this account is on the FREE plan, whose
+  # 6-month window closes ~2027-01-12 -- BEFORE a $200 grant would be
+  # exhausted (~2027-02-01 at $0.92/day). Raising the limit to $200 pushes
+  # the 100% alert to 1 Feb, i.e. ~20 days AFTER the account has already
+  # been paused: an alarm that fires only once it no longer matters.
+  # Held at $160, the thresholds fire 24 Sep / 15 Nov / 20 Dec -- all
+  # usefully before the window. So 100% here no longer means "credits
+  # exhausted"; it means "~3 weeks left before the plan window closes",
+  # which is the deadline that actually binds. Revisit only if the account
+  # moves to the Paid plan, where credit exhaustion becomes the real limit
+  # again.
   description = "Total AWS Free Tier credit GRANT for the current calendar year, in USD (aws_budgets_budget.credit_runway.limit_amount) -- credit_runway is ANNUALLY and AWS accumulates its spend over the whole calendar year regardless of time_period_start, so this must be the total grant, not a remaining balance measured partway through the year. Must come from a measured console read -- do not invent a value here."
   type        = string
 

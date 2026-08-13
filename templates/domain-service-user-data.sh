@@ -82,3 +82,71 @@ docker run -d --name domain-service --restart unless-stopped --network cv \
   -e AUTH_ENABLED=true \
   -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
   "${image}"
+
+# --- Nightly MySQL backup: mysqldump -> S3 (T-001) ---
+# RDS's managed backups went away when MySQL moved onto this instance (see
+# CLAUDE.md's "No RDS" decision) -- this timer is the replacement. The dump
+# script re-reads the DB password from SSM at run time rather than reusing
+# this boot script's copy: a systemd timer fires long after this process has
+# exited, so nothing sensitive can be inherited from this shell.
+cat > /usr/local/bin/mysql-backup.sh <<'BACKUP_SCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+DB_PASSWORD=$(aws ssm get-parameter --with-decryption --region "${aws_region}" \
+  --name "/${project_name}/${environment}/db/password" \
+  --query Parameter.Value --output text)
+
+TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DUMP_FILE="/tmp/mysql-dump-$TIMESTAMP.sql.gz"
+
+# pipefail (set above) makes this pipeline's exit status the FIRST non-zero
+# exit among mysqldump/gzip, so a mysqldump failure mid-stream is caught
+# here even though gzip itself always exits 0. The dump lands in a local
+# temp file first and is uploaded only if the pipeline succeeded AND the
+# file is non-empty -- a bad run therefore never reaches S3, let alone
+# clobbers the last good dump (every upload also gets its own timestamped
+# key, for the same reason).
+if ! docker exec mysql mysqldump -u root -p"$DB_PASSWORD" --single-transaction --quick "${db_name}" | gzip > "$DUMP_FILE"; then
+  echo "mysqldump failed -- not uploading a partial dump" >&2
+  rm -f "$DUMP_FILE"
+  exit 1
+fi
+
+if [ ! -s "$DUMP_FILE" ]; then
+  echo "dump file is empty -- not uploading" >&2
+  rm -f "$DUMP_FILE"
+  exit 1
+fi
+
+aws s3 cp "$DUMP_FILE" "s3://${backup_bucket}/${backup_prefix}/${db_name}-$TIMESTAMP.sql.gz"
+rm -f "$DUMP_FILE"
+BACKUP_SCRIPT
+chmod 700 /usr/local/bin/mysql-backup.sh
+
+cat > /etc/systemd/system/mysql-backup.service <<'EOF'
+[Unit]
+Description=Nightly mysqldump of the self-hosted MySQL container to S3
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mysql-backup.sh
+EOF
+
+cat > /etc/systemd/system/mysql-backup.timer <<'EOF'
+[Unit]
+Description=Nightly trigger for mysql-backup.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now mysql-backup.timer

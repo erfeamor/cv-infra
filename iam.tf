@@ -46,6 +46,28 @@ resource "aws_iam_role_policy" "read_parameters" {
   })
 }
 
+# Nightly mysqldump upload (T-001) -- scoped to the backup prefix only,
+# never the bucket root and never s3:*. AbortMultipartUpload is deliberately
+# omitted: these are small logical dumps of a test-data database uploaded
+# with a single `aws s3 cp`, well under the multipart threshold, so the
+# extra permission has no justified use today (see the lifecycle rule's
+# abort_incomplete_multipart_upload in backup.tf for cleanup instead).
+resource "aws_iam_role_policy" "mysql_backup_upload" {
+  name = "mysql-backup-upload"
+  role = aws_iam_role.domain_service.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "${aws_s3_bucket.backup.arn}/${local.mysql_backup_prefix}/*"
+      }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "domain_service" {
   name = "${var.project_name}-domain-service"
   role = aws_iam_role.domain_service.name

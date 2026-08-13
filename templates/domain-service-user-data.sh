@@ -93,6 +93,14 @@ cat > /usr/local/bin/mysql-backup.sh <<'BACKUP_SCRIPT'
 #!/bin/bash
 set -euo pipefail
 
+# The dump is the entire database, so it must never be readable outside root
+# while it sits on local disk. Root's default umask here is 022, which would
+# create it 0644 — world-readable for the whole window between the redirect
+# below and the rm. Nothing else on this box can read /tmp today, but that is a
+# property of what happens to run here, not of this script; 077 makes it hold
+# regardless.
+umask 077
+
 DB_PASSWORD=$(aws ssm get-parameter --with-decryption --region "${aws_region}" \
   --name "/${project_name}/${environment}/db/password" \
   --query Parameter.Value --output text)

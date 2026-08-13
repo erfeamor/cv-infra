@@ -410,4 +410,117 @@ run "plan_succeeds" {
   # under `command = plan`, so subscriber_sns_topic_arns on credit_runway's
   # notification blocks isn't assertable here either. Same S1/S5 stage-4
   # coverage applies to this resource too.
+
+  # --- T-001: mysqldump -> S3 nightly backup, replacing RDS's managed
+  # backups for the self-hosted MySQL container ---
+
+  assert {
+    condition     = aws_s3_bucket.backup.bucket == "${var.project_name}-mysql-backup-${var.environment}"
+    error_message = "Backup bucket name must follow the project/environment naming convention"
+  }
+
+  # Crux of the "block ALL public access" requirement -- same posture as
+  # aws_s3_bucket_public_access_block.frontend.
+  assert {
+    condition = (
+      aws_s3_bucket_public_access_block.backup.block_public_acls == true &&
+      aws_s3_bucket_public_access_block.backup.block_public_policy == true &&
+      aws_s3_bucket_public_access_block.backup.ignore_public_acls == true &&
+      aws_s3_bucket_public_access_block.backup.restrict_public_buckets == true
+    )
+    error_message = "Backup bucket must block ALL public access -- all four settings must be true"
+  }
+
+  # aws_s3_bucket.backup.id/.arn and everything downstream of them (the
+  # public access block's own `bucket` link, the IAM policy's rendered JSON,
+  # aws_instance.domain_service.user_data) are unknown-until-apply under
+  # `command = plan` -- same documented limitation as aws_eip.drone.public_ip
+  # and aws_sns_topic.budget_alerts.arn above. Those checks live in the
+  # `command = apply` run block below instead (safe under mock_provider,
+  # since nothing real gets created).
+
+  # Retention: a handful of daily dumps, not indefinite accumulation --
+  # credit-funded (T-010), so this must stay negligible.
+  assert {
+    condition = anytrue([
+      for rule in aws_s3_bucket_lifecycle_configuration.backup.rule :
+      rule.status == "Enabled" && rule.expiration[0].days > 0 && rule.expiration[0].days <= 14
+    ])
+    error_message = "Backup bucket must have an enabled lifecycle rule expiring dumps within roughly two weeks -- retention should stay negligible against the credit burn"
+  }
+
+  # The lifecycle rule must actually scope to the backup prefix -- an
+  # unscoped rule would still pass a naive "does a rule exist" check but
+  # wouldn't prove it targets the right objects.
+  assert {
+    condition = anytrue([
+      for rule in aws_s3_bucket_lifecycle_configuration.backup.rule :
+      length(rule.filter) > 0 && rule.filter[0].prefix == "${local.mysql_backup_prefix}/"
+    ])
+    error_message = "The expiration rule must filter on the mysql-dumps/ prefix"
+  }
+
+}
+
+# --- T-001 identity/ARN assertions, run under `command = apply` ---
+# aws_s3_bucket.backup.arn/.id and aws_iam_role.domain_service.id are
+# computed and unknown-until-apply, so the assertions that actually prove
+# IAM scoping (the ones a reviewer will check hardest) need an applied plan
+# to have concrete values to compare -- same rationale as the O7/N5 comments
+# above. mock_provider makes an apply of these two resources safe -- EXCEPT
+# that an unscoped/full-module apply would also create
+# null_resource.jenkins_provision (ci.tf), whose local-exec provisioner
+# shells out to real `aws ssm` commands regardless of the AWS provider being
+# mocked (confirmed empirically: it ran for real and only failed because the
+# mock instance ID doesn't exist). plan_options.target below restricts this
+# run to exactly the two backup resources and their dependencies, so
+# aws_instance.drone / null_resource.jenkins_provision are never reached.
+run "backup_iam_scoping" {
+  command = apply
+
+  plan_options {
+    target = [
+      aws_iam_role_policy.mysql_backup_upload,
+      aws_s3_bucket_public_access_block.backup,
+    ]
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.mysql_backup_upload.role == aws_iam_role.domain_service.id
+    error_message = "The backup upload policy must attach to the domain_service role -- that's the role the backup timer runs under"
+  }
+
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.mysql_backup_upload.policy).Statement[0].Action == ["s3:PutObject"]
+    error_message = "The backup upload policy must grant only s3:PutObject -- not s3:*, not a broader action set"
+  }
+
+  # The assertion a reviewer will check hardest (task's own words): the
+  # Resource ARN must visibly show scoping to the backup prefix -- not the
+  # bucket root, not a wildcard bucket ARN, not s3:*.
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.mysql_backup_upload.policy).Statement[0].Resource == "${aws_s3_bucket.backup.arn}/${local.mysql_backup_prefix}/*"
+    error_message = "The backup upload policy's Resource must be scoped to the backup bucket's mysql-dumps/ prefix specifically -- not the bucket ARN alone (bucket root) and not a bare wildcard"
+  }
+
+  # Negative check: the Resource must NOT be the bucket ARN by itself (that
+  # would grant PutObject bucket-wide, defeating prefix scoping).
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.mysql_backup_upload.policy).Statement[0].Resource != aws_s3_bucket.backup.arn
+    error_message = "The backup upload policy's Resource must not be the bare bucket ARN -- that grants PutObject bucket-wide instead of prefix-scoped"
+  }
+
+  assert {
+    condition     = aws_s3_bucket_public_access_block.backup.bucket == aws_s3_bucket.backup.id
+    error_message = "The public access block must target the backup bucket, not some other bucket"
+  }
+
+  # NOT tested here, deliberately, same O7/N5-style limitation documented
+  # above: proving aws_instance.domain_service.user_data actually contains
+  # the backup bucket name would need targeting the instance itself, which
+  # pulls in aws_cloudfront_distribution.frontend and its dependents --
+  # confirmed empirically to fail at destroy/teardown under mock_provider
+  # (invalid mock ARN format rejected by aws_cloudfront_function's
+  # function_association). The wiring is covered by `terraform validate` +
+  # code review instead of an assertion here.
 }

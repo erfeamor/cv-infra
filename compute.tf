@@ -40,6 +40,8 @@ resource "aws_instance" "domain_service" {
     db_name           = var.db_name
     db_username       = var.db_username
     cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name
+    backup_bucket     = aws_s3_bucket.backup.bucket
+    backup_prefix     = local.mysql_backup_prefix
   })
 
   # A user_data edit changes how the box bootstraps, so it must actually

@@ -17,7 +17,7 @@ mkswap /swapfile
 swapon /swapfile
 echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
-dnf install -y docker git
+dnf install -y docker git xfsprogs
 systemctl enable --now docker
 
 param() {
@@ -31,11 +31,79 @@ COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
 
 docker network create cv || true
 
+# --- Mount the dedicated MySQL EBS volume (T-018) ---
+# This runs before the MySQL container starts (ruling 4) so /var/lib/cv-mysql
+# is already backed by the persistent volume -- not the instance's root
+# volume -- by the time `docker run` binds it in.
+#
+# Ruling 2: nitro instances present EBS volumes as /dev/nvme<N>n1 with N not
+# stable across boots, so never resolve by device name. Go by volume ID via
+# the udev by-id symlink instead (AWS renders the ID without its "vol-"
+# hyphen in that symlink name).
+MYSQL_VOLUME_ID_NO_HYPHEN=$(echo "${mysql_volume_id}" | tr -d '-')
+MYSQL_DEVICE="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$MYSQL_VOLUME_ID_NO_HYPHEN"
+
+# The by-id symlink appears once udev processes the attachment, which can
+# happen slightly after this script starts (Terraform creates the instance,
+# whose user_data starts running at boot, before it creates the
+# aws_volume_attachment resource that actually attaches the volume). Wait
+# rather than fail on the first boot's inherent race.
+for i in $(seq 1 90); do
+  [ -e "$MYSQL_DEVICE" ] && break
+  echo "waiting for $MYSQL_DEVICE to appear ($i/90)"
+  sleep 2
+done
+if [ ! -e "$MYSQL_DEVICE" ]; then
+  echo "FATAL: $MYSQL_DEVICE never appeared -- refusing to start MySQL without its data volume" >&2
+  exit 1
+fi
+
+mkdir -p /var/lib/cv-mysql
+
+# Ruling 3: format ONLY a genuinely empty volume, fail closed. blkid exits 2
+# when it finds no recognizable filesystem signature at all -- that's the
+# one case safe to format (first boot, brand-new volume). Any other outcome
+# (0 = a filesystem is already there, e.g. a reattach after replacement; or
+# anything else = detection was ambiguous or errored) must NOT trigger
+# mkfs. An unconditional mkfs here would reformat the database on every
+# instance replacement -- the exact failure this task exists to prevent,
+# arriving disguised as a healthy boot.
+set +e
+blkid "$MYSQL_DEVICE" >/dev/null 2>&1
+BLKID_STATUS=$?
+set -e
+case "$BLKID_STATUS" in
+  2)
+    echo "$MYSQL_DEVICE has no filesystem -- first boot, formatting"
+    mkfs.xfs "$MYSQL_DEVICE"
+    ;;
+  0)
+    echo "$MYSQL_DEVICE already has a filesystem -- reattach, not formatting"
+    ;;
+  *)
+    echo "FATAL: blkid on $MYSQL_DEVICE was ambiguous (exit $BLKID_STATUS) -- refusing to format or mount an unidentified volume" >&2
+    exit 1
+    ;;
+esac
+
+# Ruling 4: persist by UUID (never by device name -- see ruling 2 on why
+# device names aren't stable here) with nofail, so on a later reboot a
+# missing/detached volume degrades to a failed MySQL container rather than
+# an instance that fails to boot and can't even be reached via SSM to
+# diagnose.
+MYSQL_VOLUME_UUID=$(blkid -s UUID -o value "$MYSQL_DEVICE")
+if ! grep -q "$MYSQL_VOLUME_UUID" /etc/fstab; then
+  echo "UUID=$MYSQL_VOLUME_UUID /var/lib/cv-mysql xfs defaults,nofail 0 2" >> /etc/fstab
+fi
+mount /var/lib/cv-mysql
+
 # --- Self-hosted MySQL 8.4, tuned for a small box ---
 # innodb-buffer-pool-size low + performance_schema off keep the memory
-# footprint modest; the host volume persists data across container restarts
-# and reboots (it is lost only if the instance itself is replaced).
-mkdir -p /var/lib/cv-mysql
+# footprint modest. Data now lives on the dedicated EBS volume mounted
+# above (T-018), so it survives instance replacement -- ruling 5: this
+# starts empty and Flyway (below) rebuilds the schema; there is no
+# migration path for pre-T-018 data, which the previous replacement already
+# discarded.
 docker run -d --name mysql --restart unless-stopped --network cv \
   -e MYSQL_ROOT_PASSWORD="$DB_PASSWORD" \
   -e MYSQL_DATABASE="${db_name}" \

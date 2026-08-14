@@ -40,6 +40,25 @@ variable "domain_service_instance_type" {
   default     = "t3.micro"
 }
 
+# T-018, ruling 1: data.aws_subnets.default.ids[0] has no ordering guarantee,
+# so the domain-service instance's AZ could silently move between plans.
+# aws_ebs_volume.mysql_data is AZ-locked (storage.tf), so once that volume
+# exists, an AZ move breaks the attachment instead of just being invisible.
+# This variable is the single pinned source: it selects the instance's
+# subnet (via data.aws_subnets.domain_service in network.tf) AND sets
+# aws_ebs_volume.mysql_data.availability_zone directly -- the two must never
+# be computed independently.
+variable "availability_zone" {
+  description = "AZ pinned for the domain-service instance and its dedicated MySQL EBS volume (T-018 ruling 1) -- both trace to this one variable so they cannot diverge."
+  type        = string
+  default     = "eu-west-3a"
+
+  validation {
+    condition     = length(var.availability_zone) > 0
+    error_message = "availability_zone must not be empty."
+  }
+}
+
 variable "drone_instance_type" {
   # T-002 (H1, ratified 2026-08-04): Free Tier already covers one t3.micro
   # (this account runs two -> domain_service + drone -> so ~710 h/month was

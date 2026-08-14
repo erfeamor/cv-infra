@@ -60,6 +60,22 @@ variables {
 run "plan_succeeds" {
   command = plan
 
+  # Review round 1, finding 4: mock_data "aws_subnets" applies one
+  # `defaults` block to EVERY aws_subnets data source, so without this
+  # override, data.aws_subnets.default.ids and
+  # data.aws_subnets.domain_service.ids are the identical, already-sorted
+  # list under test -- the subnet regression guard below would pass just as
+  # well if compute.tf were reverted to data.aws_subnets.default.ids[0]
+  # (the reviewer proved this empirically). Give the pinned data source its
+  # own, distinct value so that assertion actually distinguishes "wired
+  # from the pinned source" from "wired from the old unordered one".
+  override_data {
+    target = data.aws_subnets.domain_service
+    values = {
+      ids = ["subnet-00000000000000009"]
+    }
+  }
+
   # MySQL is self-hosted on the domain-service EC2 (see compute.tf /
   # templates/domain-service-user-data.sh) — there is no RDS instance to
   # assert on anymore.

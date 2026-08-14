@@ -55,6 +55,16 @@ for i in $(seq 1 90); do
 done
 if [ ! -e "$MYSQL_DEVICE" ]; then
   echo "FATAL: $MYSQL_DEVICE never appeared -- refusing to start MySQL without its data volume" >&2
+  # Review round 1, finding 7: if this 180s window expires, the script
+  # exits here and cloud-init marks user_data as having run -- it only
+  # fires once per instance. A plain `terraform apply` afterwards creates
+  # the attachment (if that's why the device was missing) but does NOT
+  # re-run this script, because nothing about user_data itself changed:
+  # the box will report converged while having no MySQL, no Flyway, no
+  # domain service. Recovery requires forcing a fresh boot explicitly --
+  # `terraform apply -replace=aws_instance.domain_service` -- not just a
+  # routine apply. A systemd retry unit that re-attempts this on a schedule
+  # is out of scope for this task.
   exit 1
 fi
 
@@ -91,9 +101,26 @@ esac
 # missing/detached volume degrades to a failed MySQL container rather than
 # an instance that fails to boot and can't even be reached via SSM to
 # diagnose.
+#
+# Review round 1, finding 2: nofail alone is not enough. Per
+# systemd.mount(5), a nofail unit is WantedBy=local-fs.target but is
+# explicitly NOT ordered before it -- and docker.service sits behind
+# basic.target <- sysinit.target <- local-fs.target, so nothing otherwise
+# holds Docker back until this mount completes. On reboot, the mysql
+# container (--restart unless-stopped) can start while /var/lib/cv-mysql is
+# still the empty directory on the root volume; the mysql:8.4 entrypoint
+# sees an empty datadir and silently initializes a brand-new database,
+# which the real volume then shadows once it does mount. The same path runs
+# deterministically if the volume genuinely fails to reattach: the box
+# boots "healthy" and serves an empty CV. x-systemd.required-by/before
+# fixes this at the systemd layer WITHOUT removing nofail: the box still
+# boots and stays SSM-reachable if the volume never attaches (ruling 4's
+# actual requirement) -- Docker just waits behind the mount attempt instead
+# of racing it, so it's MySQL that fails, not the whole instance. Do not
+# "simplify" this back to bare `defaults,nofail`.
 MYSQL_VOLUME_UUID=$(blkid -s UUID -o value "$MYSQL_DEVICE")
 if ! grep -q "$MYSQL_VOLUME_UUID" /etc/fstab; then
-  echo "UUID=$MYSQL_VOLUME_UUID /var/lib/cv-mysql xfs defaults,nofail 0 2" >> /etc/fstab
+  echo "UUID=$MYSQL_VOLUME_UUID /var/lib/cv-mysql xfs defaults,nofail,x-systemd.required-by=docker.service,x-systemd.before=docker.service 0 2" >> /etc/fstab
 fi
 mount /var/lib/cv-mysql
 
@@ -104,6 +131,30 @@ mount /var/lib/cv-mysql
 # starts empty and Flyway (below) rebuilds the schema; there is no
 # migration path for pre-T-018 data, which the previous replacement already
 # discarded.
+#
+# Review round 1, finding 5: because the datadir now survives replacement,
+# a deliberate db_password rotation (var.db_password / SSM) is a trap this
+# container doesn't handle. mysql:8.4's entrypoint only applies
+# MYSQL_ROOT_PASSWORD/MYSQL_PASSWORD on first init of an EMPTY datadir --
+# on every boot after the first, an existing datadir means init is skipped
+# and the container keeps whatever credentials were baked in when the
+# volume was formatted, while this script and Flyway below both read
+# whatever the CURRENT SSM value is. A rotation therefore makes Flyway's
+# auth fail (set -e aborts, domain service never starts) until someone runs
+# ALTER USER inside the container (or wipes the volume). Not fixed here on
+# purpose -- a credential-rewriting branch in a boot script is its own
+# hazard and needs its own task (filed as a follow-up).
+#
+# Review round 1, finding 2 (belt-and-braces half): refuse to start MySQL
+# at all if /var/lib/cv-mysql isn't actually the mounted EBS volume -- a
+# second guard against the same "empty dir masquerading as the datadir"
+# failure the fstab options above are meant to prevent, in case this script
+# ever runs in a context where the fstab/systemd ordering wasn't honored.
+if ! mountpoint -q /var/lib/cv-mysql; then
+  echo "FATAL: /var/lib/cv-mysql is not a mountpoint -- refusing to start MySQL against the root volume" >&2
+  exit 1
+fi
+
 docker run -d --name mysql --restart unless-stopped --network cv \
   -e MYSQL_ROOT_PASSWORD="$DB_PASSWORD" \
   -e MYSQL_DATABASE="${db_name}" \

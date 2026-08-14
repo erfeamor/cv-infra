@@ -53,9 +53,18 @@ variable "availability_zone" {
   type        = string
   default     = "eu-west-3a"
 
+  # Review round 1, finding 6: length(...) > 0 alone accepts an AZ in the
+  # wrong region -- e.g. var.aws_region = "eu-west-1" against this
+  # variable's "eu-west-3a" default would make
+  # data.aws_subnets.domain_service (filtered on both vpc-id and this AZ)
+  # return zero ids, and the plan would die on sort(...)[0] with an opaque
+  # "Invalid index" rather than a message that names the actual mismatch.
+  # Terraform 1.9+ allows cross-object references between variables in
+  # validation blocks, so check against var.aws_region directly instead of
+  # just checking non-emptiness.
   validation {
-    condition     = length(var.availability_zone) > 0
-    error_message = "availability_zone must not be empty."
+    condition     = startswith(var.availability_zone, var.aws_region)
+    error_message = "availability_zone (\"${var.availability_zone}\") must start with aws_region (\"${var.aws_region}\") -- an AZ from a different region will make data.aws_subnets.domain_service return zero ids."
   }
 }
 

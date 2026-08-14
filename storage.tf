@@ -24,6 +24,12 @@ resource "aws_ebs_volume" "mysql_data" {
   # not to.
   encrypted = true
 
+  # Review round 1, finding 3: on delete, take a final snapshot rather than
+  # dropping the data outright -- cheap insurance (a snapshot of a stopped
+  # small volume is negligible against the credit runway) against exactly
+  # the class of loss this task exists to prevent.
+  final_snapshot = true
+
   # Cost (recorded against the credit runway, T-010): an 8 GiB gp3 volume in
   # eu-west-3 is on the order of $1/month at AWS list pricing -- negligible
   # against current burn. Burn today is ~$1.23/day (~$37.30/month); the
@@ -32,6 +38,20 @@ resource "aws_ebs_volume" "mysql_data" {
   tags = {
     Name    = "${var.project_name}-mysql-data"
     Project = var.project_name
+  }
+
+  # Review round 1, finding 3: availability_zone, type, and encrypted are
+  # all ForceNew on this resource -- editing var.availability_zone (a knob
+  # this task introduces) would otherwise destroy this volume and create an
+  # empty replacement, and because the volume id is interpolated into
+  # aws_instance.domain_service's user_data, the instance gets replaced in
+  # the same apply, so the loss would look like a routine re-provision, not
+  # data loss. prevent_destroy makes that apply fail loudly instead.
+  # Deliberately remove this only if T-012 ever resolves to a real teardown
+  # of this environment -- that should be a decision someone makes on
+  # purpose, not a side effect of an unrelated apply.
+  lifecycle {
+    prevent_destroy = true
   }
 }
 
@@ -48,15 +68,23 @@ resource "aws_volume_attachment" "mysql_data" {
   volume_id   = aws_ebs_volume.mysql_data.id
   instance_id = aws_instance.domain_service.id
 
-  # force_detach is deliberately NOT set -- flagged as an open question in
-  # T-018 rather than decided here. aws_volume_attachment.instance_id
-  # referencing aws_instance.domain_service.id already gives Terraform the
-  # dependency edge it needs to detach this attachment (old instance) before
-  # destroying the old instance itself on a user_data-driven replacement,
-  # under the default (non create_before_destroy) ordering already in place
-  # -- so the specific "detach hangs while the old instance is still
-  # terminating" failure this option guards against shouldn't arise from
-  # Terraform's own ordering. Left to the human to confirm via the two live
-  # replacements in the acceptance criteria rather than set reflexively: see
-  # the implementation report for the full reasoning.
+  # Review round 1, finding 1 -- corrects a wrong assumption in the
+  # original comment here. On a user_data-driven replacement, Terraform
+  # DOES destroy this attachment before destroying the old instance (the
+  # dependency edge from instance_id above is real) -- but "before
+  # destroying the instance" does not mean "before the instance is busy".
+  # The old instance is still fully running, with XFS mounted and mysqld
+  # holding open files, at the moment DetachVolume is issued: EC2 parks a
+  # detach of a mounted, busy volume in "detaching" indefinitely, the
+  # provider's wait times out, and the apply is left half-done. The
+  # dependency edge is what *causes* the detach to be attempted against a
+  # live filesystem, not what protects against it.
+  #
+  # stop_instance_before_detaching = true is the actual fix: it stops the
+  # old instance first (cleanly unmounting/flushing), then detaches, then
+  # lets the (now-stopped) instance proceed to termination. force_detach is
+  # deliberately NOT used instead -- forcing a detach of a still-mounted
+  # volume with dirty writeback risks exactly the data loss this task
+  # exists to prevent.
+  stop_instance_before_detaching = true
 }

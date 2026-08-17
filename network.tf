@@ -13,6 +13,25 @@ data "aws_subnets" "default" {
   }
 }
 
+# T-018 ruling 1: the domain-service instance now anchors an AZ-locked EBS
+# volume (see storage.tf), so its subnet can no longer be picked by list
+# position off data.aws_subnets.default -- aws_subnets does not guarantee
+# ordering, and a later plan could silently move the instance to a
+# different AZ than the volume. Filtered on var.availability_zone so
+# compute.tf's subnet_id and storage.tf's aws_ebs_volume.availability_zone
+# both trace to that one variable and can never diverge.
+data "aws_subnets" "domain_service" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+
+  filter {
+    name   = "availability-zone"
+    values = [var.availability_zone]
+  }
+}
+
 resource "aws_security_group" "domain_service" {
   name        = "${var.project_name}-domain-service"
   description = "Allows inbound HTTP(S) and SSH to the domain service EC2 instance"

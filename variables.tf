@@ -40,6 +40,34 @@ variable "domain_service_instance_type" {
   default     = "t3.micro"
 }
 
+# T-018, ruling 1: data.aws_subnets.default.ids[0] has no ordering guarantee,
+# so the domain-service instance's AZ could silently move between plans.
+# aws_ebs_volume.mysql_data is AZ-locked (storage.tf), so once that volume
+# exists, an AZ move breaks the attachment instead of just being invisible.
+# This variable is the single pinned source: it selects the instance's
+# subnet (via data.aws_subnets.domain_service in network.tf) AND sets
+# aws_ebs_volume.mysql_data.availability_zone directly -- the two must never
+# be computed independently.
+variable "availability_zone" {
+  description = "AZ pinned for the domain-service instance and its dedicated MySQL EBS volume (T-018 ruling 1) -- both trace to this one variable so they cannot diverge."
+  type        = string
+  default     = "eu-west-3a"
+
+  # Review round 1, finding 6: length(...) > 0 alone accepts an AZ in the
+  # wrong region -- e.g. var.aws_region = "eu-west-1" against this
+  # variable's "eu-west-3a" default would make
+  # data.aws_subnets.domain_service (filtered on both vpc-id and this AZ)
+  # return zero ids, and the plan would die on sort(...)[0] with an opaque
+  # "Invalid index" rather than a message that names the actual mismatch.
+  # Terraform 1.9+ allows cross-object references between variables in
+  # validation blocks, so check against var.aws_region directly instead of
+  # just checking non-emptiness.
+  validation {
+    condition     = startswith(var.availability_zone, var.aws_region)
+    error_message = "availability_zone (\"${var.availability_zone}\") must start with aws_region (\"${var.aws_region}\") -- an AZ from a different region will make data.aws_subnets.domain_service return zero ids."
+  }
+}
+
 variable "drone_instance_type" {
   # T-002 (H1, ratified 2026-08-04): Free Tier already covers one t3.micro
   # (this account runs two -> domain_service + drone -> so ~710 h/month was

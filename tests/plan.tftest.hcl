@@ -60,6 +60,22 @@ variables {
 run "plan_succeeds" {
   command = plan
 
+  # Review round 1, finding 4: mock_data "aws_subnets" applies one
+  # `defaults` block to EVERY aws_subnets data source, so without this
+  # override, data.aws_subnets.default.ids and
+  # data.aws_subnets.domain_service.ids are the identical, already-sorted
+  # list under test -- the subnet regression guard below would pass just as
+  # well if compute.tf were reverted to data.aws_subnets.default.ids[0]
+  # (the reviewer proved this empirically). Give the pinned data source its
+  # own, distinct value so that assertion actually distinguishes "wired
+  # from the pinned source" from "wired from the old unordered one".
+  override_data {
+    target = data.aws_subnets.domain_service
+    values = {
+      ids = ["subnet-00000000000000009"]
+    }
+  }
+
   # MySQL is self-hosted on the domain-service EC2 (see compute.tf /
   # templates/domain-service-user-data.sh) — there is no RDS instance to
   # assert on anymore.
@@ -458,6 +474,61 @@ run "plan_succeeds" {
       length(rule.filter) > 0 && rule.filter[0].prefix == "${local.mysql_backup_prefix}/"
     ])
     error_message = "The expiration rule must filter on the mysql-dumps/ prefix"
+  }
+
+  # --- T-018: MySQL's data directory moves onto a dedicated EBS volume ---
+
+  # Ruling 1, the crux: the instance's subnet and the volume's AZ must trace
+  # to the SAME pinned source (var.availability_zone) so they can never
+  # diverge -- an EBS volume is AZ-locked.
+  assert {
+    condition     = aws_ebs_volume.mysql_data.availability_zone == var.availability_zone
+    error_message = "aws_ebs_volume.mysql_data.availability_zone must come from var.availability_zone -- the same pinned source that selects aws_instance.domain_service's subnet, never a separately-computed AZ"
+  }
+
+  # Proves the instance's subnet is actually wired from the new pinned data
+  # source (network.tf), not still off data.aws_subnets.default's unordered
+  # list -- a regression here would silently reintroduce the AZ-drift risk
+  # ruling 1 exists to close.
+  assert {
+    condition     = aws_instance.domain_service.subnet_id == sort(data.aws_subnets.domain_service.ids)[0]
+    error_message = "aws_instance.domain_service.subnet_id must come from data.aws_subnets.domain_service (filtered on var.availability_zone), not data.aws_subnets.default"
+  }
+
+  # Regression guard, mirrored from the equivalent Drone assertion but with
+  # the opposite polarity: unlike Drone (provisioned out-of-band, must NEVER
+  # replace), the domain-service box MUST keep replacing on user_data edits
+  # -- that's what makes this task's own acceptance criterion (apply twice,
+  # prove the database survives replacement) a real test rather than a no-op.
+  assert {
+    condition     = aws_instance.domain_service.user_data_replace_on_change == true
+    error_message = "aws_instance.domain_service must keep user_data_replace_on_change = true -- removing it means a bootstrap edit never re-provisions the box (this bug has shipped once already)"
+  }
+
+  assert {
+    condition     = aws_ebs_volume.mysql_data.size == 8 && aws_ebs_volume.mysql_data.type == "gp3"
+    error_message = "aws_ebs_volume.mysql_data should stay an 8 GiB gp3 volume -- a size/class bump is cost drift and needs an explicit, recorded decision (CLAUDE.md review guidance)"
+  }
+
+  assert {
+    condition     = aws_ebs_volume.mysql_data.encrypted == true
+    error_message = "aws_ebs_volume.mysql_data must be encrypted at rest"
+  }
+
+  # aws_volume_attachment.mysql_data.volume_id/.instance_id and
+  # aws_ebs_volume.mysql_data.id are unknown-until-apply under `command =
+  # plan` (same documented limitation as aws_s3_bucket.backup.arn and
+  # aws_eip.drone.public_ip above), and targeting them for a `command =
+  # apply` run pulls in aws_instance.domain_service -> its user_data ->
+  # aws_cloudfront_distribution.frontend, which is the exact combination
+  # already confirmed (see the backup_iam_scoping run's own comment) to fail
+  # at destroy/teardown under mock_provider. So the attachment's wiring
+  # (right volume, right instance) is covered by `terraform validate` +
+  # code review instead of an assertion here, deliberately, not omitted by
+  # oversight.
+  assert {
+    condition     = aws_volume_attachment.mysql_data.device_name == "/dev/sdf"
+    error_message = "aws_volume_attachment.mysql_data.device_name is a Terraform/EC2-API label only -- nitro remaps it at the kernel, see ruling 2 -- kept stable here so a change doesn't go unnoticed"
   }
 
 }

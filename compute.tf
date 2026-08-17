@@ -26,9 +26,16 @@ resource "aws_eip" "domain_service" {
 }
 
 resource "aws_instance" "domain_service" {
-  ami                    = data.aws_ami.al2023.id
-  instance_type          = var.domain_service_instance_type
-  subnet_id              = data.aws_subnets.default.ids[0]
+  ami           = data.aws_ami.al2023.id
+  instance_type = var.domain_service_instance_type
+  # T-018 ruling 1: pinned via data.aws_subnets.domain_service, which is
+  # itself filtered on var.availability_zone -- the SAME variable that sets
+  # aws_ebs_volume.mysql_data.availability_zone in storage.tf, so the
+  # instance and its EBS volume can never land in different AZs. sort()
+  # keeps the pick deterministic even if the default VPC ever has more than
+  # one subnet in that AZ (list position off an unordered API result is
+  # exactly what this ruling exists to avoid).
+  subnet_id              = sort(data.aws_subnets.domain_service.ids)[0]
   vpc_security_group_ids = [aws_security_group.domain_service.id]
   iam_instance_profile   = aws_iam_instance_profile.domain_service.name
 
@@ -42,6 +49,11 @@ resource "aws_instance" "domain_service" {
     cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name
     backup_bucket     = aws_s3_bucket.backup.bucket
     backup_prefix     = local.mysql_backup_prefix
+    # T-018 ruling 2: the bootstrap resolves the MySQL data device by volume
+    # ID (via /dev/disk/by-id/...), never by the /dev/sdf name below or by
+    # /dev/nvme<N>n1 -- N is not stable across boots on these nitro
+    # instances. See templates/domain-service-user-data.sh.
+    mysql_volume_id = aws_ebs_volume.mysql_data.id
   })
 
   # A user_data edit changes how the box bootstraps, so it must actually

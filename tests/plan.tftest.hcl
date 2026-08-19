@@ -605,12 +605,13 @@ run "backup_iam_scoping" {
 run "ci_on_demand" {
   command = plan
 
-  # --- The size wall T-009 exists to prevent -------------------------------
-  # This is the assertion T-009 asks for: user_data has grown 85.6% -> 91.1%
-  # -> 94.4% -> 95.7% -> 98.3% across successive tasks, and exceeding 16,384 B
-  # is NOT caught by fmt, validate, or a mocked plan -- it surfaces as an
-  # apply-time API rejection while the live CI host is being modified. A red
-  # test is a much better place to find out.
+  # --- The size wall, now enforced at T-009's threshold ---------------------
+  # Tightened from 16,384 to 8,192 once T-009 moved jenkins-provision.sh to S3:
+  # the render dropped from 16,104 B (98.3%) to roughly 3 KB, so an 8 KB ceiling
+  # leaves generous room while still failing long BEFORE the real EC2 limit.
+  # Exceeding 16,384 is not caught by fmt, validate or a mocked plan -- it
+  # surfaces as an apply-time API rejection on the live CI host, which is a far
+  # worse place to discover it than a red test.
   assert {
     condition = length(join("\n", [
       templatefile("${path.module}/templates/drone-user-data.sh", {
@@ -620,16 +621,15 @@ run "ci_on_demand" {
         server_host    = "203.0.113.10"
         admin_username = var.drone_admin_username
       }),
-      templatefile("${path.module}/templates/jenkins-provision.sh", {
-        aws_region             = var.aws_region
-        project_name           = var.project_name
-        environment            = var.environment
-        server_host            = "203.0.113.10"
-        admin_username         = var.drone_admin_username
-        jenkins_admin_username = var.jenkins_admin_username
+      templatefile("${path.module}/templates/jenkins-bootstrap.sh", {
+        aws_region      = var.aws_region
+        project_name    = var.project_name
+        environment     = var.environment
+        artifact_bucket = "test-bucket"
+        artifact_key    = "jenkins-provision.sh"
       }),
-    ])) < 16384
-    error_message = "Rendered user_data for aws_instance.drone exceeds EC2's 16,384 byte limit. Do NOT fix this by trimming explanatory comments again -- that is the toll T-009 exists to stop paying. Move the provisioning script to S3 (T-009) instead."
+    ])) < 8192
+    error_message = "Rendered user_data for aws_instance.drone exceeds 8 KB. The provisioning script already lives in S3 (T-009), so something substantial has been inlined back into user_data -- move it out rather than trimming comments to fit."
   }
 
   # Ruling 1: the periodic scan is what makes the doorbell able to stay a pure
@@ -644,6 +644,41 @@ run "ci_on_demand" {
       jenkins_admin_username = var.jenkins_admin_username
     }))) == 2
     error_message = "Both multibranch jobs must carry a periodicFolderTrigger -- without it a push that arrives while the CI host is stopped is never built (T-019 ruling 1)"
+  }
+
+  # --- T-009: the fetch-and-execute path ------------------------------------
+  # The script is executed as root on a host mounting the docker socket, so a
+  # publicly readable bucket would be a direct route to controlling what that
+  # host runs.
+  assert {
+    condition = (aws_s3_bucket_public_access_block.ci_artifacts.block_public_acls &&
+      aws_s3_bucket_public_access_block.ci_artifacts.block_public_policy &&
+      aws_s3_bucket_public_access_block.ci_artifacts.ignore_public_acls &&
+    aws_s3_bucket_public_access_block.ci_artifacts.restrict_public_buckets)
+    error_message = "The CI artifact bucket must block public access on all four flags -- it holds a script executed as root on the CI host"
+  }
+
+  # It must never be staged in the bucket CloudFront serves to the internet.
+  assert {
+    condition     = aws_s3_bucket.ci_artifacts.bucket != aws_s3_bucket.frontend.bucket
+    error_message = "The provisioning script must NOT be staged in the public frontend bucket"
+  }
+
+  # NOT asserted, and worth saying why rather than leaving the gap silent:
+  # that the S3 object and the SSM-pushed script carry identical bytes, and
+  # that the SSM checksum is the hash of what was uploaded. Both are true by
+  # construction -- all three read local.jenkins_provision_script, the single
+  # expression that renders the script -- but neither is checkABLE here,
+  # because that local embeds aws_eip.drone.public_ip and is therefore unknown
+  # under `command = plan` (the limitation this file documents in several other
+  # places). The real proof is the boot itself: a mismatch makes the bootstrap
+  # stub abort with "checksum mismatch" and the box comes up with no Jenkins,
+  # which stage 4 exercises directly.
+
+  # Single object, not the bucket, not s3:*.
+  assert {
+    condition     = join(",", local.drone_provision_s3_actions) == "s3:GetObject"
+    error_message = "The CI host's new S3 grant must be s3:GetObject only -- it is read-only access to one artifact"
   }
 
   # --- Ruling 3: the security boundary -------------------------------------

@@ -90,16 +90,19 @@ resource "aws_instance" "drone" {
   # live today this changes Terraform state only; Jenkins gets installed on
   # it via null_resource.jenkins_provision instead.
   #
-  # Size: rendered, this comes to roughly 14 KB against EC2's 16 KB
-  # user_data limit (~86%) -- measured by hand outside this repo, since this
-  # worktree has no state to `terraform console` against, so treat the
-  # exact figure as approximate and re-measure after any edit. Two rounds of
-  # review findings each grew jenkins-provision.sh enough to push the render
-  # over budget; both times its own comments (not its logic) were cut back
-  # to fit, which is why they read tersely -- that's deliberate. A future
-  # addition to either template should re-measure before assuming there's
-  # room, and expect to trim comments again rather than logic if it doesn't
-  # fit.
+  # T-009: the Jenkins half is no longer inlined here. It lives in S3
+  # (ci-provision.tf) and this carries only a ~900 byte stub that fetches it,
+  # verifies its SHA-256 against SSM, and runs it. Rendered size went from
+  # 16,104 / 16,384 (98.3%, 280 bytes of headroom) to roughly 3 KB (~19%).
+  #
+  # Two consequences worth knowing before editing either template:
+  #   - There is now a `terraform test` assertion that FAILS if this render
+  #     exceeds 8 KB, so the wall is hit as a red test rather than as an
+  #     apply-time API rejection on the live CI host.
+  #   - This value no longer changes when jenkins-provision.sh changes, so a
+  #     provisioning tweak no longer stop/starts the instance. The re-provision
+  #     signal moved to null_resource.jenkins_provision's script_sha trigger,
+  #     which is unchanged and still fires on every edit.
   user_data = join("\n", [
     templatefile("${path.module}/templates/drone-user-data.sh", {
       aws_region     = var.aws_region
@@ -108,16 +111,30 @@ resource "aws_instance" "drone" {
       server_host    = aws_eip.drone.public_ip
       admin_username = var.drone_admin_username
     }),
-    local.jenkins_provision_script,
+    templatefile("${path.module}/templates/jenkins-bootstrap.sh", {
+      aws_region      = var.aws_region
+      project_name    = var.project_name
+      environment     = var.environment
+      artifact_bucket = aws_s3_bucket.ci_artifacts.id
+      artifact_key    = local.jenkins_provision_key
+    }),
   ])
 
   # user_data reads the CI parameters at first boot, so they must exist first.
+  #
+  # T-009 adds two more, and they are not optional ordering niceties: the
+  # bootstrap stub downloads the provisioning script from S3 and checks it
+  # against the SHA in SSM. If either is missing at first boot the stub fails
+  # loudly and the box comes up with no Jenkins at all -- the chicken-and-egg
+  # this depends_on exists to prevent.
   depends_on = [
     aws_ssm_parameter.drone_rpc_secret,
     aws_ssm_parameter.drone_github_client_id,
     aws_ssm_parameter.drone_github_client_secret,
     aws_ssm_parameter.jenkins_admin_password,
     aws_ssm_parameter.github_pat_ci,
+    aws_ssm_parameter.jenkins_provision_sha256,
+    aws_s3_object.jenkins_provision,
   ]
 
   # AMI churn must never replace this host: Drone's state (repo activations,

@@ -16,11 +16,32 @@
 #      put it in terraform.tfvars as github_pat_ci -- it lands in SSM as a
 #      SecureString (see ssm.tf), never committed.
 #   5. Add a webhook on cv-domain-service and cv-database (Settings ->
-#      Webhooks) pointing at http://<drone_server_url>/jenkins/github-webhook/
-#      for events push + pull_request -- mirrors the cv-admin-react -> Drone
-#      hook. This needs a token/user with hook-admin rights; the PAT above
-#      is deliberately scoped to repo:status only and cannot create hooks
-#      itself, so this step stays manual by design (least privilege).
+#      Webhooks) for events push + pull_request -- mirrors the
+#      cv-admin-react -> Drone hook. This needs a token/user with hook-admin
+#      rights; the PAT above is deliberately scoped to repo:status only and
+#      cannot create hooks itself, so this step stays manual by design
+#      (least privilege).
+#
+#      T-019 CHANGED WHERE THESE POINT. They used to target this box directly
+#      (http://<drone_server_url>/jenkins/github-webhook/). The box is now
+#      normally STOPPED, and a stopped box answers nothing -- GitHub just
+#      records a failed delivery and no build ever runs. So the hooks point at
+#      the doorbell Lambda instead:
+#
+#        URL:          terraform output ci_doorbell_url
+#        Content type: application/json
+#        Secret:       the value of var.github_webhook_secret (REQUIRED --
+#                      the doorbell rejects every unsigned request)
+#
+#      Jenkins then discovers the push itself via the periodicFolderTrigger on
+#      each multibranch job (templates/jenkins-provision.sh), which is why the
+#      Lambda never forwards the payload. UNTIL THE HOOKS ARE RE-POINTED THIS
+#      AUTOMATION DOES NOTHING, and nothing in Terraform can detect that.
+#
+#   6. T-019, cv-admin-react only: Drone has no SCM polling, so pointing its
+#      hook at the doorbell starts the box but runs no build. Leave that hook
+#      as it is for now (it fails while the box is down, which is the honest
+#      behaviour) and revisit at T-301, when that repo is actually worked on.
 #
 # T-002 (H1 decision 1): Jenkins is installed on the *live* instance
 # out-of-band via SSM Run Command (null_resource.jenkins_provision below),

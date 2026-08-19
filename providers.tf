@@ -18,6 +18,12 @@ terraform {
       source  = "hashicorp/local"
       version = "~> 2.4"
     }
+    # T-019: zips the on-demand CI Lambda sources (ci-on-demand.tf). Source
+    # lives in lambda/ as readable .py rather than a committed binary zip.
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 
   # Uncomment once a state bucket exists; local state is fine for the demo.

@@ -127,6 +127,10 @@ jobs:
             }
           }
         }
+        // T-019: finds pushes missed while stopped. Why: ci-on-demand.tf
+        triggers {
+          periodicFolderTrigger { interval('5m') }
+        }
         orphanedItemStrategy {
           discardOldItems { numToKeep(20) }
         }
@@ -155,6 +159,10 @@ jobs:
               }
             }
           }
+        }
+        // T-019: finds pushes missed while stopped. Why: ci-on-demand.tf
+        triggers {
+          periodicFolderTrigger { interval('5m') }
         }
         orphanedItemStrategy {
           discardOldItems { numToKeep(20) }

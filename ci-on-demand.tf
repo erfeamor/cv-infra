@@ -161,6 +161,38 @@ resource "aws_lambda_function_url" "ci_doorbell" {
   authorization_type = "NONE"
 }
 
+# WITHOUT THIS THE FUNCTION URL RETURNS 403 AND THE LAMBDA IS NEVER INVOKED.
+#
+# Found at stage-4 verification, not by reading anything: every request to the
+# URL came back as AWS's own AccessDeniedException with zero invocations
+# logged, while a direct `lambda invoke` of the same function worked perfectly.
+#
+# Accounts created after ~2024 — this one dates to 2026-07 — have Lambda's
+# "block public access" behaviour on by default. Under it, the
+# `lambda:InvokeFunctionUrl` grant that `aws_lambda_function_url` creates for
+# an AuthType=NONE url is NOT sufficient on its own: the block specifically
+# stops that permission from conferring public access. An unconditioned
+# `lambda:InvokeFunction` grant is what actually opens the path.
+#
+# Note the asymmetry, because it wastes an hour otherwise: this statement must
+# NOT carry function_url_auth_type. AWS rejects that outright —
+# "FunctionUrlAuthType is only supported for lambda:InvokeFunctionUrl action".
+#
+# On Principal = "*", which a reviewer should stop at: it is genuinely
+# unconditioned, and it means anyone may invoke this function. That is
+# acceptable here for one specific reason — **the authentication is in the
+# handler, not in the transport**. index.py verifies GitHub's HMAC over the raw
+# body before it touches the EC2 API, so an unsigned invocation, by any route,
+# returns 401 and starts nothing. Verified live: an unsigned POST through this
+# URL returns "bad signature" and the instance is untouched. If that check is
+# ever weakened, this grant becomes a genuine cost-DoS hole.
+resource "aws_lambda_permission" "ci_doorbell_public_invoke" {
+  statement_id  = "AllowPublicInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ci_doorbell.function_name
+  principal     = "*"
+}
+
 # ---------------------------------------------------------------------------
 # Reaper — scheduled idle check -> stop the instance
 # ---------------------------------------------------------------------------

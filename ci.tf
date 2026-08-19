@@ -122,8 +122,16 @@ resource "aws_instance" "drone" {
 
   # AMI churn must never replace this host: Drone's state (repo activations,
   # secrets) is SQLite on the instance volume.
+  #
+  # T-019: CIKeepAlive is an *operational* tag, set by hand to stop the reaper
+  # shutting the box down while someone is being walked through CI. It is
+  # deliberately not declared in this config — its whole value is that it can be
+  # toggled from the console in seconds without an apply. Without ignoring it
+  # here, the next `terraform apply` silently strips it and the box starts
+  # getting stopped mid-demo, which is precisely when nobody is watching a plan.
+  # Found by stage-4 drift check, which flagged the tag as pending removal.
   lifecycle {
-    ignore_changes = [ami]
+    ignore_changes = [ami, tags["CIKeepAlive"], tags_all["CIKeepAlive"]]
   }
 
   tags = {

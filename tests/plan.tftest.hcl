@@ -665,6 +665,21 @@ run "ci_on_demand" {
     error_message = "The GitHub webhook secret must be a SecureString"
   }
 
+  # The permission whose ABSENCE made the whole deployment inert: without an
+  # unconditioned lambda:InvokeFunction grant, this account's default Lambda
+  # public-access block makes the Function URL answer 403 and the handler is
+  # never reached. Every other assertion in this file passed while that was
+  # broken, which is why it gets one of its own.
+  assert {
+    condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunction"
+    error_message = "The doorbell needs an unconditioned lambda:InvokeFunction grant or its Function URL returns 403 without ever invoking the handler (verified live 2026-08-19)"
+  }
+
+  assert {
+    condition     = aws_lambda_permission.ci_doorbell_public_invoke.principal == "*"
+    error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py, not this permission"
+  }
+
   # The doorbell may START the one instance and nothing else.
   #
   # NOT asserted on the rendered policy JSON, and this is a real limitation

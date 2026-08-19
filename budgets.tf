@@ -1,5 +1,32 @@
 # T-011: a budget alarm that fires on GROSS usage, not on the invoice.
 #
+# T-020 §4, decided 2026-08-19: LEAVE THESE LIMITS ALONE. Recorded here because
+# "we looked and deliberately changed nothing" is otherwise indistinguishable
+# from "nobody looked".
+#
+# The board expected this file to need retuning: at the $37.30/month rate the
+# 2026-08-08 CI-host resize produced, the $30 monthly limit was structurally
+# exceeded (~124%), so its 100/120% thresholds would have fired every month
+# from September onward -- and an alarm that always fires stops being a signal,
+# which is the exact failure that made the deleted $5 console budget useless.
+#
+# That premise expired before it was acted on. Measured 2026-08-19, with the CI
+# host now stopped between builds (T-019), the real rate is ~$0.68/day ≈
+# $21/month: September projects to ~68% of this limit, not 124%. August still
+# breaches once (~$34.68, 116%) on the strength of its first half, which is
+# history rather than a trend.
+#
+# So a $30 monthly limit against a ~$21/month rate is now a working DEVIATION
+# alarm, and it fires on precisely the one behaviour worth being told about:
+# the CI host being left running, which adds ~$17/month and moves credit
+# exhaustion forward by ~8 weeks. Retuning the limit down to hug the current
+# rate would trade that signal for noise.
+#
+# The credit_runway limit stays at $160 for the reason cv-infra#14 recorded and
+# T-010 verified: raising it to $200 pushes the 100% alert past the date the
+# account is paused, so the alarm would stay green until it could no longer
+# help. That reasoning is unaffected by the new numbers.
+#
 # The crux (H1 DoR decision 1, non-negotiable): aws_budgets_budget's
 # cost_types block defaults include_credit = true, which makes the budget's
 # metric NET cost. On this account credits currently absorb ~100% of usage,
@@ -39,8 +66,8 @@
 # limit was caught before the first apply (a credit-pot-sized MONTHLY
 # budget never fires); sharing thresholds was caught AT stage 4 against the
 # live account -- a console-created $5 budget with the shared 50/80/100 set
-# sat permanently in ALARM, because ordinary ~$28/month burn crosses both
-# 50% and 80% of $5 every month. An alarm that always fires is one nobody
+# sat permanently in ALARM, because ordinary burn (~$28/month as measured
+# then; ~$21/month now) crosses both 50% and 80% of $5 every month. An alarm that always fires is one nobody
 # reads, which is exactly the failure this file exists to prevent, from the
 # opposite direction.
 
@@ -151,7 +178,7 @@ resource "aws_budgets_budget" "gross_usage" {
   # Own thresholds (var.budget_monthly_thresholds via
   # local.gross_usage_notifications, NOT credit_runway's) -- 100/120/150 by
   # default: at $30 expected spend, only exceeding it is news. Steady-state
-  # ~$28/month burn produces zero notifications here.
+  # burn (~$21/month, measured 2026-08-19) produces zero notifications here.
   dynamic "notification" {
     for_each = local.gross_usage_notifications
     content {

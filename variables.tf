@@ -128,7 +128,8 @@ variable "github_pat_ci" {
 #
 # Scope amendment (H1, ratified 2026-08-09): the original single
 # budget_limit_amount was a MONTHLY limit compared against a CUMULATIVE
-# credit pot -- $121.03 of remaining credit is ~4.3x the ~$28/month burn, so
+# credit pot -- $121.03 of remaining credit was ~4.3x the ~$28/month burn
+# believed at the time (the real rate is now ~$21/month -- T-020), so
 # a monthly budget set to that figure reads at ~23% and never crosses even
 # the lowest 50% threshold while the pot drains to zero. That is the exact
 # never-fires failure class this task exists to prevent, just relocated one
@@ -164,10 +165,13 @@ variable "budget_credit_grant_amount" {
   # activities land, even though the grant will genuinely become $200.
   # Reason (T-010, measured): this account is on the FREE plan, whose
   # 6-month window closes ~2027-01-12 -- BEFORE a $200 grant would be
-  # exhausted (~2027-02-01 at $0.92/day). Raising the limit to $200 pushes
-  # the 100% alert to 1 Feb, i.e. ~20 days AFTER the account has already
-  # been paused: an alarm that fires only once it no longer matters.
-  # Held at $160, the thresholds fire 24 Sep / 15 Nov / 20 Dec -- all
+  # exhausted. Raising the limit to $200 pushes the 100% alert past the
+  # date the account is paused: an alarm that fires only once it no longer
+  # matters. (The specific dates this comment used to quote -- 2027-02-01,
+  # and 24 Sep / 15 Nov / 20 Dec -- were derived at $0.92/day and are all
+  # early; re-derive from CLAUDE.md's measured rate if you need them. The
+  # DECISION is unaffected: the window still closes before a $200 grant
+  # could drain.) Held at $160, the thresholds fire progressively -- all
   # usefully before the window. So 100% here no longer means "credits
   # exhausted"; it means "~3 weeks left before the plan window closes",
   # which is the deadline that actually binds. Revisit only if the account
@@ -265,7 +269,7 @@ variable "budget_monthly_thresholds" {
   # ($30) now represents EXPECTED spend, not a ceiling with headroom, so
   # crossing it at all is the anomaly signal: 100% = over expectation,
   # 120% = materially over, 150% = something is wrong. At steady state
-  # (~$28/month actual burn against $30 expected) this produces ZERO
+  # (~$21/month measured burn against $30 expected -- T-020) this produces ZERO
   # notifications -- the opposite of the shared-thresholds bug this
   # variable exists to fix (see budget_credit_runway_thresholds).
   description = "Ascending, strictly increasing list of percentage-of-limit thresholds for aws_budgets_budget.gross_usage ONLY (notification.threshold, threshold_type = PERCENTAGE). budget_monthly_limit_amount represents expected spend, so these mark deviation from it, not progress toward it: 100/120/150 by default. Independent of budget_credit_runway_thresholds on purpose -- the two budgets must never share a thresholds variable."

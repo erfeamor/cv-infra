@@ -38,6 +38,7 @@ variables {
   drone_github_client_secret = "test-client-secret-not-real"
   jenkins_admin_password     = "test-jenkins-password-not-real"
   github_pat_ci              = "test-github-pat-not-real"
+  github_webhook_secret      = "test-webhook-secret-not-real"
 
   # T-011: no default on budget_credit_grant_amount by design (see
   # variables.tf) -- test value only, never a number that could pass for a
@@ -594,4 +595,167 @@ run "backup_iam_scoping" {
   # (invalid mock ARN format rejected by aws_cloudfront_function's
   # function_association). The wiring is covered by `terraform validate` +
   # code review instead of an assertion here.
+}
+
+# ---------------------------------------------------------------------------
+# T-019 -- on-demand CI host. The doorbell is an unauthenticated public
+# endpoint that can start EC2 instances, so most of what follows is about
+# proving the blast radius stays small when someone edits this later.
+# ---------------------------------------------------------------------------
+run "ci_on_demand" {
+  command = plan
+
+  # --- The size wall T-009 exists to prevent -------------------------------
+  # This is the assertion T-009 asks for: user_data has grown 85.6% -> 91.1%
+  # -> 94.4% -> 95.7% -> 98.3% across successive tasks, and exceeding 16,384 B
+  # is NOT caught by fmt, validate, or a mocked plan -- it surfaces as an
+  # apply-time API rejection while the live CI host is being modified. A red
+  # test is a much better place to find out.
+  assert {
+    condition = length(join("\n", [
+      templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }),
+      templatefile("${path.module}/templates/jenkins-provision.sh", {
+        aws_region             = var.aws_region
+        project_name           = var.project_name
+        environment            = var.environment
+        server_host            = "203.0.113.10"
+        admin_username         = var.drone_admin_username
+        jenkins_admin_username = var.jenkins_admin_username
+      }),
+    ])) < 16384
+    error_message = "Rendered user_data for aws_instance.drone exceeds EC2's 16,384 byte limit. Do NOT fix this by trimming explanatory comments again -- that is the toll T-009 exists to stop paying. Move the provisioning script to S3 (T-009) instead."
+  }
+
+  # Ruling 1: the periodic scan is what makes the doorbell able to stay a pure
+  # doorbell. Delete it and every cold start silently builds nothing.
+  assert {
+    condition = length(regexall("periodicFolderTrigger", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      server_host            = "203.0.113.10"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+    }))) == 2
+    error_message = "Both multibranch jobs must carry a periodicFolderTrigger -- without it a push that arrives while the CI host is stopped is never built (T-019 ruling 1)"
+  }
+
+  # --- Ruling 3: the security boundary -------------------------------------
+  # authorization_type = NONE is forced (GitHub cannot sign SigV4), so this
+  # assertion is not "NONE is fine" -- it pins the fact that the HMAC check in
+  # the handler is the ONLY thing standing in front of ec2:StartInstances.
+  assert {
+    condition     = aws_lambda_function_url.ci_doorbell.authorization_type == "NONE"
+    error_message = "The doorbell Function URL must be NONE (GitHub cannot sign SigV4); its authentication is the HMAC check in lambda/ci_doorbell/index.py"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["WEBHOOK_SECRET_PARAM"] == aws_ssm_parameter.github_webhook_secret.name
+    error_message = "The doorbell must read its HMAC secret from the SSM parameter, never from a literal"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.github_webhook_secret.type == "SecureString"
+    error_message = "The GitHub webhook secret must be a SecureString"
+  }
+
+  # The permission whose ABSENCE made the whole deployment inert: without an
+  # unconditioned lambda:InvokeFunction grant, this account's default Lambda
+  # public-access block makes the Function URL answer 403 and the handler is
+  # never reached. Every other assertion in this file passed while that was
+  # broken, which is why it gets one of its own.
+  assert {
+    condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunction"
+    error_message = "The doorbell needs an unconditioned lambda:InvokeFunction grant or its Function URL returns 403 without ever invoking the handler (verified live 2026-08-19)"
+  }
+
+  assert {
+    condition     = aws_lambda_permission.ci_doorbell_public_invoke.principal == "*"
+    error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py, not this permission"
+  }
+
+  # The doorbell may START the one instance and nothing else.
+  #
+  # NOT asserted on the rendered policy JSON, and this is a real limitation
+  # rather than laziness: the documents interpolate computed ARNs (the instance
+  # id, the SSM parameter ARNs), so under `command = plan` the whole string is
+  # unknown and jsondecode cannot run on it. The unlike-for-unlike case already
+  # in this file (mysql_backup_upload) works only because S3 bucket ARNs ARE
+  # known at plan time. The action lists are therefore lifted into named locals
+  # in ci-on-demand.tf, which is where the security property actually lives and
+  # is what these assertions pin. Resource scoping is covered by code review
+  # and by stage-4 verification against the live policy.
+  assert {
+    condition     = join(",", local.ci_doorbell_ec2_actions) == "ec2:StartInstances"
+    error_message = "The doorbell role must grant StartInstances only -- no terminate, modify, or run (T-019 ruling 3)"
+  }
+
+  assert {
+    condition     = join(",", local.ci_reaper_ec2_actions) == "ec2:StopInstances"
+    error_message = "The reaper role must grant StopInstances only"
+  }
+
+  # The check that actually catches a careless edit: whatever the action lists
+  # grow into, they may never intersect the destructive set.
+  assert {
+    condition = length(setintersection(
+      toset(concat(local.ci_doorbell_ec2_actions, local.ci_reaper_ec2_actions)),
+      toset(local.ci_forbidden_ec2_actions)
+    )) == 0
+    error_message = "Neither CI Lambda may grant terminate/modify/run on EC2 -- the worst a compromised public endpoint should manage is turning the CI box on or off"
+  }
+
+  # --- Ruling 2: the reaper -------------------------------------------------
+  assert {
+    condition     = aws_cloudwatch_event_rule.ci_reaper.schedule_expression == "rate(5 minutes)"
+    error_message = "The reaper must run on a schedule; without it the host never stops and the task saves nothing"
+  }
+
+  # Asserted by rule name, not by ARN: Lambda ARNs are computed, so an
+  # ARN-to-ARN comparison is unknown under `command = plan` (same limitation
+  # documented throughout this file).
+  assert {
+    condition     = aws_cloudwatch_event_target.ci_reaper.rule == aws_cloudwatch_event_rule.ci_reaper.name
+    error_message = "The reaper's schedule target must be attached to the reaper rule"
+  }
+
+  assert {
+    condition     = aws_lambda_permission.ci_reaper_events.function_name == aws_lambda_function.ci_reaper.function_name
+    error_message = "EventBridge must be granted lambda:InvokeFunction on the reaper -- without it the schedule fires and nothing happens"
+  }
+
+  assert {
+    condition     = tonumber(aws_lambda_function.ci_reaper.environment[0].variables["IDLE_WINDOW_MINUTES"]) >= 15
+    error_message = "The idle window must stay long enough that a gap between pipeline stages cannot trip it (T-019 ruling 2)"
+  }
+
+  # The reaper reads Jenkins' password from SSM. Asserted via the Lambda's
+  # env var rather than the policy document, for the unknown-ARN reason above:
+  # the parameter NAME is known at plan time, the ARN is not.
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["JENKINS_PASSWORD_PARAM"] == aws_ssm_parameter.jenkins_admin_password.name
+    error_message = "The reaper must read the Jenkins admin password from SSM, never from a literal or an env var baked at apply"
+  }
+
+  # Cost guard: this task exists to save money, so it must not add a billed
+  # always-on resource. A Function URL is free; an API Gateway in front of the
+  # same Lambda would not be. Asserting the URL is attached to the doorbell is
+  # the plan-time proxy for "no gateway was introduced".
+  #
+  # NOT asserted, same unknown-until-apply limitation already documented above
+  # for aws_eip.drone.public_ip: aws_lambda_function_url.ci_doorbell.function_url
+  # itself is computed at apply, so its value cannot be checked under
+  # `command = plan`. Do not add a `command = apply` run block to force it --
+  # that would create real AWS resources from a test suite that is meant to run
+  # offline. The URL is verified for real at stage 4, by ringing it.
+  assert {
+    condition     = aws_lambda_function_url.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
+    error_message = "The Function URL must be attached to the doorbell Lambda -- an API Gateway would add cost this task cannot justify"
+  }
 }

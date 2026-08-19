@@ -17,3 +17,10 @@ tfplan*
 # provisioning script here for the out-of-band SSM apply step — generated,
 # never authored, never committed.
 /generated/
+
+# T-019: the Lambda sources in lambda/ are plain .py, but running them through
+# py_compile (or any local import) drops bytecode beside them. It is build
+# output, it is architecture- and interpreter-version specific, and it is not
+# what gets deployed — data.archive_file zips source_file, i.e. index.py alone.
+__pycache__/
+*.pyc

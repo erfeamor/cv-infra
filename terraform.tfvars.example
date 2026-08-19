@@ -62,3 +62,8 @@ budget_credit_runway_thresholds = [50, 80, 100]
 budget_monthly_thresholds = [100, 120, 150]
 
 budget_notification_emails = ["REPLACE_ME@example.com"]
+
+# T-019: shared secret for the GitHub webhook -> ci-doorbell Lambda HMAC check.
+# Generate with: openssl rand -hex 32
+# Set the SAME value in each repo's webhook (Settings -> Webhooks -> Secret).
+github_webhook_secret = "REPLACE_ME"

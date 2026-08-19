@@ -33,3 +33,8 @@ output "cognito_user_pool_id" {
 output "cognito_hosted_ui_domain" {
   value = aws_cognito_user_pool_domain.cv.domain
 }
+
+output "ci_doorbell_url" {
+  description = "T-019: Function URL to register as the GitHub webhook on cv-domain-service, cv-database and cv-admin-react. Until the hooks point here, the automation is inert."
+  value       = aws_lambda_function_url.ci_doorbell.function_url
+}

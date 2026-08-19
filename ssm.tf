@@ -78,3 +78,18 @@ resource "aws_ssm_parameter" "cognito_issuer_uri" {
     Project = var.project_name
   }
 }
+
+# T-019 ruling 4: the doorbell's HMAC check needs a shared secret, and no
+# webhook secret existed anywhere in this project — T-005 listed one under
+# "also worth doing" and it was never built. Set the SAME value in each GitHub
+# webhook (see the manual steps in ci.tf); without it the Function URL would be
+# an unauthenticated endpoint that starts EC2 instances.
+resource "aws_ssm_parameter" "github_webhook_secret" {
+  name  = "/${var.project_name}/${var.environment}/ci/github-webhook-secret"
+  type  = "SecureString"
+  value = var.github_webhook_secret
+
+  tags = {
+    Project = var.project_name
+  }
+}

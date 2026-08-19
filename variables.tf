@@ -306,3 +306,23 @@ variable "budget_notification_emails" {
     error_message = "budget_notification_emails must not be empty -- a budget alarm with no subscriber notifies nobody."
   }
 }
+
+# T-019 -----------------------------------------------------------------
+
+variable "github_webhook_secret" {
+  description = "Shared secret for GitHub webhook HMAC validation (ruling 4). Set the same value in each repo's webhook config. No default: an empty secret would make the doorbell's signature check pass for anyone."
+  type        = string
+  sensitive   = true
+}
+
+variable "ci_idle_window_minutes" {
+  description = "How long the CI host must be quiet before the reaper stops it. Long enough that a gap between pipeline stages never trips it."
+  type        = number
+  default     = 20
+}
+
+variable "ci_cpu_busy_percent" {
+  description = "Peak CPU over the idle window at or above which the host counts as busy. A veto only — Jenkins' own queue/executor state is the authoritative signal (T-019 ruling 2)."
+  type        = number
+  default     = 10
+}

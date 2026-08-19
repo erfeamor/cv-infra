@@ -30,11 +30,12 @@ resource "aws_ebs_volume" "mysql_data" {
   # the class of loss this task exists to prevent.
   final_snapshot = true
 
-  # Cost (recorded against the credit runway, T-010): an 8 GiB gp3 volume in
+  # Cost (recorded against the credit runway, T-012): an 8 GiB gp3 volume in
   # eu-west-3 is on the order of $1/month at AWS list pricing -- negligible
-  # against current burn. Burn today is ~$1.23/day (~$37.30/month); the
-  # ~$0.92/day (~$28/month) figure still in cv-infra/CLAUDE.md is stale
-  # (correcting that file is T-020's job, not this task's).
+  # against current burn, which is ~$0.68/day (~$21/month) as measured
+  # 2026-08-19 with the CI host stopped between builds (T-020; CLAUDE.md
+  # carries the full model). This note previously said the figure in
+  # CLAUDE.md was stale and needed T-020 -- that has since happened.
   tags = {
     Name    = "${var.project_name}-mysql-data"
     Project = var.project_name

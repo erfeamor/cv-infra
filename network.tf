@@ -32,17 +32,54 @@ data "aws_subnets" "domain_service" {
   }
 }
 
+# T-022: CloudFront's own origin-facing address ranges, published by AWS as a
+# managed prefix list and kept current by AWS. Referenced by the 8080 ingress
+# below so the domain service answers the edge and nothing else.
+#
+# This is deliberately the same mechanism T-014 ruling 1 mandates for the BFF's
+# port 3000 -- one pattern across both ports, established here first. Read the
+# quota note on that ingress before adding a second rule that references it.
+data "aws_ec2_managed_prefix_list" "cloudfront_origin_facing" {
+  name = "com.amazonaws.global.cloudfront.origin-facing"
+}
+
 resource "aws_security_group" "domain_service" {
-  name        = "${var.project_name}-domain-service"
+  name = "${var.project_name}-domain-service"
+  # Still says "and SSH" though there is no port-22 ingress and has not been
+  # for some time. Left alone deliberately, for the reason spelled out on
+  # aws_security_group.drone below: description is ForceNew (AWS has no
+  # modify-description API) and this group has no create_before_destroy, so
+  # editing this string would destroy a group still attached to
+  # aws_instance.domain_service -- DependencyViolation, mid-apply, on the live
+  # API box. T-022 deliberately did not touch it (its DoR §3 names this trap).
+  # The ingress descriptions below carry the accurate meaning.
   description = "Allows inbound HTTP(S) and SSH to the domain service EC2 instance"
   vpc_id      = data.aws_vpc.default.id
 
+  # T-022: was cidr_blocks = ["0.0.0.0/0"], which made the edge optional --
+  # CloudFront is the designed entry point (see frontend.tf), but the origin
+  # answered the whole internet on plain HTTP, so any behaviour the
+  # distribution enforces could be sidestepped by talking to the EIP. It also
+  # served /v3/api-docs unauthenticated (200 with the full springdoc document,
+  # while the same path 403s through CloudFront), and that surface grows with
+  # every resource M2 lands.
+  #
+  # Scoped to CloudFront's origin-facing ranges. CloudFront reaches this
+  # instance on 8080 over http-only (frontend.tf's domain-service-api origin),
+  # so this is the exact set of sources that legitimately arrive here.
+  #
+  # QUOTA, read before adding another rule that uses this list: an AWS-managed
+  # prefix list counts against "inbound rules per security group" (60) as its
+  # entry count, not as one rule. This list held 46 entries on 2026-08-20, so
+  # ONE reference fits with 14 to spare and TWO (46 + 46 = 92) do not. T-014
+  # therefore cannot add a second prefix-list rule for port 3000 to THIS group
+  # -- the BFF needs its own security group, which is cleaner anyway.
   ingress {
-    description = "App port"
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "Domain service API, reachable only from the CloudFront origin-facing ranges (T-022)"
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id]
   }
 
   # No SSH ingress: shell access goes through SSM Session Manager, which

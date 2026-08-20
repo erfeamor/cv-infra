@@ -15,6 +15,16 @@ mock_provider "aws" {
     }
   }
 
+  # T-022: the CloudFront origin-facing managed prefix list. Mocked so the
+  # 8080 ingress can be asserted offline; the real list is AWS-owned and its
+  # id differs per region (pl-75b1541c in eu-west-3).
+  mock_data "aws_ec2_managed_prefix_list" {
+    defaults = {
+      id   = "pl-00000000000000000"
+      name = "com.amazonaws.global.cloudfront.origin-facing"
+    }
+  }
+
   mock_data "aws_ami" {
     defaults = {
       id = "ami-00000000000000000"
@@ -792,5 +802,59 @@ run "ci_on_demand" {
   assert {
     condition     = aws_lambda_function_url.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
     error_message = "The Function URL must be attached to the doorbell Lambda -- an API Gateway would add cost this task cannot justify"
+  }
+}
+
+# T-022: the domain service used to answer the whole internet on 8080, which
+# made CloudFront optional as an entry point and served /v3/api-docs
+# unauthenticated. These assertions pin the fix so a later edit cannot quietly
+# widen it back -- the failure they guard against reads as a working plan.
+run "domain_service_ingress_scoped_to_cloudfront" {
+  command = plan
+
+  # The rule must reference the managed prefix list, and it must be THE
+  # CloudFront one -- asserting "some prefix list" would pass against any list.
+  assert {
+    condition = alltrue([
+      for rule in aws_security_group.domain_service.ingress :
+      contains(coalesce(rule.prefix_list_ids, []), data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id)
+      if rule.from_port == 8080
+    ])
+    error_message = "The 8080 ingress must be scoped to the CloudFront origin-facing prefix list, not to a CIDR"
+  }
+
+  assert {
+    condition     = data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.name == "com.amazonaws.global.cloudfront.origin-facing"
+    error_message = "The prefix list must be CloudFront's origin-facing list -- any other list would scope 8080 to the wrong senders"
+  }
+
+  # The point of the task: no open CIDR survives anywhere on this group's
+  # ingress. Checked across every rule, not just the 8080 one, so re-adding an
+  # open rule on another port also fails here.
+  assert {
+    condition = alltrue([
+      for rule in aws_security_group.domain_service.ingress :
+      !contains(coalesce(rule.cidr_blocks, []), "0.0.0.0/0")
+    ])
+    error_message = "No ingress rule on the domain-service security group may be open to 0.0.0.0/0 -- T-022 closed the direct-to-origin path and this is what keeps it closed"
+  }
+
+  # DoR §3 / network.tf: description is ForceNew on a group with no
+  # create_before_destroy, so changing it destroys a group still attached to
+  # the live instance. Pinning the exact string makes that an explicit
+  # decision rather than an accident during unrelated tidying.
+  assert {
+    condition     = aws_security_group.domain_service.description == "Allows inbound HTTP(S) and SSH to the domain service EC2 instance"
+    error_message = "Do not edit aws_security_group.domain_service.description -- it is ForceNew and would replace a group attached to the running instance (see the comment in network.tf)"
+  }
+
+  # Port 22 has never been open here and must not arrive by accident: shell
+  # access is SSM Session Manager (CLAUDE.md, "No SSH anywhere").
+  assert {
+    condition = alltrue([
+      for rule in aws_security_group.domain_service.ingress :
+      rule.from_port != 22 && rule.to_port != 22
+    ])
+    error_message = "No port-22 ingress: shell access is SSM Session Manager"
   }
 }

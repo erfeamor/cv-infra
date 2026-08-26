@@ -98,6 +98,29 @@ unclassified:
     url: "http://${server_host}/jenkins/"
 jobs:
   - script: |
+      // T-026: SEED ONLY WHEN ABSENT. JCasC re-applies this whole document on
+      // every Jenkins start, and re-running the DSL recreates the multibranch
+      // job -- which re-creates its branch children with their build numbering
+      // reset to #1, against a JENKINS_HOME whose builds/1 is still on disk.
+      // Jenkins then refuses to overwrite (JENKINS-23152) and creates a fresh
+      // #2, orphaning the #1 that is already running: "No build record could be
+      // located". Measured 7/7 against every recorded occurrence -- see T-026.
+      //
+      // The try/catch is deliberate and is the safety property: if the lookup
+      // is ever unavailable (sandbox, API change) `existing` stays null and we
+      // fall through to creating the job -- today's behaviour, never worse. A
+      // raised exception here would abort the ENTIRE JCasC document and the box
+      // would come up with no jobs at all.
+      def existing = null
+      try {
+        existing = jenkins.model.Jenkins.get().getItemByFullName('cv-domain-service')
+      } catch (Throwable ignored) {
+        existing = null
+      }
+      if (existing != null) {
+        println 'T-026: cv-domain-service already exists; not reseeding'
+        return
+      }
       multibranchPipelineJob('cv-domain-service') {
         branchSources {
           branchSource {
@@ -136,6 +159,18 @@ jobs:
         }
       }
   - script: |
+      // T-026: seed only when absent -- see the full reasoning on the
+      // cv-domain-service script above. Same guard, same fail-open try/catch.
+      def existing = null
+      try {
+        existing = jenkins.model.Jenkins.get().getItemByFullName('cv-database')
+      } catch (Throwable ignored) {
+        existing = null
+      }
+      if (existing != null) {
+        println 'T-026: cv-database already exists; not reseeding'
+        return
+      }
       multibranchPipelineJob('cv-database') {
         branchSources {
           branchSource {

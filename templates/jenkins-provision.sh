@@ -98,6 +98,46 @@ unclassified:
     url: "http://${server_host}/jenkins/"
 jobs:
   - script: |
+      // T-026: SEED ONLY WHEN ABSENT. JCasC re-applies this whole document on
+      // every Jenkins start, and re-running the DSL recreates the multibranch
+      // job -- which re-creates its branch children with their build numbering
+      // reset to #1, against a JENKINS_HOME whose builds/1 is still on disk.
+      // Jenkins then refuses to overwrite (JENKINS-23152) and creates a fresh
+      // #2, orphaning the #1 that is already running: "No build record could be
+      // located". Measured 7/7 against every recorded occurrence -- see T-026.
+      //
+      // TEST THE FILESYSTEM, NOT THE ITEM MODEL. Attempt 1 asked
+      // Jenkins.get().getItemByFullName(...) and was PROVEN INERT by an apply:
+      // JCasC runs job-dsl BEFORE Jenkins loads jobs from disk -- the boot log
+      // order is "Processing provided DSL script" -> createOrUpdateConfig ->
+      // "Loaded all jobs" -- so at DSL time the item model is EMPTY and the
+      // lookup returns null for every job regardless of what is on disk. The
+      // job directory, on the persistent JENKINS_HOME bind mount, IS there.
+      //
+      // Path hardcoded because this heredoc is quoted ('CASC_EOF'): it is
+      // $JENKINS_HOME_DIR/jobs/<name>/config.xml, and JENKINS_HOME_DIR is
+      // /var/lib/jenkins above, bind-mounted and passed as JENKINS_HOME at the
+      // identical path inside the container (see the `docker run` below).
+      //
+      // The try/catch is the safety property: on any failure `seeded` stays
+      // false and we fall through to creating the job -- today's behaviour,
+      // never worse. A raised exception here would abort the ENTIRE JCasC
+      // document and the box would come up with no jobs at all. It LOGS:
+      // attempt 1's catch was silent, so the log could not tell "returned
+      // null" from "threw and was swallowed", and disambiguating that cost a
+      // whole apply cycle.
+      def seeded = false
+      try {
+        seeded = new File('/var/lib/jenkins/jobs/cv-domain-service/config.xml').exists()
+        println 'T-026: cv-domain-service config.xml present=' + seeded
+      } catch (Throwable t) {
+        println 'T-026: cv-domain-service existence check FAILED, seeding anyway: ' + t
+        seeded = false
+      }
+      if (seeded) {
+        println 'T-026: cv-domain-service already exists; not reseeding'
+        return
+      }
       multibranchPipelineJob('cv-domain-service') {
         branchSources {
           branchSource {
@@ -136,6 +176,21 @@ jobs:
         }
       }
   - script: |
+      // T-026: seed only when absent -- see the full reasoning on the
+      // cv-domain-service script above. Same filesystem probe, same fail-open
+      // try/catch, same logging.
+      def seeded = false
+      try {
+        seeded = new File('/var/lib/jenkins/jobs/cv-database/config.xml').exists()
+        println 'T-026: cv-database config.xml present=' + seeded
+      } catch (Throwable t) {
+        println 'T-026: cv-database existence check FAILED, seeding anyway: ' + t
+        seeded = false
+      }
+      if (seeded) {
+        println 'T-026: cv-database already exists; not reseeding'
+        return
+      }
       multibranchPipelineJob('cv-database') {
         branchSources {
           branchSource {

@@ -80,13 +80,43 @@ run "plan_public_access_block" {
 run "plan_deny_non_tls_policy" {
   command = plan
 
+  # try() around the Condition lookup: a future statement added to this
+  # policy without a Condition block must not make jsondecode/index blow
+  # up the whole assertion (a KeyError-equivalent) -- it should just fail
+  # to match the deny-non-TLS statement being searched for, same as any
+  # other non-matching statement.
   assert {
     condition = anytrue([
       for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
       stmt.Effect == "Deny" &&
-      tostring(stmt.Condition.Bool["aws:SecureTransport"]) == "false"
+      try(tostring(stmt.Condition.Bool["aws:SecureTransport"]), "") == "false"
     ])
     error_message = "bucket policy must Deny access when aws:SecureTransport is false"
+  }
+
+  assert {
+    condition = anytrue([
+      for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
+      try(stmt.Principal, "") == "*"
+    ])
+    error_message = "the deny-non-TLS statement must apply to every principal (Principal \"*\"), not be scoped to one -- a non-TLS request from anyone must be denied"
+  }
+
+  assert {
+    condition = anytrue([
+      for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
+      try(stmt.Action, "") == "s3:*"
+    ])
+    error_message = "the deny-non-TLS statement must cover s3:* -- scoping it to fewer actions would let some non-TLS calls through"
+  }
+
+  assert {
+    condition = anytrue([
+      for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
+      contains(try(stmt.Resource, []), "arn:aws:s3:::cv-project-tfstate-760904708057") &&
+      contains(try(stmt.Resource, []), "arn:aws:s3:::cv-project-tfstate-760904708057/*")
+    ])
+    error_message = "the deny-non-TLS statement's Resource must cover both the bucket itself and every object in it -- covering only one leaves the other reachable over plain HTTP"
   }
 }
 
@@ -102,9 +132,51 @@ run "plan_lock_table" {
     condition     = aws_dynamodb_table.tf_locks.hash_key == "LockID"
     error_message = "the S3 backend's dynamodb_table locking protocol requires the hash key literally named LockID"
   }
+
+  assert {
+    condition = anytrue([
+      for a in aws_dynamodb_table.tf_locks.attribute :
+      a.name == "LockID" && a.type == "S"
+    ])
+    error_message = "LockID must be typed S (string) -- the S3 backend's locking protocol writes a string LockID value, and a numeric/binary key would reject every lock write"
+  }
+}
+
+run "plan_lifecycle_configuration" {
+  command = plan
+
+  assert {
+    condition = anytrue([
+      for r in aws_s3_bucket_lifecycle_configuration.tfstate.rule :
+      try(r.noncurrent_version_expiration[0].noncurrent_days, null) != null &&
+      r.status == "Enabled"
+    ])
+    error_message = "an enabled rule must expire noncurrent versions -- otherwise every historical state version (review finding 9) accumulates forever, unbounded cost with no offsetting benefit past the recovery window"
+  }
+
+  assert {
+    condition = anytrue([
+      for r in aws_s3_bucket_lifecycle_configuration.tfstate.rule :
+      try(r.abort_incomplete_multipart_upload[0].days_after_initiation, null) != null &&
+      r.status == "Enabled"
+    ])
+    error_message = "an enabled rule must abort incomplete multipart uploads -- otherwise an interrupted upload's parts bill forever with nothing to show for them"
+  }
+}
+
+run "plan_ownership_controls" {
+  command = plan
+
+  assert {
+    condition = anytrue([
+      for r in aws_s3_bucket_ownership_controls.tfstate.rule :
+      r.object_ownership == "BucketOwnerEnforced"
+    ])
+    error_message = "BucketOwnerEnforced disables ACLs entirely for this bucket -- access is bucket-policy-only, which is what the deny-non-TLS policy already assumes; a laxer setting would let an ACL bypass it"
+  }
 }
 
 # prevent_destroy is a lifecycle meta-argument, not a resource attribute --
 # it doesn't appear in plan output for terraform test to assert on directly.
-# Verified instead by a static grep in bootstrap's fmt/validate gate (see
+# Verified instead by check-static.sh, part of bootstrap's gate (see
 # README.md, "Static checks terraform test can't express").

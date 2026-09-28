@@ -30,6 +30,15 @@ Bootstrap state stays local, gitignored, exactly like any other
 - `lifecycle { prevent_destroy = true }` on the bucket -- this is the
   mapping between every resource in the repo and the live AWS objects it
   created; losing it is exactly what T-004 exists to prevent.
+- `aws_s3_bucket_ownership_controls.tfstate` -- `BucketOwnerEnforced`
+  (review round 1, finding 9): disables ACLs on this bucket entirely, so
+  access is bucket-policy-only, matching what the deny-non-TLS policy
+  already assumes.
+- `aws_s3_bucket_lifecycle_configuration.tfstate` (review round 1,
+  finding 9): expires noncurrent versions after 90 days (versioning
+  without an expiration policy keeps every historical state revision,
+  and its cost, forever) and aborts incomplete multipart uploads after 7
+  days.
 - `aws_dynamodb_table.tf_locks` -- `cv-project-tfstate-lock`,
   `PAY_PER_REQUEST`, hash key `LockID` (the S3 backend's locking protocol
   requires that exact attribute name).
@@ -38,11 +47,24 @@ Bootstrap state stays local, gitignored, exactly like any other
 
 `prevent_destroy` is a lifecycle meta-argument, not a resource attribute
 -- it never appears in plan output, so no `assert` block can see it.
-Checked instead by a static grep as part of this module's gate:
+Checked instead by `bootstrap/check-static.sh`, part of this module's gate
+(run it alongside fmt/validate/test -- the meta repo's `lint-all.sh` /
+`test-all.sh` don't invoke it, since this is a demo-scale addition scoped
+to this one module rather than a cross-repo convention; wiring it in there
+is a separate, deliberate change if it's ever wanted):
 
 ```bash
-grep -n "prevent_destroy" bootstrap/state-backend.tf
+bash bootstrap/check-static.sh
 ```
+
+Anchored (`^\s*prevent_destroy\s*=\s*true`) and requires the assignment
+uncommented, so it can't be fooled by a comment mentioning
+`prevent_destroy` (this file has several) the way a bare
+`grep -n prevent_destroy` would be. Verified red: removing the
+`lifecycle { prevent_destroy = true }` block from a scratch copy of
+`state-backend.tf` makes the script exit 1 with "no uncommented
+'prevent_destroy = true' found"; restoring the block (or checking the
+real file) exits 0.
 
 ## Bootstrap / apply / migrate order
 
@@ -50,13 +72,22 @@ Everything below except step 1 is **driver-run**, not part of this PR (see
 the task's H1 test plan -- this PR is code + offline gates only).
 
 1. `terraform fmt -check -recursive`, `terraform validate`, `terraform
-   test` here and in the main module. (This PR.)
-2. Back up the main module's `terraform.tfstate` and `.backup` to
+   test`, and `bash bootstrap/check-static.sh`, here and in the main
+   module. (This PR.)
+2. Back up the main module's `terraform.tfstate` and `.backup`, **and**
+   this module's own `bootstrap/terraform.tfstate` /
+   `.tfstate.backup` once they exist, to
    `~/.local/share/cv-infra-state-backups/<date>/` (dir `0700`, files
-   `0600`) -- **before** anything below touches the real backend.
+   `0600`) -- **before** anything below touches the real backend. The
+   bootstrap state is the only record of what the bucket/table actually
+   are (their real ARNs, tags, applied config) until the next apply; losing
+   that disk without a backup means falling back to the `terraform import`
+   recovery below.
 3. `cd bootstrap && terraform init && terraform apply` -- creates the
    bucket and table for real. Nothing about the main module's state
-   changes yet.
+   changes yet. Immediately after, back up the now-populated
+   `bootstrap/terraform.tfstate` per step 2 (it didn't exist before this
+   step).
 4. Note `terraform state list | wc -l` in the main module (pre-migration
    resource count, to diff against post-migration).
 5. In the main module: `terraform init -migrate-state` against the new
@@ -78,7 +109,9 @@ the task's H1 test plan -- this PR is code + offline gates only).
 ## Rollback
 
 Bootstrap and main-module migration are **separate applies against
-separate state**, so rollback is per-stage:
+separate state**, so rollback is per-stage. In every case, back up
+whatever local state file is about to be touched, per the step-2 backup
+convention, *before* running anything below.
 
 - **Before step 5 (migration not yet run):** nothing to roll back. The
   main module is still on local state; `terraform destroy` here removes
@@ -86,24 +119,84 @@ separate state**, so rollback is per-stage:
   bucket will refuse this -- remove that block first if the bootstrap
   itself needs undoing, which is the point: it forces that removal to be
   a deliberate, separate action, not a side effect.
-- **After step 5, before step 6 confirms clean:** do not apply anything.
-  Restore the main module's `terraform.tfstate` from the step-2 backup,
-  then re-run `terraform init` there (without `-migrate-state`) to drop
-  back to local state. The bucket now holds a copy of state that no
-  longer matches the working config's backend block; it can be emptied
-  and left in place, or the object deleted, once local state is confirmed
-  working again.
+- **After step 5, before step 6 confirms clean** -- order matters here,
+  reversed from what's intuitive:
+  1. Revert the `backend "s3"` block in the main module's `providers.tf`
+     to local (comment it out, matching what it looked like before this
+     task).
+  2. `terraform init -reconfigure` in the main module. This is the step
+     that actually matters and is easy to skip: the working directory's
+     own backend pointer (`.terraform/terraform.tfstate`, not the state
+     file itself) still says "S3" until `-reconfigure` runs, so without
+     it Terraform keeps reading/writing the bucket regardless of what
+     `providers.tf` now says, and the restored file in step 3 is never
+     looked at.
+  3. Restore the main module's `terraform.tfstate` from the step-2
+     backup.
+  4. `terraform plan` -- confirms no drift happened between the backup
+     and now (it should already match; this is a check, not a fix).
+
+  The remote copy in the bucket is now stale, not authoritative. Leave it
+  (harmless, and versioning bills for it either way at this scale) or see
+  "Deleting a stale remote object" below.
 - **After step 6 confirms clean:** the bucket is now authoritative.
-  Rolling back means reversing the `backend "s3"` block in the main
-  module's `providers.tf` back to local, `terraform init` (Terraform
-  copies remote state back to a local file on the next init without
-  `-migrate-state` if prompted, or use `terraform state pull >
-  terraform.tfstate` to recover it manually), and treating the bucket
-  copy as the backup going forward.
+  Rolling back:
+  1. Revert the `backend "s3"` block in `providers.tf` to local, same as
+     above.
+  2. `terraform init -migrate-state` (S3 → local this time) --
+     Terraform prompts to copy the current remote state down to a local
+     file; confirm. A plain `terraform init` here is not enough:
+     Terraform detects the backend config changed and refuses with an
+     error demanding `-migrate-state` or `-reconfigure` explicitly, it
+     will not silently guess which you want. Manual alternative, if the
+     file is wanted on disk before telling Terraform to stop using the
+     backend: `terraform state pull > terraform.tfstate` followed by
+     `terraform init -reconfigure`.
+  3. `terraform plan` to confirm no changes.
 - Versioning on the bucket means an in-place corruption (not a backend
   swap, but a bad state write) is a version rollback
   (`aws s3api list-object-versions` /
   `aws s3api get-object --version-id`), not a restore-from-elsewhere.
+
+### Deleting a stale remote object
+
+Versioning means a plain `aws s3api delete-object` only writes a delete
+marker -- every prior version (and the secrets in it) is still stored
+and billed, just hidden from a normal `get-object`. To actually remove a
+stale state object, delete every version and every delete marker for
+that key explicitly:
+
+```bash
+aws s3api list-object-versions --bucket cv-project-tfstate-760904708057 \
+  --prefix cv-infra/terraform.tfstate \
+  --query '{Versions: Versions[].[Key,VersionId], Markers: DeleteMarkers[].[Key,VersionId]}'
+# For every [Key, VersionId] pair in BOTH lists returned above:
+aws s3api delete-object --bucket cv-project-tfstate-760904708057 \
+  --key cv-infra/terraform.tfstate --version-id <VersionId>
+```
+
+### Recovering from a lost bootstrap state
+
+Bootstrap's own state is local (see above); losing that disk loses the
+mapping to the real bucket/table even though the bucket/table themselves
+are untouched. Recover with an empty bootstrap state and import the
+eight resources back into it (the step-2 backup is the alternative to
+all of this -- restore it instead if one exists):
+
+```bash
+cd bootstrap
+terraform init
+terraform import aws_s3_bucket.tfstate                                   cv-project-tfstate-760904708057
+terraform import aws_s3_bucket_versioning.tfstate                        cv-project-tfstate-760904708057
+terraform import aws_s3_bucket_server_side_encryption_configuration.tfstate cv-project-tfstate-760904708057
+terraform import aws_s3_bucket_public_access_block.tfstate               cv-project-tfstate-760904708057
+terraform import aws_s3_bucket_ownership_controls.tfstate                 cv-project-tfstate-760904708057
+terraform import aws_s3_bucket_lifecycle_configuration.tfstate           cv-project-tfstate-760904708057
+terraform import aws_s3_bucket_policy.tfstate                            cv-project-tfstate-760904708057
+terraform import aws_dynamodb_table.tf_locks                             cv-project-tfstate-lock
+terraform plan   # must show no changes -- confirms every attribute the import
+                 # brought in still matches this module's config
+```
 
 ## Rotation decision (T-004 part 3)
 

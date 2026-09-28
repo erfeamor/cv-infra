@@ -77,18 +77,23 @@ resource "aws_s3_bucket_policy" "tfstate" {
         Effect    = "Deny"
         Principal = "*"
         Action    = "s3:*"
-        # Built from the bucket name (var.project_name/var.account_id),
-        # not aws_s3_bucket.tfstate.arn: an S3 ARN is always
+        # Built from aws_s3_bucket.tfstate.bucket (the configured `bucket`
+        # argument reflected back), not from repeating the
+        # project_name/account_id interpolation a second time, and not
+        # from aws_s3_bucket.tfstate.arn: an S3 ARN is always
         # "arn:aws:s3:::<bucket-name>[/key]" -- no account id or region
-        # component, so this is exactly the same value the computed .arn
-        # would resolve to, but known at plan time. That keeps this
-        # resource's `terraform test` coverage at `command = plan`
-        # instead of `apply` -- material here because the bucket carries
+        # component -- and `.bucket` is an input attribute (known at plan
+        # time, equal to the string passed in), unlike `.arn`, which AWS
+        # assigns and is unknown until apply. Using `.bucket` here means
+        # the name is declared in exactly one place (the resource's own
+        # `bucket` argument above) while still keeping this resource's
+        # `terraform test` coverage at `command = plan` instead of
+        # `apply` -- material because the bucket carries
         # `lifecycle { prevent_destroy = true }`, and test teardown
         # cannot destroy an applied prevent_destroy'd resource.
         Resource = [
-          "arn:aws:s3:::${var.project_name}-tfstate-${var.account_id}",
-          "arn:aws:s3:::${var.project_name}-tfstate-${var.account_id}/*",
+          "arn:aws:s3:::${aws_s3_bucket.tfstate.bucket}",
+          "arn:aws:s3:::${aws_s3_bucket.tfstate.bucket}/*",
         ]
         Condition = {
           Bool = {
@@ -100,6 +105,64 @@ resource "aws_s3_bucket_policy" "tfstate" {
   })
 
   depends_on = [aws_s3_bucket_public_access_block.tfstate]
+}
+
+resource "aws_s3_bucket_ownership_controls" "tfstate" {
+  bucket = aws_s3_bucket.tfstate.id
+
+  # Review round 1, finding 9: BucketOwnerEnforced disables ACLs for this
+  # bucket entirely -- access is bucket-policy-only. The deny-non-TLS
+  # policy above already assumes that framing (a Deny statement, not an
+  # ACL); a laxer ownership setting would leave an ACL-based path that
+  # policy doesn't cover.
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "tfstate" {
+  # Must be created after ownership controls under BucketOwnerEnforced --
+  # not functionally required for THIS rule (it touches no ACL), but
+  # matches the dependency AWS documents between the two resource types
+  # for this bucket so a future rule that does need one doesn't silently
+  # race it.
+  depends_on = [aws_s3_bucket_ownership_controls.tfstate]
+
+  bucket = aws_s3_bucket.tfstate.id
+
+  rule {
+    id     = "state-housekeeping"
+    status = "Enabled"
+
+    # Applies to every object in the bucket (there's only ever one, the
+    # main module's state file) -- an empty filter, not a prefix, is what
+    # makes that explicit rather than implicit.
+    filter {}
+
+    # Review round 1, finding 9: versioning without an expiration policy
+    # means every historical revision of the state file is kept, and
+    # billed, forever. 90 days / a state file this size is negligible
+    # against the credit runway (cv-infra/CLAUDE.md's cost model) and
+    # comfortably covers "someone notices the corruption and needs to
+    # roll back" -- the scenario versioning exists for in the first
+    # place (see the "Why this exists" / part 2 rationale). Kept as days,
+    # not a version count, because Terraform's S3 backend writes on every
+    # apply, not on a fixed schedule -- a version-count limit would give
+    # an unpredictable window depending on how often applies happen,
+    # where a day count doesn't.
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+
+    # An interrupted multipart upload's parts are billed indefinitely
+    # with nothing to show for them if never aborted. The state file here
+    # is a few KB -- nowhere near S3's multipart threshold -- so this
+    # rule is precautionary rather than something expected to ever fire,
+    # but costs nothing to have in place.
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
 }
 
 resource "aws_dynamodb_table" "tf_locks" {

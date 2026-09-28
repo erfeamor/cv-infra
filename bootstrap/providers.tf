@@ -18,4 +18,14 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
+
+  # Review round 1, finding 7: this module creates a bucket whose name is
+  # itself account-specific (var.account_id, folded into the name in
+  # state-backend.tf for global uniqueness -- see variables.tf). Guard
+  # against ever applying it against the wrong set of credentials: if the
+  # configured credentials resolve to a different account than
+  # var.account_id, Terraform refuses before making any AWS call, rather
+  # than creating a same-named bucket attempt (which would just fail) or,
+  # worse, silently succeeding against an account nobody intended.
+  allowed_account_ids = [var.account_id]
 }

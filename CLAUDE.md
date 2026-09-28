@@ -16,6 +16,16 @@ terraform plan             # needs real AWS credentials + terraform.tfvars
 
 One root module, one file per concern: `providers.tf`, `variables.tf`, `network.tf` (default VPC + SGs), `compute.tf` (EC2), `frontend.tf` (S3+CloudFront), `auth.tf` (Cognito), `iam.tf`, `observability.tf` (log groups), `ssm.tf` (parameters), `outputs.tf`. New resources join the matching file or get a new single-concern file. **MySQL is self-hosted** in a container on the domain-service EC2 (`templates/domain-service-user-data.sh`), not RDS — see the decision below.
 
+There is also `bootstrap/`, a **separate root module with its own local state** (T-004 part 2). It creates the S3 bucket and DynamoDB table the main module's `backend "s3"` block (`providers.tf`) points at — the main module never manages the bucket it stores its own state in. See `bootstrap/README.md` for the bootstrap/apply/migrate order and the rollback procedure.
+
+## Remote state
+
+State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3 + a public-access block + a deny-non-TLS policy + `prevent_destroy`), locked via a DynamoDB table (`cv-project-tfstate-lock`, `PAY_PER_REQUEST`, hash key `LockID`). Both are created by `bootstrap/`, not by this module.
+
+- **Why DynamoDB and not S3-native locking:** Terraform here is pinned to **1.9.8**. S3-native locking (`use_lockfile` on the `backend "s3"` block, no DynamoDB table needed) needs **Terraform >= 1.10**. When the toolchain is upgraded past 1.10, switch `providers.tf`'s backend block to `use_lockfile = true` and drop `dynamodb_table` (and decommission the lock table) **in that same PR** — not as an incidental side effect of an unrelated toolchain bump, and not before the upgrade actually lands.
+- **Local-state backup convention.** Before any state-affecting operation (a backend migration, an out-of-band edit, anything riskier than a routine `apply`), copy `terraform.tfstate` and `terraform.tfstate.backup` to `~/.local/share/cv-infra-state-backups/<date>/` — directory `0700`, files `0600`. This lives outside the repo and outside `cv-infra/` itself on purpose: a mistake that damages the working tree (or the bucket) shouldn't also destroy the one copy that could recover it.
+- **Rotation decision (T-004 part 3): accept, no rotation.** `db_password`, `drone_rpc_secret`, `drone_github_client_secret` sat in local state at `0664` until 2026-08-24 (`0600` since). Single-user machine, gitignored files, closed exposure window — judged low enough risk not to rotate. `db_password` specifically has an additional blocker regardless: see T-021 (meta repo task board — cv-infra has no `.claude/` of its own) — rotating it before that lands means Flyway auth fails against the persistent MySQL volume's original credentials and the box comes up with no domain-service container at all. Full reasoning in `bootstrap/README.md`.
+
 ## Binding constraints & decisions
 
 - **Cost model — read this before citing "Free Tier". Figures measured 2026-08-19 (T-020); re-read them, do not inherit them.** This account was created 2026-07-12, so it is on AWS's **post-July-2025 Free Tier**: a fixed pot of signup credits and a 6-month window, **not** the legacy 12-month allowance. There is **no 750 h/month EC2 allowance here**, so every instance-hour bills and is paid from credits (net invoice $0 so far).

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Stub `aws` CLI for scripts/tests/run-drone-reseed-tests.sh. Only
+# understands the one call scripts/drone-reseed-secrets.sh makes:
+#   aws ssm get-parameter --with-decryption --region R --name N \
+#       --query Parameter.Value --output text
+#
+# Behaviour is driven entirely by env vars the harness sets, never by
+# argument parsing tricks, so the fixture is easy to read:
+#   STUB_AWS_CALLS_LOG              -- append "get-parameter <name>" per call
+#   STUB_AWS_MISSING_PARAM_SUFFIX   -- if the requested --name ends with
+#                                      this, print nothing and exit 254
+#                                      (mirrors the real CLI's
+#                                      ParameterNotFound exit behaviour)
+#   STUB_AWS_ACCESS_KEY_ID_VALUE    -- value returned for .../access-key-id
+#   STUB_AWS_SECRET_ACCESS_KEY_VALUE -- value returned for .../secret-access-key
+set -euo pipefail
+
+if [ "${1:-}" != "ssm" ] || [ "${2:-}" != "get-parameter" ]; then
+  echo "stub aws: unsupported invocation: $*" >&2
+  exit 1
+fi
+shift 2
+
+name=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --name)
+    name="$2"
+    shift 2
+    ;;
+  *)
+    shift
+    ;;
+  esac
+done
+
+if [ -n "${STUB_AWS_CALLS_LOG:-}" ]; then
+  echo "get-parameter ${name}" >>"$STUB_AWS_CALLS_LOG"
+fi
+
+if [ -n "${STUB_AWS_MISSING_PARAM_SUFFIX:-}" ] && [[ "$name" == *"$STUB_AWS_MISSING_PARAM_SUFFIX" ]]; then
+  echo "stub aws: An error occurred (ParameterNotFound)" >&2
+  exit 254
+fi
+
+case "$name" in
+*/access-key-id)
+  printf '%s\n' "${STUB_AWS_ACCESS_KEY_ID_VALUE:?}"
+  ;;
+*/secret-access-key)
+  printf '%s\n' "${STUB_AWS_SECRET_ACCESS_KEY_VALUE:?}"
+  ;;
+*)
+  echo "stub aws: no fixture for --name $name" >&2
+  exit 1
+  ;;
+esac

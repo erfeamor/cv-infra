@@ -12,7 +12,14 @@ terraform init -backend=false     # since the T-004 backend "s3" block landed, p
                                    # tries to reach the real bucket/table; -backend=false skips that
 terraform validate
 terraform test                    # tests/plan.tftest.hcl — runs OFFLINE via mock_provider
+bash scripts/check-t008-static.sh          # T-008: two properties plan-time `terraform test` can't see
+                                            # (a sensitive output, a policy pinned by hash) — see the
+                                            # script's own header for why
+bash scripts/tests/run-drone-reseed-tests.sh   # T-008: offline harness for scripts/drone-reseed-secrets.sh
+                                                # (stubs `aws` and the Drone API; no AWS/network needed)
 ```
+
+Both `scripts/check-t008-static.sh` and `scripts/tests/run-drone-reseed-tests.sh` are cv-infra-local additions (T-008) — they are not part of the meta repo's `scripts/lint-all.sh` / `scripts/test-all.sh` orchestration, so run them directly from here as shown above.
 
 Real usage (needs AWS credentials, `terraform.tfvars`, and the state bucket/table from `bootstrap/` to already exist — see `bootstrap/README.md`):
 
@@ -67,6 +74,7 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 - **No RDS — MySQL is self-hosted** on the domain-service EC2 (MySQL 8.4 container, Flyway-migrated at boot, data on a host volume). This was a deliberate move off `db.t3.micro` RDS: it removed the instance cost **and** the MySQL 8.0 Extended Support per-vCPU charge that began Aug 2026. Trade-off: no managed backups/patching/HA — durability rests on the instance's volume, and a `mysqldump→S3` job is the intended backup. A `t3.small` is recommended over `t3.micro` for the DB+app box for RAM headroom.
 - **No SSH anywhere.** Shell access is SSM Session Manager via the instance profile in `iam.tf`. Do not add port-22 ingress or key pairs back.
 - Secrets flow: values land in SSM Parameter Store (`/cv-project/<env>/…`); services read them at runtime via the instance role. Never put secrets in tfvars committed files — `terraform.tfvars` is gitignored, `.example` carries placeholders.
+- **Exception: `.../deploy/drone-deploy/*` (T-008).** The drone-deploy IAM user's own access key (`aws_iam_access_key.drone_deploy`, `iam.tf`) lives in SSM at `.../deploy/drone-deploy/{access-key-id,secret-access-key}`, deliberately **outside** `ci/*` and read by **no instance role** — the Drone CI host's own role only reads `ci/*`, and build containers on that host can reach it until T-007/T-005. This credential is read only by an operator's own AWS credentials, off-host, via `scripts/drone-reseed-secrets.sh` over an SSM port-forwarding tunnel to Drone (see `docs/drone-host-backup-and-cutover.md`). Before this task the credential's only copy was in Drone's SQLite on the CI host's unencrypted root volume.
 - `.terraform.lock.hcl` **is committed** (HashiCorp guidance). Provider/version bumps are their own PR.
 - CloudFront serves the SPA fallback (403/404 → `/index.html`) and reaches S3 only through OAC + bucket policy — if you touch `frontend.tf`, keep both, they're what make the distribution work at all.
 

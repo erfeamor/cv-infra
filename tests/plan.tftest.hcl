@@ -805,6 +805,122 @@ run "ci_on_demand" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# T-008 -- the drone-deploy IAM user's own access key moves into Terraform +
+# SSM (iam.tf, ssm.tf), so the CI host's Drone SQLite stops being the only
+# copy of this credential. Everything here is known at plan time: the user's
+# `name` is a plain variable interpolation (no AWS-generated ARN involved),
+# and the two SSM parameter names/types are literal too.
+# ---------------------------------------------------------------------------
+run "drone_deploy_credentials" {
+  command = plan
+
+  # Case 1, RED FIRST: the access key attaches to the SAME existing user
+  # that already carries the frontend-deploy policy -- not a new/parallel
+  # IAM identity.
+  assert {
+    condition     = aws_iam_access_key.drone_deploy.user == aws_iam_user.drone_deploy.name
+    error_message = "aws_iam_access_key.drone_deploy must attach to aws_iam_user.drone_deploy, not a different or new IAM user"
+  }
+
+  # Case 2, RED FIRST: both parameters are SecureStrings...
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_access_key_id.type == "SecureString"
+    error_message = "The drone-deploy access key ID must be stored as a SecureString"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_secret_access_key.type == "SecureString"
+    error_message = "The drone-deploy secret access key must be stored as a SecureString"
+  }
+
+  # ...at the deploy/ path...
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_access_key_id.name == "/${var.project_name}/${var.environment}/deploy/drone-deploy/access-key-id"
+    error_message = "The access key ID parameter must live at the deploy/drone-deploy path"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_secret_access_key.name == "/${var.project_name}/${var.environment}/deploy/drone-deploy/secret-access-key"
+    error_message = "The secret access key parameter must live at the deploy/drone-deploy path"
+  }
+
+  # ...NOT under ci/ -- that's what the Drone host's own instance role can
+  # read, and build containers on that host can reach it until T-007/T-005.
+  assert {
+    condition = (
+      !can(regex("/ci/", aws_ssm_parameter.drone_deploy_access_key_id.name)) &&
+      !can(regex("/ci/", aws_ssm_parameter.drone_deploy_secret_access_key.name))
+    )
+    error_message = "Neither drone-deploy SSM parameter may live under the ci/ prefix -- that's what the Drone host's own instance role can read"
+  }
+
+  # Negative half of case 2, the CI-host role: aws_iam_role_policy.
+  # drone_read_ci_parameters is scoped to ci/* only -- pin its Resource
+  # string exactly (fully known at plan, built only from variables, no
+  # AWS-generated ARN involved) so a later widening (e.g. to deploy/* or
+  # the whole tree) fails here instead of silently handing a build
+  # container its own deploy key.
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement[0].Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
+    error_message = "aws_iam_role_policy.drone_read_ci_parameters must stay scoped to ci/* -- widening it would let a build container on the Drone host read its own deploy key out of SSM"
+  }
+
+  # --- Security review round 2 (Medium, accepted): the APP host's own role
+  # is NOT isolated from deploy/ the same way -- aws_iam_role_policy.
+  # read_parameters (iam.tf) grants ssm:GetParameter* on the WHOLE
+  # /${project}/* tree (it legitimately needs db/, cognito/, observability/,
+  # etc across the tree), which already covered deploy/drone-deploy/* before
+  # this fix, and this host has no metadata_options (IMDSv1 on) and runs
+  # containers reachable by SSRF/RCE. "Outside ci/*" alone only isolates the
+  # CI host's role; this pair of assertions is what actually isolates the
+  # app host's role too, via an explicit Deny (which IAM always evaluates
+  # ahead of any Allow, regardless of statement order). This task
+  # deliberately does NOT narrow the Allow itself (that's T-005 work; a
+  # missed path there would break this host's own boot), so both the
+  # original tree-wide Allow and the new Deny are asserted, not one in
+  # place of the other. ---
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
+      s.Effect == "Allow" && contains(s.Action, "ssm:GetParameter") && s.Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/*"
+    ])
+    error_message = "aws_iam_role_policy.read_parameters must keep its tree-wide Allow on ssm:GetParameter* -- this task does not narrow it (T-005 does)"
+  }
+
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
+      s.Effect == "Deny" && contains(s.Action, "ssm:GetParameter") && s.Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
+    ])
+    error_message = "aws_iam_role_policy.read_parameters must explicit-Deny ssm:GetParameter* on the deploy/ prefix -- otherwise the app host's own role (IMDSv1, no metadata_options) can read the frontend deploy key via an SSRF/RCE in the domain service (T-008 security review round 2)"
+  }
+
+  # Ties the Deny's literal Resource pattern to the REAL parameter names
+  # created in ssm.tf, rather than trusting two independently-typed string
+  # literals to agree with each other -- a Deny on the wrong prefix would
+  # still pass the assertion above (both sides are just string literals)
+  # without actually covering these parameters.
+  assert {
+    condition = (
+      startswith(aws_ssm_parameter.drone_deploy_access_key_id.name, "/${var.project_name}/${var.environment}/deploy/") &&
+      startswith(aws_ssm_parameter.drone_deploy_secret_access_key.name, "/${var.project_name}/${var.environment}/deploy/")
+    )
+    error_message = "The Deny's deploy/ prefix must actually cover both drone-deploy SSM parameter names"
+  }
+
+  # Case 4/5 (the part checkable under `command = plan`): aws_iam_user_policy.
+  # drone_deploy is NOT reasserted here -- its Resource fields embed
+  # aws_s3_bucket.frontend.arn / aws_cloudfront_distribution.frontend.arn,
+  # which are unknown-until-apply under `command = plan` (same documented
+  # limitation as aws_s3_bucket.backup.arn and aws_eip.drone.public_ip
+  # elsewhere in this file; confirmed empirically the same way). This task
+  # does not touch that resource at all -- verified by code review (git
+  # diff shows no edit to its block) and by scripts/check-t008-static.sh,
+  # which pins its exact text with a hash so a future edit that changes it
+  # fails a fast, offline check instead of only being caught by review.
+}
+
 # T-022: the domain service used to answer the whole internet on 8080, which
 # made CloudFront optional as an entry point and served /v3/api-docs
 # unauthenticated. These assertions pin the fix so a later edit cannot quietly

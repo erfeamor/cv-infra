@@ -32,14 +32,25 @@ gate that built the Terraform and the reseed script it references
   round 1).** An earlier draft of this runbook had a "Part 3" that shipped
   `database.sqlite` off the host via a presigned S3 URL before the
   rehearsal. Dropped entirely: that file holds the GitHub OAuth token and
-  every activated repo's secrets **unencrypted** -- Drone has no
-  `DRONE_DATABASE_SECRET` configured (`../templates/drone-user-data.sh`
-  sets no such env var), so there is no at-rest encryption to rely on, and
-  copying it off-host would have created a second, less-controlled home for
-  exactly the credentials this task exists to stop scattering. The fallback
-  until T-007 replaces this host with an encrypted root is the moved-aside
+  every activated repo's secrets **unencrypted at the time this decision was
+  made** -- Drone had no `DRONE_DATABASE_SECRET` configured back then, so
+  there was no at-rest encryption to rely on, and copying it off-host would
+  have created a second, less-controlled home for exactly the credentials
+  this task exists to stop scattering. The fallback until T-007 replaces
+  this host with an encrypted root is the moved-aside
   `database.sqlite.rehearsal-<date>` file Part 2 already leaves on the host
   itself -- not a separate off-host copy.
+  **Update (T-007): `DRONE_DATABASE_SECRET` is now set.** T-007 adds
+  `random_password.drone_database_secret` and an SSM SecureString at
+  `ci/drone/database-secret` (`../ssm.tf`), and
+  `../templates/drone-user-data.sh` reads it via `param()` and passes it to
+  `drone-server` as `DRONE_DATABASE_SECRET`. This is set on the *replacement*
+  host built by T-007's own runbook
+  (`docs/t007-ci-host-replace-runbook.md`) -- the rebuild that runbook
+  documents already includes it, so no separate cutover step is needed here.
+  The background above is left as-is because it correctly describes why the
+  gap existed and why it wasn't papered over with an off-host copy; it is
+  not a live gap after T-007 lands.
 
 ## Part 1 -- apply and cutover
 

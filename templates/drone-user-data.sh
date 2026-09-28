@@ -29,6 +29,10 @@ param() {
 DRONE_RPC_SECRET=$(param drone-rpc-secret)
 GITHUB_CLIENT_ID=$(param github-client-id)
 GITHUB_CLIENT_SECRET=$(param github-client-secret)
+# T-007: encrypts sensitive data (OAuth tokens, activated-repo secrets) at
+# rest in Drone's SQLite. Never echoed or logged -- read straight into the
+# env var docker run below reads from.
+DRONE_DATABASE_SECRET=$(param drone/database-secret)
 
 docker network create drone
 
@@ -38,6 +42,7 @@ docker run -d --name drone-server --restart unless-stopped \
   -e DRONE_GITHUB_CLIENT_ID="$GITHUB_CLIENT_ID" \
   -e DRONE_GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \
   -e DRONE_RPC_SECRET="$DRONE_RPC_SECRET" \
+  -e DRONE_DATABASE_SECRET="$DRONE_DATABASE_SECRET" \
   -e DRONE_SERVER_HOST="${server_host}" \
   -e DRONE_SERVER_PROTO=http \
   -e DRONE_USER_CREATE="username:${admin_username},admin:true" \
@@ -55,3 +60,36 @@ docker run -d --name drone-runner --restart unless-stopped \
   -e DRONE_RUNNER_CAPACITY=1 \
   -e DRONE_RUNNER_NAME="${project_name}-runner" \
   drone/drone-runner-docker:1
+
+# T-007 (H1 decision 2): nothing on this host prunes Docker images -- every
+# base-image/tool bump (e.g. Flyway) adds a layer set beside the old one, and
+# that is what forced the disk measurement behind this task's root-size
+# choice. A weekly sweep keeps the 20 GB root from filling silently between
+# replacements. No -a/--volumes: this only reclaims dangling images/build
+# cache, never a still-referenced image or a named volume (Drone's own data
+# lives in the /var/lib/drone bind mount above, untouched either way).
+# Idempotent: both files are overwritten deterministically and
+# `systemctl enable --now` is a no-op if already enabled.
+cat >/etc/systemd/system/docker-prune.service <<'EOF'
+[Unit]
+Description=Weekly docker system prune
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker system prune -f
+EOF
+
+cat >/etc/systemd/system/docker-prune.timer <<'EOF'
+[Unit]
+Description=Weekly timer for docker-prune.service
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now docker-prune.timer

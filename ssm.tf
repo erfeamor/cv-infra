@@ -11,6 +11,34 @@ resource "aws_ssm_parameter" "db_password" {
   }
 }
 
+# T-007: DRONE_DATABASE_SECRET encrypts sensitive data (repo OAuth tokens,
+# activated-repo secrets) at rest in Drone's SQLite. Drone has run without
+# one since it was first stood up (T-002) -- docs/drone-host-backup-and-cutover.md
+# recorded that gap explicitly. Generated here, not typed into tfvars by
+# hand, so the only copies are Terraform state and this SecureString.
+#
+# Format: Drone reads this as an opaque string and uses it as an AES-256 key
+# to encrypt values before they touch SQLite, so it must be exactly 32 bytes.
+# random_password's default character set (letters + digits, no special
+# chars here -- see override below) makes each character exactly 1 byte in
+# UTF-8, so length = 32 yields a 32-byte ASCII key -- satisfies both "32
+# bytes" and "32-char string" without relying on a hex/base64 encoding Drone
+# would then have to decode.
+resource "random_password" "drone_database_secret" {
+  length  = 32
+  special = false
+}
+
+resource "aws_ssm_parameter" "drone_database_secret" {
+  name  = "/${var.project_name}/${var.environment}/ci/drone/database-secret"
+  type  = "SecureString"
+  value = random_password.drone_database_secret.result
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
 # CI secrets the Drone host reads at boot (see templates/drone-user-data.sh).
 resource "aws_ssm_parameter" "drone_rpc_secret" {
   name  = "/${var.project_name}/${var.environment}/ci/drone-rpc-secret"

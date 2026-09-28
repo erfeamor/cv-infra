@@ -88,6 +88,33 @@ resource "aws_instance" "drone" {
   vpc_security_group_ids = [aws_security_group.drone.id]
   iam_instance_profile   = aws_iam_instance_profile.drone.name
 
+  # T-007 (H1 decision 2): the plain AL2023 AMI defaults to an 8 GB root --
+  # too small for this host's measured ~17 GiB of Docker images/build cache
+  # (T-007's disk measurement, 2026-09-24). Explicit and sized with
+  # headroom, not left to the AMI default. gp3 (not gp2) matches the rest
+  # of this module's convention, and encrypted at rest with the AWS-managed
+  # EBS key -- no CMK needed for this box.
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+    encrypted   = true
+  }
+
+  # T-007 (H1 decision 3, carried from T-005): require IMDSv2 and cap the hop
+  # limit at 1, so a container on this host (reachable via the docker socket
+  # mount on drone-runner, or any build step) cannot reach the instance
+  # metadata service through a bridge network -- hop 1 stops it one Docker
+  # network hop short of the host's own loopback route. Host-side `param()`
+  # (templates/drone-user-data.sh) and SSM Session Manager both go through
+  # the SSM agent/AWS CLI on the host itself, which is hop 0 from its own
+  # perspective, so neither is affected. Verify both properties live, before
+  # trusting this: a container denied credentials, and param()/SSM still
+  # working (see docs/t007-ci-host-replace-runbook.md).
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
   # Concatenated so a *future* replacement instance boots straight into
   # Drone + Jenkins + proxy. Deliberately NOT paired with
   # user_data_replace_on_change (see header comment) -- on the box that is
@@ -135,6 +162,7 @@ resource "aws_instance" "drone" {
     aws_ssm_parameter.drone_rpc_secret,
     aws_ssm_parameter.drone_github_client_id,
     aws_ssm_parameter.drone_github_client_secret,
+    aws_ssm_parameter.drone_database_secret,
     aws_ssm_parameter.jenkins_admin_password,
     aws_ssm_parameter.github_pat_ci,
     aws_ssm_parameter.jenkins_provision_sha256,

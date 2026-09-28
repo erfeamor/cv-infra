@@ -19,6 +19,10 @@ Part of the [cv-project](../README.md) multi-repo. No dedicated pipeline yet (Te
 
 Uses the account's default VPC (no NAT gateway) to stay Free Tier-eligible.
 
+## State
+
+Remote, in S3 + DynamoDB (`providers.tf`'s `backend "s3"` block) — created by `bootstrap/`, a separate root module with its own local state (see `bootstrap/README.md` for the bootstrap/apply/migrate order, the rollback procedure, and the T-004 part 3 rotation decision). Back up `terraform.tfstate`/`.backup` to `~/.local/share/cv-infra-state-backups/<date>/` (`0700`/`0600`) before any state-affecting operation.
+
 ## Usage
 
 ```bash

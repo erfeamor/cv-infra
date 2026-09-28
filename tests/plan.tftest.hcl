@@ -855,16 +855,58 @@ run "drone_deploy_credentials" {
     error_message = "Neither drone-deploy SSM parameter may live under the ci/ prefix -- that's what the Drone host's own instance role can read"
   }
 
-  # Negative half of case 2: no existing IAM policy grants read access to
-  # the deploy/ path. aws_iam_role_policy.drone_read_ci_parameters is the
-  # only policy in this module that reads any part of this parameter tree
-  # at all -- pin its Resource string exactly to ci/* (fully known at plan,
-  # built only from variables, no AWS-generated ARN involved) so a later
-  # widening (e.g. to deploy/* or the whole tree) fails here instead of
-  # silently handing a build container its own deploy key.
+  # Negative half of case 2, the CI-host role: aws_iam_role_policy.
+  # drone_read_ci_parameters is scoped to ci/* only -- pin its Resource
+  # string exactly (fully known at plan, built only from variables, no
+  # AWS-generated ARN involved) so a later widening (e.g. to deploy/* or
+  # the whole tree) fails here instead of silently handing a build
+  # container its own deploy key.
   assert {
     condition     = jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement[0].Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
     error_message = "aws_iam_role_policy.drone_read_ci_parameters must stay scoped to ci/* -- widening it would let a build container on the Drone host read its own deploy key out of SSM"
+  }
+
+  # --- Security review round 2 (Medium, accepted): the APP host's own role
+  # is NOT isolated from deploy/ the same way -- aws_iam_role_policy.
+  # read_parameters (iam.tf) grants ssm:GetParameter* on the WHOLE
+  # /${project}/* tree (it legitimately needs db/, cognito/, observability/,
+  # etc across the tree), which already covered deploy/drone-deploy/* before
+  # this fix, and this host has no metadata_options (IMDSv1 on) and runs
+  # containers reachable by SSRF/RCE. "Outside ci/*" alone only isolates the
+  # CI host's role; this pair of assertions is what actually isolates the
+  # app host's role too, via an explicit Deny (which IAM always evaluates
+  # ahead of any Allow, regardless of statement order). This task
+  # deliberately does NOT narrow the Allow itself (that's T-005 work; a
+  # missed path there would break this host's own boot), so both the
+  # original tree-wide Allow and the new Deny are asserted, not one in
+  # place of the other. ---
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
+      s.Effect == "Allow" && contains(s.Action, "ssm:GetParameter") && s.Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/*"
+    ])
+    error_message = "aws_iam_role_policy.read_parameters must keep its tree-wide Allow on ssm:GetParameter* -- this task does not narrow it (T-005 does)"
+  }
+
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
+      s.Effect == "Deny" && contains(s.Action, "ssm:GetParameter") && s.Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
+    ])
+    error_message = "aws_iam_role_policy.read_parameters must explicit-Deny ssm:GetParameter* on the deploy/ prefix -- otherwise the app host's own role (IMDSv1, no metadata_options) can read the frontend deploy key via an SSRF/RCE in the domain service (T-008 security review round 2)"
+  }
+
+  # Ties the Deny's literal Resource pattern to the REAL parameter names
+  # created in ssm.tf, rather than trusting two independently-typed string
+  # literals to agree with each other -- a Deny on the wrong prefix would
+  # still pass the assertion above (both sides are just string literals)
+  # without actually covering these parameters.
+  assert {
+    condition = (
+      startswith(aws_ssm_parameter.drone_deploy_access_key_id.name, "/${var.project_name}/${var.environment}/deploy/") &&
+      startswith(aws_ssm_parameter.drone_deploy_secret_access_key.name, "/${var.project_name}/${var.environment}/deploy/")
+    )
+    error_message = "The Deny's deploy/ prefix must actually cover both drone-deploy SSM parameter names"
   }
 
   # Case 4/5 (the part checkable under `command = plan`): aws_iam_user_policy.

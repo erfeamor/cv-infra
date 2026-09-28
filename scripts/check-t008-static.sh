@@ -112,4 +112,56 @@ else
   fi
 fi
 
+# --- Check 3 (security review round 2): every `ssm:GetParameter`-only ----
+# grant (the shape the two on-demand-CI Lambdas use -- ci-on-demand.tf's
+# ci_doorbell and ci_reaper policies, each reading exactly one parameter)
+# must reference a SPECIFIC aws_ssm_parameter's own `.arn`, never a literal
+# ARN string (which could be a wildcard covering deploy/drone-deploy/*).
+# This is the Lambda half of the round-2 finding -- the two IAM-role halves
+# (domain_service's explicit Deny, drone's ci/*-only scope) are asserted in
+# tests/plan.tftest.hcl instead, because those policies are built purely
+# from variables and ARE knowable under `command = plan`; a Lambda policy's
+# `Resource = aws_ssm_parameter.X.arn` is a computed attribute reference and
+# is unknown-until-apply there (same documented limitation as
+# aws_iam_user_policy.drone_deploy above), so this one is checked
+# source-text-side instead, same convention as checks 1-2.
+#
+# Deliberately scoped to the single-action `["ssm:GetParameter"]` shape:
+# that's what distinguishes "a narrow, single-parameter Lambda grant" from
+# aws_iam_role_policy.read_parameters / drone_read_ci_parameters's
+# multi-action, tree-scoped shape, which is asserted separately above and
+# in tests/plan.tftest.hcl.
+ssm_get_parameter_violations=""
+for tf_file in *.tf; do
+  violations_in_file=$(awk '
+    function strip_comments(line,    h) {
+      h = index(line, "#")
+      if (h > 0) line = substr(line, 1, h - 1)
+      return line
+    }
+    {
+      line = strip_comments($0)
+      if (line ~ /Action[ \t]*=[ \t]*\["ssm:GetParameter"\][ \t]*$/) { awaiting_resource = 1; next }
+      if (!awaiting_resource) next
+      if (line ~ /^[ \t]*$/) next
+      awaiting_resource = 0
+      if (line !~ /^[ \t]*Resource[ \t]*=[ \t]*aws_ssm_parameter\.[A-Za-z0-9_]+\.arn[ \t]*$/) {
+        print line
+      }
+    }
+  ' "$tf_file")
+  if [ -n "$violations_in_file" ]; then
+    ssm_get_parameter_violations="${ssm_get_parameter_violations}${tf_file}: ${violations_in_file}
+"
+  fi
+done
+
+if [ -n "$ssm_get_parameter_violations" ]; then
+  echo "FAIL: a single-parameter ssm:GetParameter grant does not reference a specific aws_ssm_parameter.<name>.arn:" >&2
+  printf '%s' "$ssm_get_parameter_violations" >&2
+  fail=1
+else
+  echo "OK: every single-parameter ssm:GetParameter grant (ci_doorbell, ci_reaper) references a specific aws_ssm_parameter.<name>.arn, not a wildcard"
+fi
+
 exit $fail

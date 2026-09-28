@@ -30,6 +30,22 @@ resource "aws_iam_role_policy_attachment" "ecr_read" {
 }
 
 # Lets the services read their secrets from SSM Parameter Store at runtime.
+#
+# T-008 security review round 2 (Medium, accepted): the Allow below is
+# `/${var.project_name}/*` -- the whole parameter tree, including
+# `deploy/drone-deploy/*` (ssm.tf), which this app host's own role has no
+# business reading. Being outside `ci/*` only isolates that credential from
+# the DRONE host's role; it does nothing against THIS role, which is
+# broader by design (it legitimately needs db/, cognito/, observability/,
+# etc across the tree). This host also has no `metadata_options` set (IMDSv1
+# is on) and runs containers that could reach instance credentials via an
+# SSRF/RCE in the domain service -- so an explicit Deny on `deploy/*` closes
+# that path without narrowing the Allow itself (narrowing the Allow to an
+# enumerated list is T-005 work; a missed path there would break this
+# host's own boot, which an explicit Deny cannot do since it only ever
+# subtracts). IAM evaluates an explicit Deny before any Allow, regardless
+# of statement order or which policy/role it's attached through, so this
+# holds even though it's declared after the Allow.
 resource "aws_iam_role_policy" "read_parameters" {
   name = "read-cv-parameters"
   role = aws_iam_role.domain_service.id
@@ -41,6 +57,11 @@ resource "aws_iam_role_policy" "read_parameters" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/*"
+      },
+      {
+        Effect   = "Deny"
+        Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
       }
     ]
   })

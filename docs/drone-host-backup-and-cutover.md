@@ -6,13 +6,22 @@ real AWS account -- nothing in this file is executed by the code/offline
 gate that built the Terraform and the reseed script it references
 (`../scripts/drone-reseed-secrets.sh`).
 
-## Background (H1, 2026-09-28; cutover order and the SQLite-copy decision revised in review round 1)
+## Background (H1, 2026-09-28; cutover order and the SQLite-copy decision revised in review round 1; deploy/ isolation extended in review round 2)
 
 - The credential moves out of Drone's SQLite: Terraform now creates
   `aws_iam_access_key.drone_deploy` (`../iam.tf`) and writes it to two SSM
   SecureStrings under `deploy/drone-deploy/*` (`../ssm.tf`) -- deliberately
   **not** under `ci/*`, so the Drone host's own instance role (which build
-  containers can reach until T-007/T-005) can never read it.
+  containers can reach until T-007/T-005) can never read it. That scope
+  isolation only protects against the CI host's role, though: the app
+  host's role (`aws_iam_role_policy.read_parameters`, `../iam.tf`) grants
+  `ssm:GetParameter*` on the whole parameter tree and has no
+  `metadata_options` (IMDSv1 on), so an SSRF/RCE in the domain service
+  could otherwise read this credential too. Security review round 2
+  (Medium, accepted) added an explicit **Deny** on that role for the
+  `deploy/*` prefix, so this path is now protected two different ways:
+  scope keeps it from the CI host's role, an explicit Deny keeps it from
+  the app host's role.
 - Drone's SQLite (`/var/lib/drone/database.sqlite` on the CI host) is
   **reconstructable, not backed up**. No new IAM grant on the CI role. A
   live rehearsal proves the rebuild. Build history is expendable.

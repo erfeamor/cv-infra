@@ -140,34 +140,53 @@ convention, *before* running anything below.
   (harmless, and versioning bills for it either way at this scale) or see
   "Deleting a stale remote object" below.
 - **After step 6 confirms clean:** the bucket is now authoritative.
-  Rolling back:
-  1. `terraform init -migrate-state` (S3 → local) with the `backend "s3"`
-     block still in place -- Terraform detects the intent to move state
-     once the block is edited, prompts to copy the current remote state
-     down to a local file, and handles the pull-then-switch atomically.
-     Confirm.
-  2. Revert the `backend "s3"` block in `providers.tf` to local now that
-     step 1 has the state safely on disk, and run `terraform init` again
-     to drop the cached S3 backend pointer.
-  3. `terraform plan` to confirm no changes.
+  Rolling back -- **`init -migrate-state` needs something to migrate
+  FROM, which means the block edit has to come first here, the opposite
+  order from the mid-migration case above** (there, the block was still
+  pointed at S3 and the goal was to abandon that; here the goal is to
+  tell Terraform "go get it from S3 one more time, then stop"):
+  1. Revert the `backend "s3"` block in `providers.tf` to local. With the
+     block still saying `s3`, `init -migrate-state` has no backend change
+     to detect and nothing to migrate; reverting first is what gives it
+     something to do.
+  2. `terraform init -migrate-state` -- Terraform detects the backend
+     config changed (s3 → none/local) and prompts to copy the current
+     remote state down to a local file. Answer yes.
+  3. `terraform plan` -- must show `No changes.`
+  4. Re-check `terraform.tfstate`'s permissions -- `init -migrate-state`
+     writes the file with the umask in effect at the time, which is not
+     guaranteed to be `0600`. `ls -l terraform.tfstate`, and
+     `chmod 600 terraform.tfstate` if it isn't already.
 
-  Manual alternative, if the file is wanted on disk under your own
-  control rather than trusting `-migrate-state`'s prompt -- **order
-  matters, and it's the reverse of what feels natural:**
-  1. `terraform state pull > /tmp/cv-infra-rollback-state.json` --
-     **while the `backend "s3"` block is still in `providers.tf` and
+  Manual alternative, if the file is wanted under your own control rather
+  than trusting `-migrate-state`'s prompt -- **order matters here, and
+  it's the reverse of the primary procedure above:**
+  1. `umask 077 && mkdir -p ~/.local/share/cv-infra-state-backups/<date>`
+     -- `0700`, matching the backup convention this reuses rather than a
+     scratch location like `/tmp`, which is world-traversable by default
+     and would land the state (secrets included) somewhere with a laxer
+     default mode than the file deserves.
+  2. `umask 077 && terraform state pull > ~/.local/share/cv-infra-state-backups/<date>/rollback-state.json`
+     -- **while the `backend "s3"` block is still in `providers.tf` and
      still what `.terraform/` is configured for.** `state pull` reads
      whatever backend the working directory is currently pointed at; if
      the block has already been reverted (or `init -reconfigure` already
-     run), it errors, and by then the `>` redirect below has already
-     truncated `terraform.tfstate` to empty on its way to failing --
-     pulling to a separate temp file first, not straight to
-     `terraform.tfstate`, is what avoids that.
-  2. Revert the `backend "s3"` block in `providers.tf` to local.
-  3. `terraform init -reconfigure`.
-  4. `mv /tmp/cv-infra-rollback-state.json terraform.tfstate` -- move the
-     already-pulled file into place now that it's safe to.
-  5. `terraform plan` to confirm no changes.
+     run), it errors, and by then the `>` redirect has already truncated
+     the target file on its way to failing -- pulling to this separate
+     file first is what avoids that. The `umask 077` on this line, not
+     just the `mkdir` above, is what actually protects the file's own
+     mode: a redirect creates the file with the umask in effect for the
+     shell running the command, not the directory's mode.
+  3. Revert the `backend "s3"` block in `providers.tf` to local.
+  4. `terraform init -reconfigure`.
+  5. `install -m 600 ~/.local/share/cv-infra-state-backups/<date>/rollback-state.json terraform.tfstate`
+     (copies and sets the mode in one step; `mv` instead is fine too, but
+     then follow with step 6 explicitly rather than assuming `mv`
+     preserved `0600`).
+  6. `chmod 600 terraform.tfstate` -- belt-and-suspenders after either
+     `install` or `mv`: re-check rather than assume, same as the primary
+     procedure's step 4.
+  7. `terraform plan` to confirm no changes.
 - Versioning on the bucket means an in-place corruption (not a backend
   swap, but a bad state write) is a version rollback
   (`aws s3api list-object-versions` /

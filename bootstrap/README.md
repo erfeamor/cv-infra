@@ -141,18 +141,33 @@ convention, *before* running anything below.
   "Deleting a stale remote object" below.
 - **After step 6 confirms clean:** the bucket is now authoritative.
   Rolling back:
-  1. Revert the `backend "s3"` block in `providers.tf` to local, same as
-     above.
-  2. `terraform init -migrate-state` (S3 → local this time) --
-     Terraform prompts to copy the current remote state down to a local
-     file; confirm. A plain `terraform init` here is not enough:
-     Terraform detects the backend config changed and refuses with an
-     error demanding `-migrate-state` or `-reconfigure` explicitly, it
-     will not silently guess which you want. Manual alternative, if the
-     file is wanted on disk before telling Terraform to stop using the
-     backend: `terraform state pull > terraform.tfstate` followed by
-     `terraform init -reconfigure`.
+  1. `terraform init -migrate-state` (S3 → local) with the `backend "s3"`
+     block still in place -- Terraform detects the intent to move state
+     once the block is edited, prompts to copy the current remote state
+     down to a local file, and handles the pull-then-switch atomically.
+     Confirm.
+  2. Revert the `backend "s3"` block in `providers.tf` to local now that
+     step 1 has the state safely on disk, and run `terraform init` again
+     to drop the cached S3 backend pointer.
   3. `terraform plan` to confirm no changes.
+
+  Manual alternative, if the file is wanted on disk under your own
+  control rather than trusting `-migrate-state`'s prompt -- **order
+  matters, and it's the reverse of what feels natural:**
+  1. `terraform state pull > /tmp/cv-infra-rollback-state.json` --
+     **while the `backend "s3"` block is still in `providers.tf` and
+     still what `.terraform/` is configured for.** `state pull` reads
+     whatever backend the working directory is currently pointed at; if
+     the block has already been reverted (or `init -reconfigure` already
+     run), it errors, and by then the `>` redirect below has already
+     truncated `terraform.tfstate` to empty on its way to failing --
+     pulling to a separate temp file first, not straight to
+     `terraform.tfstate`, is what avoids that.
+  2. Revert the `backend "s3"` block in `providers.tf` to local.
+  3. `terraform init -reconfigure`.
+  4. `mv /tmp/cv-infra-rollback-state.json terraform.tfstate` -- move the
+     already-pulled file into place now that it's safe to.
+  5. `terraform plan` to confirm no changes.
 - Versioning on the bucket means an in-place corruption (not a backend
   swap, but a bad state write) is a version rollback
   (`aws s3api list-object-versions` /
@@ -173,6 +188,20 @@ aws s3api list-object-versions --bucket cv-project-tfstate-760904708057 \
 # For every [Key, VersionId] pair in BOTH lists returned above:
 aws s3api delete-object --bucket cv-project-tfstate-760904708057 \
   --key cv-infra/terraform.tfstate --version-id <VersionId>
+```
+
+The S3 backend (DynamoDB-locking mode, which is what this task uses --
+see the `use_lockfile` note above) also writes a digest item to the lock
+table alongside every state write, keyed as `<bucket>/<key>-md5`, to
+detect a state object that's out of sync with what Terraform last wrote.
+Deleting the S3 object without also deleting this item leaves a stale
+digest behind: the next `init`/`plan` against that key compares the
+(now-missing or different) object against the old digest and fails on a
+checksum mismatch instead of just seeing a clean, empty key.
+
+```bash
+aws dynamodb delete-item --table-name cv-project-tfstate-lock \
+  --key '{"LockID":{"S":"cv-project-tfstate-760904708057/cv-infra/terraform.tfstate-md5"}}'
 ```
 
 ### Recovering from a lost bootstrap state

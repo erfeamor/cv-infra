@@ -121,11 +121,14 @@ resource "aws_s3_bucket_ownership_controls" "tfstate" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "tfstate" {
-  # Must be created after ownership controls under BucketOwnerEnforced --
-  # not functionally required for THIS rule (it touches no ACL), but
-  # matches the dependency AWS documents between the two resource types
-  # for this bucket so a future rule that does need one doesn't silently
-  # race it.
+  # Review round 2, finding: the previous comment here claimed AWS
+  # documents an ordering requirement between ownership controls and
+  # lifecycle configuration -- it doesn't, for this rule. Neither
+  # noncurrent_version_expiration nor abort_incomplete_multipart_upload
+  # touches an ACL, so there is no real dependency to enforce. depends_on
+  # is precautionary co-sequencing only, so that a future rule added here
+  # that DOES interact with object ownership doesn't silently race
+  # BucketOwnerEnforced by accident.
   depends_on = [aws_s3_bucket_ownership_controls.tfstate]
 
   bucket = aws_s3_bucket.tfstate.id

@@ -80,43 +80,64 @@ run "plan_public_access_block" {
 run "plan_deny_non_tls_policy" {
   command = plan
 
-  # try() around the Condition lookup: a future statement added to this
-  # policy without a Condition block must not make jsondecode/index blow
-  # up the whole assertion (a KeyError-equivalent) -- it should just fail
-  # to match the deny-non-TLS statement being searched for, same as any
-  # other non-matching statement.
+  # Review round 2, finding 3: this used to be four SEPARATE anytrue()
+  # assertions (Deny+Condition, Principal, Action, Resource), each
+  # independently satisfied by ANY statement in the list. That composes
+  # wrong: a policy with one narrowly-scoped Deny statement plus a second,
+  # unrelated broad Allow statement could satisfy all four checks between
+  # them without a single statement actually denying non-TLS access
+  # broadly. One anytrue() over a single combined condition means the
+  # SAME statement (the `stmt` bound once per loop iteration) must supply
+  # every property together.
+  #
+  # try() around Condition/Principal/Action/Resource: a statement missing
+  # any of those keys (e.g. a future statement added without a Condition
+  # block) must fail to match this deny statement, not blow up the whole
+  # assertion the way a bare index/attribute lookup would.
+  #
+  # flatten([try(stmt.Resource, [])]) (finding 4): IAM allows a
+  # statement's Resource to be either a JSON array or a single string.
+  # This module always emits a list, but contains() errors on a bare
+  # string, and a for-loop assertion is the wrong place to discover that
+  # from a future edit. flatten() normalizes either shape into a list
+  # before contains() runs. Exercised directly (not via this resource,
+  # which never produces the scalar form) by the
+  # "policy_resource_may_be_a_scalar_string" run block below.
   assert {
     condition = anytrue([
       for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
       stmt.Effect == "Deny" &&
-      try(tostring(stmt.Condition.Bool["aws:SecureTransport"]), "") == "false"
+      try(tostring(stmt.Condition.Bool["aws:SecureTransport"]), "") == "false" &&
+      try(stmt.Principal, "") == "*" &&
+      try(stmt.Action, "") == "s3:*" &&
+      contains(flatten([try(stmt.Resource, [])]), "arn:aws:s3:::cv-project-tfstate-760904708057") &&
+      contains(flatten([try(stmt.Resource, [])]), "arn:aws:s3:::cv-project-tfstate-760904708057/*")
     ])
-    error_message = "bucket policy must Deny access when aws:SecureTransport is false"
+    error_message = "a single statement must Deny every principal's s3:* on both the bucket and its objects when aws:SecureTransport is false -- these properties satisfied by DIFFERENT statements do not add up to a real deny-non-TLS guarantee"
   }
+}
 
-  assert {
-    condition = anytrue([
-      for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
-      try(stmt.Principal, "") == "*"
-    ])
-    error_message = "the deny-non-TLS statement must apply to every principal (Principal \"*\"), not be scoped to one -- a non-TLS request from anyone must be denied"
-  }
+run "policy_resource_may_be_a_scalar_string" {
+  command = plan
 
+  # Not derived from aws_s3_bucket_policy.tfstate -- this module's own
+  # policy always sets Resource as a list, so there is no real statement
+  # to exercise the scalar case with. A literal fixture, evaluated
+  # entirely at plan time with no resource/AWS dependency, is enough to
+  # prove flatten([try(stmt.Resource, [])]) above handles Resource as
+  # either shape IAM allows, not just the one this policy happens to use.
   assert {
-    condition = anytrue([
-      for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
-      try(stmt.Action, "") == "s3:*"
-    ])
-    error_message = "the deny-non-TLS statement must cover s3:* -- scoping it to fewer actions would let some non-TLS calls through"
-  }
-
-  assert {
-    condition = anytrue([
-      for stmt in jsondecode(aws_s3_bucket_policy.tfstate.policy).Statement :
-      contains(try(stmt.Resource, []), "arn:aws:s3:::cv-project-tfstate-760904708057") &&
-      contains(try(stmt.Resource, []), "arn:aws:s3:::cv-project-tfstate-760904708057/*")
-    ])
-    error_message = "the deny-non-TLS statement's Resource must cover both the bucket itself and every object in it -- covering only one leaves the other reachable over plain HTTP"
+    # `terraform test` requires an assert condition to reference something
+    # from the configuration or it rejects the run outright ("the result
+    # would not be checking anything") -- length(var.account_id) > 0 is
+    # that anchor; the actual property under test is the flatten/contains
+    # logic that follows.
+    condition = (
+      length(var.account_id) > 0 &&
+      contains(flatten([try({ Resource = "arn:aws:s3:::scalar-fixture" }.Resource, [])]), "arn:aws:s3:::scalar-fixture") &&
+      contains(flatten([try({ Resource = ["arn:aws:s3:::list-fixture"] }.Resource, [])]), "arn:aws:s3:::list-fixture")
+    )
+    error_message = "flatten([try(stmt.Resource, [])]) must handle Resource as either a scalar string or a list -- IAM permits both"
   }
 }
 

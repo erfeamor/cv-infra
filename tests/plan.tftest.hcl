@@ -895,36 +895,103 @@ run "t007_ci_host_hardening" {
     error_message = "DRONE_DATABASE_SECRET must live at ci/drone/database-secret -- under ci/*, so the Drone host's own instance role (drone_read_ci_parameters) can read it, matching every other Drone boot secret"
   }
 
-  # Case 6: the rendered user_data (drone-user-data.sh + jenkins-bootstrap.sh)
-  # stays under the same 8 KB wall asserted in "ci_on_demand" above, even
-  # after adding the DRONE_DATABASE_SECRET fetch/env var and the weekly
-  # docker-prune systemd timer.
+  # Case 6 and case 7 (review round 1, finding 9: dropped from here, not
+  # duplicated): the <8 KB user_data wall against this exact templatefile()
+  # call is already asserted once, in "ci_on_demand" above -- re-asserting
+  # the identical computed value under a second name proves nothing extra
+  # and doubles the maintenance cost of the 8192 constant. Likewise
+  # `aws_instance.drone.user_data_replace_on_change != true` is already
+  # asserted in "plan_succeeds" above. Both keep working unchanged by this
+  # task; see those two run blocks instead of repeating them here.
+
+  # Review round 1, finding 9 -- RED FIRST: DRONE_DATABASE_SECRET must
+  # actually reach the drone-server container (not just exist in SSM), and
+  # the param() path it's read from must be the exact path segment that
+  # builds aws_ssm_parameter.drone_database_secret.name above
+  # ("drone/database-secret", under the ci/ prefix param() always
+  # prepends) -- a typo in either place would pass every other assertion in
+  # this run and still leave DRONE_DATABASE_SECRET unset or fetched from
+  # the wrong SSM path at boot.
   assert {
-    condition = length(join("\n", [
-      templatefile("${path.module}/templates/drone-user-data.sh", {
+    condition = length(regexall("-e DRONE_DATABASE_SECRET=", templatefile("${path.module}/templates/drone-user-data.sh", {
+      aws_region     = var.aws_region
+      project_name   = var.project_name
+      environment    = var.environment
+      server_host    = "203.0.113.10"
+      admin_username = var.drone_admin_username
+    }))) == 1
+    error_message = "templates/drone-user-data.sh must pass -e DRONE_DATABASE_SECRET to the drone-server container exactly once"
+  }
+
+  assert {
+    condition = length(regexall("param drone/database-secret", templatefile("${path.module}/templates/drone-user-data.sh", {
+      aws_region     = var.aws_region
+      project_name   = var.project_name
+      environment    = var.environment
+      server_host    = "203.0.113.10"
+      admin_username = var.drone_admin_username
+    }))) == 1
+    error_message = "templates/drone-user-data.sh must read DRONE_DATABASE_SECRET via `param drone/database-secret` -- the same ci/drone/database-secret path aws_ssm_parameter.drone_database_secret.name builds"
+  }
+
+  # Review round 1, finding 9 -- RED FIRST: the prune timer must run the
+  # PO-decided commands (image/build-cache only, age-filtered, never
+  # containers/networks), never the broader `docker system prune`.
+  # Anchored on the literal `ExecStart=` prefix, not a bare substring search
+  # -- this script's own explanatory comments quote these exact commands by
+  # name (both the wanted ones and, in the "deliberately NOT" sentence, the
+  # unwanted one), so a substring-only search would double-count against
+  # the comment text and could never legitimately assert "0 occurrences" of
+  # the forbidden command below.
+  assert {
+    condition = (
+      length(regexall("ExecStart=/usr/bin/docker image prune -af --filter until=168h", templatefile("${path.module}/templates/drone-user-data.sh", {
         aws_region     = var.aws_region
         project_name   = var.project_name
         environment    = var.environment
         server_host    = "203.0.113.10"
         admin_username = var.drone_admin_username
-      }),
-      templatefile("${path.module}/templates/jenkins-bootstrap.sh", {
-        aws_region      = var.aws_region
-        project_name    = var.project_name
-        environment     = var.environment
-        artifact_bucket = "test-bucket"
-        artifact_key    = "jenkins-provision.sh"
-      }),
-    ])) < 8192
-    error_message = "Rendered user_data for aws_instance.drone exceeds 8 KB after adding DRONE_DATABASE_SECRET and the docker-prune timer -- re-measure and, if genuinely needed, move something out rather than trimming comments to fit"
+      }))) == 1 &&
+      length(regexall("ExecStart=/usr/bin/docker builder prune -af --filter until=168h", templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }))) == 1
+    )
+    error_message = "docker-prune.service must run `docker image prune -af --filter until=168h` and `docker builder prune -af --filter until=168h` as ExecStart lines (PO decision, review round 1 finding 3)"
   }
 
-  # Case 7 (regression guard, unchanged by this task): still must never
-  # force a replace on a user_data edit -- H1 decision 1 (out-of-band
-  # provisioning) depends on it, same assertion as above in this file.
   assert {
-    condition     = aws_instance.drone.user_data_replace_on_change != true
-    error_message = "aws_instance.drone must NOT set user_data_replace_on_change -- T-007 adds root_block_device/metadata_options, it does not change the out-of-band provisioning model"
+    condition = length(regexall("ExecStart=.*docker system prune", templatefile("${path.module}/templates/drone-user-data.sh", {
+      aws_region     = var.aws_region
+      project_name   = var.project_name
+      environment    = var.environment
+      server_host    = "203.0.113.10"
+      admin_username = var.drone_admin_username
+    }))) == 0
+    error_message = "docker-prune.service must not run `docker system prune` -- it also removes stopped containers and unused networks, not just images/build cache (review round 1, finding 3)"
+  }
+
+  assert {
+    condition = (
+      length(regexall("After=docker.service", templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }))) == 1 &&
+      length(regexall("Requires=docker.service", templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }))) == 1
+    )
+    error_message = "docker-prune.service must declare After=docker.service and Requires=docker.service"
   }
 }
 

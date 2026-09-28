@@ -34,7 +34,11 @@ GITHUB_CLIENT_SECRET=$(param github-client-secret)
 # env var docker run below reads from.
 DRONE_DATABASE_SECRET=$(param drone/database-secret)
 
-docker network create drone
+# Idempotent (review round 1, finding 5): templates/jenkins-provision.sh
+# creates this same network with the identical guard, and either script can
+# run first on a fresh boot -- a bare `docker network create` would make the
+# loser of that race fail on "network already exists".
+docker network inspect drone >/dev/null 2>&1 || docker network create drone
 
 docker run -d --name drone-server --restart unless-stopped \
   --network drone \
@@ -61,22 +65,33 @@ docker run -d --name drone-runner --restart unless-stopped \
   -e DRONE_RUNNER_NAME="${project_name}-runner" \
   drone/drone-runner-docker:1
 
-# T-007 (H1 decision 2): nothing on this host prunes Docker images -- every
-# base-image/tool bump (e.g. Flyway) adds a layer set beside the old one, and
-# that is what forced the disk measurement behind this task's root-size
-# choice. A weekly sweep keeps the 20 GB root from filling silently between
-# replacements. No -a/--volumes: this only reclaims dangling images/build
-# cache, never a still-referenced image or a named volume (Drone's own data
-# lives in the /var/lib/drone bind mount above, untouched either way).
-# Idempotent: both files are overwritten deterministically and
+# T-007 (H1 decision 2, commands per review round 1 finding 3): nothing on
+# this host prunes Docker images -- every base-image/tool bump (e.g. Flyway)
+# adds a layer set beside the old one, and that whole-disk growth is what
+# forced the disk measurement behind this task's root-size choice. A weekly
+# sweep keeps the 20 GB root from filling silently between replacements.
+#
+# `docker image prune -af --filter until=168h` and
+# `docker builder prune -af --filter until=168h` -- deliberately NOT
+# `docker system prune`, which also removes stopped containers and unused
+# networks. -a reaches every unused image, not just dangling ones (that's
+# what actually reclaims an old tag left behind by a base-image bump -- a
+# plain, non -a prune would not), age-filtered to >1 week so an image pulled
+# for a build still in flight this week is never a target. Never touches a
+# running container, a named volume, or the "drone" network -- Drone's own
+# data lives in the /var/lib/drone bind mount above regardless. Idempotent:
+# both unit files are overwritten deterministically and
 # `systemctl enable --now` is a no-op if already enabled.
 cat >/etc/systemd/system/docker-prune.service <<'EOF'
 [Unit]
-Description=Weekly docker system prune
+Description=Weekly docker image/build-cache prune
+After=docker.service
+Requires=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/docker system prune -f
+ExecStart=/usr/bin/docker image prune -af --filter until=168h
+ExecStart=/usr/bin/docker builder prune -af --filter until=168h
 EOF
 
 cat >/etc/systemd/system/docker-prune.timer <<'EOF'

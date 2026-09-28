@@ -89,11 +89,32 @@ resource "aws_instance" "drone" {
   iam_instance_profile   = aws_iam_instance_profile.drone.name
 
   # T-007 (H1 decision 2): the plain AL2023 AMI defaults to an 8 GB root --
-  # too small for this host's measured ~17 GiB of Docker images/build cache
-  # (T-007's disk measurement, 2026-09-24). Explicit and sized with
-  # headroom, not left to the AMI default. gp3 (not gp2) matches the rest
-  # of this module's convention, and encrypted at rest with the AWS-managed
-  # EBS key -- no CMK needed for this box.
+  # too small for this host's measured ~17 GiB of whole-disk usage (T-007's
+  # disk measurement, 2026-09-24 -- Docker images/build cache, not the only
+  # consumer). Explicit and sized with headroom, not left to the AMI
+  # default. gp3 (not gp2) matches the rest of this module's convention, and
+  # encrypted at rest with the AWS-managed EBS key -- no CMK needed for this
+  # box. Re-measure after the first real build of every repo
+  # (docs/t007-ci-host-replace-runbook.md's post-replace verification): if
+  # usage exceeds 75% of this 20 GB, file a follow-up to resize rather than
+  # letting it fill silently.
+  #
+  # REVIEW ROUND 1, FINDING 1 -- read before touching this block or
+  # `metadata_options` below: `encrypted` and a `volume_size` decrease are
+  # both ForceNew on `root_block_device`. `ignore_changes` below covers only
+  # `ami` and the CIKeepAlive tags -- it does NOT cover this block, so once
+  # this PR's config lands, even a PLAIN `terraform plan` (no `-replace`
+  # needed at all) already proposes replacing this instance, because the
+  # live instance's actual root (30 GB, unencrypted -- the ECS AMI's
+  # default) genuinely differs from this config. `-replace` is still the
+  # command used (see docs/t007-ci-host-replace-runbook.md), but only
+  # because it's also needed to force the AMI swap despite
+  # `ignore_changes = [ami]` -- the replacement itself is no longer
+  # optional once this merges. Consequence: this must be applied from the
+  # branch and proven live BEFORE merging to master (same convention as
+  # T-004/T-008's state-affecting changes) -- master must never carry this
+  # diff unapplied, or the next person to run a routine `plan` gets a
+  # surprise instance replacement they didn't ask for.
   root_block_device {
     volume_size = 20
     volume_type = "gp3"
@@ -101,15 +122,25 @@ resource "aws_instance" "drone" {
   }
 
   # T-007 (H1 decision 3, carried from T-005): require IMDSv2 and cap the hop
-  # limit at 1, so a container on this host (reachable via the docker socket
-  # mount on drone-runner, or any build step) cannot reach the instance
-  # metadata service through a bridge network -- hop 1 stops it one Docker
-  # network hop short of the host's own loopback route. Host-side `param()`
-  # (templates/drone-user-data.sh) and SSM Session Manager both go through
-  # the SSM agent/AWS CLI on the host itself, which is hop 0 from its own
-  # perspective, so neither is affected. Verify both properties live, before
-  # trusting this: a container denied credentials, and param()/SSM still
-  # working (see docs/t007-ci-host-replace-runbook.md).
+  # limit at 1. This denies IMDS to any container reachable through this
+  # host's Docker BRIDGE networks (e.g. the "drone" network drone-server/
+  # drone-runner share) -- hop 1 stops it one hop short of the host's own
+  # loopback route. Host-side `param()` (templates/drone-user-data.sh) and
+  # SSM Session Manager both go through the SSM agent/AWS CLI on the host
+  # itself, which is hop 0 from its own perspective, so neither is affected.
+  #
+  # REVIEW ROUND 1, FINDING 2 -- KNOWN GAP, NOT CLOSED BY THIS: a container
+  # started with `--network host` is NOT one hop away, it IS the host's own
+  # network namespace, so the hop-1 cap does not apply to it and it CAN
+  # fetch IMDS credentials. drone-runner mounts /var/run/docker.sock
+  # (templates/drone-user-data.sh) and Jenkins build steps run against the
+  # same socket (templates/jenkins-provision.sh), so any build step that
+  # runs `docker run --network host ...` gets the instance role's
+  # credentials same as before this change. Verify the bridge-network case
+  # is denied and record the host-network gap explicitly rather than
+  # claiming full protection (see docs/t007-ci-host-replace-runbook.md) --
+  # closing the host-network gap is T-005's work (docker socket / build
+  # isolation), not this task's.
   metadata_options {
     http_tokens                 = "required"
     http_put_response_hop_limit = 1

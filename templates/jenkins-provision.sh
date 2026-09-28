@@ -12,6 +12,17 @@ if ! flock -w 1500 200; then
   exit 1
 fi
 
+# T-007 review round 1, finding 5: on a freshly-replaced instance, the SSM
+# agent reports Online (ci.tf's null_resource.jenkins_provision waits only
+# for that) well before cloud-init's own user_data run -- which installs
+# Docker, creates the "drone" network, and starts drone-server
+# (templates/drone-user-data.sh) -- has necessarily finished. Without this,
+# this script's first docker command on a fresh box could race that
+# install, or collide with it on network creation. Blocks until cloud-init
+# converges; a no-op (returns immediately) on the long-lived box this
+# script normally targets, where cloud-init finished boots ago.
+cloud-init status --wait >/dev/null 2>&1 || true
+
 param() {
   aws ssm get-parameter --with-decryption --region "${aws_region}" \
     --name "/${project_name}/${environment}/ci/$1" \
@@ -361,6 +372,14 @@ if docker inspect drone-server >/dev/null 2>&1; then
     DRONE_RPC_SECRET=$(param drone-rpc-secret)
     GITHUB_CLIENT_ID=$(param github-client-id)
     GITHUB_CLIENT_SECRET=$(param github-client-secret)
+    # T-007 review round 1, finding 8: this is a second, independent
+    # drone-server invocation from templates/drone-user-data.sh's -- it
+    # drifted once already (this whole block exists to fix a :80-publish
+    # drift), so DRONE_DATABASE_SECRET is fetched and passed here too rather
+    # than assuming the two copies stay in sync. scripts/check-t007-static.sh
+    # pins this: every `docker run ... drone/drone:...` invocation, in
+    # either template, must carry -e DRONE_DATABASE_SECRET.
+    DRONE_DATABASE_SECRET=$(param drone/database-secret)
     echo "jenkins-provision: recreating drone-server without the direct :80 publish"
     docker rm -f drone-server
     docker run -d --name drone-server --restart unless-stopped \
@@ -369,6 +388,7 @@ if docker inspect drone-server >/dev/null 2>&1; then
       -e DRONE_GITHUB_CLIENT_ID="$GITHUB_CLIENT_ID" \
       -e DRONE_GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \
       -e DRONE_RPC_SECRET="$DRONE_RPC_SECRET" \
+      -e DRONE_DATABASE_SECRET="$DRONE_DATABASE_SECRET" \
       -e DRONE_SERVER_HOST="${server_host}" \
       -e DRONE_SERVER_PROTO=http \
       -e DRONE_USER_CREATE="username:${admin_username},admin:true" \

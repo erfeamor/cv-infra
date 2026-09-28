@@ -14,50 +14,60 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 fail=0
 
 # --- Check 1 (case 3): no output exposes the drone-deploy access key ------
-# unless it is explicitly marked sensitive. Scans outputs.tf for any output
-# block referencing aws_iam_access_key.drone_deploy; if none exists, that's
-# the expected/current state and this check passes trivially -- it exists
-# to catch a FUTURE output added without sensitive = true, not to demand one
-# exist today. Single self-contained awk pass, `#` comments stripped,
-# tracking both "references the key resource" and "has sensitive = true"
-# per block.
+# unless it is explicitly marked sensitive. Terraform allows an `output`
+# block in ANY .tf file, not just outputs.tf -- review round 1 caught that
+# this originally only scanned outputs.tf itself, which would miss one
+# added to, say, a new single-concern file. Scans every *.tf in the module
+# root for an output block referencing aws_iam_access_key.drone_deploy; if
+# none exists anywhere, that's the expected/current state and this check
+# passes trivially -- it exists to catch a FUTURE output added without
+# sensitive = true, not to demand one exist today. Single self-contained
+# awk pass per file, `#` comments stripped, tracking both "references the
+# key resource" and "has sensitive = true" per block.
 #
-# Deliberately does NOT try to strip /* */ block comments: neither
-# outputs.tf nor iam.tf uses them (grep-confirmed), and a naive index()-based
+# Deliberately does NOT try to strip /* */ block comments: none of this
+# module's .tf files use them (grep-confirmed), and a naive index()-based
 # /* scan false-positives on the wildcard ARNs this codebase is full of
 # (e.g. "${aws_s3_bucket.frontend.arn}/*") -- a real bug this script hit
 # and fixed against itself before being committed. Do not reintroduce that
 # handling without also excluding matches inside quoted strings.
-unsafe_output=$(awk '
-  function strip_comments(line,    h) {
-    h = index(line, "#")
-    if (h > 0) line = substr(line, 1, h - 1)
-    return line
-  }
-  BEGIN { depth = 0; inblock = 0; refs = 0; sens = 0 }
-  {
-    line = strip_comments($0)
-    if (!inblock) {
-      if (line ~ /^output[ \t]+"[^"]+"[ \t]*{/) { inblock = 1; depth = 0; refs = 0; sens = 0; name = line }
-      else next
+unsafe_output=""
+for tf_file in *.tf; do
+  found_in_file=$(awk '
+    function strip_comments(line,    h) {
+      h = index(line, "#")
+      if (h > 0) line = substr(line, 1, h - 1)
+      return line
     }
-    if (line ~ /aws_iam_access_key\.drone_deploy/) refs = 1
-    if (line ~ /^[ \t]*sensitive[ \t]*=[ \t]*true[ \t]*$/) sens = 1
-    n = gsub(/\{/, "{", line); depth += n
-    m = gsub(/\}/, "}", line); depth -= m
-    if (depth == 0) {
-      inblock = 0
-      if (refs && !sens) { print name }
+    BEGIN { depth = 0; inblock = 0; refs = 0; sens = 0 }
+    {
+      line = strip_comments($0)
+      if (!inblock) {
+        if (line ~ /^output[ \t]+"[^"]+"[ \t]*{/) { inblock = 1; depth = 0; refs = 0; sens = 0; name = line }
+        else next
+      }
+      if (line ~ /aws_iam_access_key\.drone_deploy/) refs = 1
+      if (line ~ /^[ \t]*sensitive[ \t]*=[ \t]*true[ \t]*$/) sens = 1
+      n = gsub(/\{/, "{", line); depth += n
+      m = gsub(/\}/, "}", line); depth -= m
+      if (depth == 0) {
+        inblock = 0
+        if (refs && !sens) { print name }
+      }
     }
-  }
-' outputs.tf)
+  ' "$tf_file")
+  if [ -n "$found_in_file" ]; then
+    unsafe_output="${unsafe_output}${tf_file}: ${found_in_file}
+"
+  fi
+done
 
 if [ -n "$unsafe_output" ]; then
-  echo "FAIL: outputs.tf has an output referencing aws_iam_access_key.drone_deploy without sensitive = true:" >&2
-  echo "$unsafe_output" >&2
+  echo "FAIL: an output references aws_iam_access_key.drone_deploy without sensitive = true:" >&2
+  printf '%s' "$unsafe_output" >&2
   fail=1
 else
-  echo "OK: no output in outputs.tf exposes aws_iam_access_key.drone_deploy (or every such output is sensitive = true)"
+  echo "OK: no output in any *.tf file exposes aws_iam_access_key.drone_deploy (or every such output is sensitive = true)"
 fi
 
 # --- Check 2 (case 4): aws_iam_user_policy.drone_deploy is byte-identical

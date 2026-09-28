@@ -12,7 +12,14 @@ terraform init -backend=false     # since the T-004 backend "s3" block landed, p
                                    # tries to reach the real bucket/table; -backend=false skips that
 terraform validate
 terraform test                    # tests/plan.tftest.hcl — runs OFFLINE via mock_provider
+bash scripts/check-t008-static.sh          # T-008: two properties plan-time `terraform test` can't see
+                                            # (a sensitive output, a policy pinned by hash) — see the
+                                            # script's own header for why
+bash scripts/tests/run-drone-reseed-tests.sh   # T-008: offline harness for scripts/drone-reseed-secrets.sh
+                                                # (stubs `aws` and the Drone API; no AWS/network needed)
 ```
+
+Both `scripts/check-t008-static.sh` and `scripts/tests/run-drone-reseed-tests.sh` are cv-infra-local additions (T-008) — they are not part of the meta repo's `scripts/lint-all.sh` / `scripts/test-all.sh` orchestration, so run them directly from here as shown above.
 
 Real usage (needs AWS credentials, `terraform.tfvars`, and the state bucket/table from `bootstrap/` to already exist — see `bootstrap/README.md`):
 

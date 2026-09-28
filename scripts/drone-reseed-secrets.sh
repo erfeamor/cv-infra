@@ -46,7 +46,19 @@
 set -euo pipefail
 
 : "${DRONE_SERVER:?DRONE_SERVER not set -- point this at the local end of the SSM tunnel to the CI host, e.g. http://127.0.0.1:8080}"
-: "${DRONE_TOKEN:?DRONE_TOKEN not set -- export it in your own shell, never on a command line}"
+
+# NOT `: "${DRONE_TOKEN:?msg}"` -- review round 1: when DRONE_TOKEN IS set,
+# `${DRONE_TOKEN:?msg}` expands to the token itself, so `bash -x` traces
+# `+ : <the actual token>` verbatim (xtrace shows a command's arguments
+# AFTER expansion, regardless of what the command does with them). Same
+# reasoning rules out `[ -z "$DRONE_TOKEN" ]` -- xtrace would show the value
+# there too. `${DRONE_TOKEN+x}` (presence, not value) and `${#DRONE_TOKEN}`
+# (a length, not the string) are the only two expansions of this variable
+# anywhere in this script that never put its content in a trace.
+if [ -z "${DRONE_TOKEN+x}" ] || [ "${#DRONE_TOKEN}" -eq 0 ]; then
+  echo "drone-reseed-secrets: DRONE_TOKEN not set -- export it in your own shell, never on a command line" >&2
+  exit 1
+fi
 
 AWS_REGION="${AWS_REGION:-eu-west-3}"
 PROJECT_NAME="${PROJECT_NAME:-cv-project}"
@@ -103,7 +115,7 @@ set_secret() {
   # `/+=`, never containing either in practice, but this is cheap insurance
   # against a malformed request rather than a guarantee for arbitrary input.
   cat >"$body_file" <<EOF
-{"name":"${name}","data":"$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$value_file")","pull_request":false}
+{"name":"${name}","data":"$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$value_file")","pull_request":false,"pull_request_push":false}
 EOF
   chmod 600 "$body_file"
 

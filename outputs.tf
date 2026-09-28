@@ -38,3 +38,9 @@ output "ci_doorbell_url" {
   description = "T-019: Function URL to register as the GitHub webhook on cv-domain-service, cv-database and cv-admin-react. Until the hooks point here, the automation is inert."
   value       = aws_lambda_function_url.ci_doorbell.function_url
 }
+
+# T-008: deliberately NO output for aws_iam_access_key.drone_deploy (its
+# .id or .secret). It leaves this module only via the two SecureStrings in
+# ssm.tf; `terraform output` / `terraform show` must never be the thing
+# that prints it. scripts/check-t008-static.sh enforces that any future
+# output referencing that resource is marked sensitive = true.

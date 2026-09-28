@@ -69,6 +69,40 @@ resource "aws_ssm_parameter" "github_pat_ci" {
   }
 }
 
+# T-008 H1 decision 1: the drone-deploy IAM user's own access key
+# (aws_iam_access_key.drone_deploy, iam.tf), so the Drone SQLite on the CI
+# host stops being the only copy of this credential.
+#
+# Deliberately OUTSIDE .../ci/* -- that prefix is what
+# aws_iam_role_policy.drone_read_ci_parameters (iam.tf) grants the Drone
+# HOST's own instance role, and build containers running on that host can
+# reach it until T-007/T-005 land. If this credential lived under ci/*, a
+# compromised build container could read out the very key that lets it
+# push to the frontend bucket and invalidate CloudFront -- i.e. mint itself
+# deploy access from inside a build. Putting it under deploy/ instead means
+# no IAM policy in this module grants it to anything; it is read only by an
+# operator's own credentials, off-host, via scripts/drone-reseed-secrets.sh
+# (see docs/drone-host-backup-and-cutover.md).
+resource "aws_ssm_parameter" "drone_deploy_access_key_id" {
+  name  = "/${var.project_name}/${var.environment}/deploy/drone-deploy/access-key-id"
+  type  = "SecureString"
+  value = aws_iam_access_key.drone_deploy.id
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+resource "aws_ssm_parameter" "drone_deploy_secret_access_key" {
+  name  = "/${var.project_name}/${var.environment}/deploy/drone-deploy/secret-access-key"
+  type  = "SecureString"
+  value = aws_iam_access_key.drone_deploy.secret
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
 resource "aws_ssm_parameter" "cognito_issuer_uri" {
   name  = "/${var.project_name}/${var.environment}/cognito/issuer-uri"
   type  = "String"

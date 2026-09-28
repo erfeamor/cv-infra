@@ -9,8 +9,12 @@
 #   1. Create a GitHub OAuth app (org erfeamor) with authorization callback
 #      http://<drone_server_url>/login and put its credentials in tfvars.
 #   2. After first login, activate cv-admin-react in the Drone UI.
-#   3. Create an access key for the drone-deploy IAM user (see iam.tf) and
-#      store it as Drone secrets for the deploy step.
+#   3. Seed the aws_access_key_id / aws_secret_access_key Drone secrets on
+#      cv-admin-react from SSM -- run scripts/drone-reseed-secrets.sh
+#      off-host, through an SSM port-forwarding tunnel to this box (T-008;
+#      see docs/drone-host-backup-and-cutover.md). Terraform creates the
+#      key itself (aws_iam_access_key.drone_deploy, iam.tf) and its SSM
+#      copies (ssm.tf); it does not call the Drone API.
 #   4. Create the GitHub PAT for Jenkins (repo:status only, or fine-grained
 #      Commit-statuses:read/write on cv-domain-service + cv-database) and
 #      put it in terraform.tfvars as github_pat_ci -- it lands in SSM as a

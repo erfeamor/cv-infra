@@ -805,6 +805,80 @@ run "ci_on_demand" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# T-008 -- the drone-deploy IAM user's own access key moves into Terraform +
+# SSM (iam.tf, ssm.tf), so the CI host's Drone SQLite stops being the only
+# copy of this credential. Everything here is known at plan time: the user's
+# `name` is a plain variable interpolation (no AWS-generated ARN involved),
+# and the two SSM parameter names/types are literal too.
+# ---------------------------------------------------------------------------
+run "drone_deploy_credentials" {
+  command = plan
+
+  # Case 1, RED FIRST: the access key attaches to the SAME existing user
+  # that already carries the frontend-deploy policy -- not a new/parallel
+  # IAM identity.
+  assert {
+    condition     = aws_iam_access_key.drone_deploy.user == aws_iam_user.drone_deploy.name
+    error_message = "aws_iam_access_key.drone_deploy must attach to aws_iam_user.drone_deploy, not a different or new IAM user"
+  }
+
+  # Case 2, RED FIRST: both parameters are SecureStrings...
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_access_key_id.type == "SecureString"
+    error_message = "The drone-deploy access key ID must be stored as a SecureString"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_secret_access_key.type == "SecureString"
+    error_message = "The drone-deploy secret access key must be stored as a SecureString"
+  }
+
+  # ...at the deploy/ path...
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_access_key_id.name == "/${var.project_name}/${var.environment}/deploy/drone-deploy/access-key-id"
+    error_message = "The access key ID parameter must live at the deploy/drone-deploy path"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.drone_deploy_secret_access_key.name == "/${var.project_name}/${var.environment}/deploy/drone-deploy/secret-access-key"
+    error_message = "The secret access key parameter must live at the deploy/drone-deploy path"
+  }
+
+  # ...NOT under ci/ -- that's what the Drone host's own instance role can
+  # read, and build containers on that host can reach it until T-007/T-005.
+  assert {
+    condition = (
+      !can(regex("/ci/", aws_ssm_parameter.drone_deploy_access_key_id.name)) &&
+      !can(regex("/ci/", aws_ssm_parameter.drone_deploy_secret_access_key.name))
+    )
+    error_message = "Neither drone-deploy SSM parameter may live under the ci/ prefix -- that's what the Drone host's own instance role can read"
+  }
+
+  # Negative half of case 2: no existing IAM policy grants read access to
+  # the deploy/ path. aws_iam_role_policy.drone_read_ci_parameters is the
+  # only policy in this module that reads any part of this parameter tree
+  # at all -- pin its Resource string exactly to ci/* (fully known at plan,
+  # built only from variables, no AWS-generated ARN involved) so a later
+  # widening (e.g. to deploy/* or the whole tree) fails here instead of
+  # silently handing a build container its own deploy key.
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement[0].Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
+    error_message = "aws_iam_role_policy.drone_read_ci_parameters must stay scoped to ci/* -- widening it would let a build container on the Drone host read its own deploy key out of SSM"
+  }
+
+  # Case 4/5 (the part checkable under `command = plan`): aws_iam_user_policy.
+  # drone_deploy is NOT reasserted here -- its Resource fields embed
+  # aws_s3_bucket.frontend.arn / aws_cloudfront_distribution.frontend.arn,
+  # which are unknown-until-apply under `command = plan` (same documented
+  # limitation as aws_s3_bucket.backup.arn and aws_eip.drone.public_ip
+  # elsewhere in this file; confirmed empirically the same way). This task
+  # does not touch that resource at all -- verified by code review (git
+  # diff shows no edit to its block) and by scripts/check-t008-static.sh,
+  # which pins its exact text with a hash so a future edit that changes it
+  # fails a fast, offline check instead of only being caught by review.
+}
+
 # T-022: the domain service used to answer the whole internet on 8080, which
 # made CloudFront optional as an entry point and served /v3/api-docs
 # unauthenticated. These assertions pin the fix so a later edit cannot quietly

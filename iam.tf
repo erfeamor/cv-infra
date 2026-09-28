@@ -121,15 +121,24 @@ resource "aws_iam_instance_profile" "drone" {
 }
 
 # Identity the cv-admin-react deploy step runs as: sync dist/ to the frontend
-# bucket and invalidate CloudFront, nothing broader. Its access key is created
-# manually (console/CLI) and stored as Drone secrets — creating it here would
-# put the secret in Terraform state.
+# bucket and invalidate CloudFront, nothing broader.
 resource "aws_iam_user" "drone_deploy" {
   name = "${var.project_name}-drone-deploy"
 
   tags = {
     Project = var.project_name
   }
+}
+
+# T-008 H1 decision 1: the key is created HERE, in Terraform, instead of
+# out-of-band. Before this task the secret's only copy was in Drone's
+# SQLite on the CI host's unencrypted root volume; creating it here means
+# it's also written to SSM (ssm.tf) and lands in Terraform state, which has
+# been in the encrypted S3 backend since T-004 -- that tradeoff no longer
+# favors keeping it out-of-band. No output references this resource (see
+# outputs.tf); the secret leaves this module only via the SSM parameters.
+resource "aws_iam_access_key" "drone_deploy" {
+  user = aws_iam_user.drone_deploy.name
 }
 
 resource "aws_iam_user_policy" "drone_deploy" {

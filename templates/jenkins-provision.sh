@@ -12,16 +12,22 @@ if ! flock -w 1500 200; then
   exit 1
 fi
 
-# T-007 review round 1, finding 5: on a freshly-replaced instance, the SSM
-# agent reports Online (ci.tf's null_resource.jenkins_provision waits only
-# for that) well before cloud-init's own user_data run -- which installs
-# Docker, creates the "drone" network, and starts drone-server
-# (templates/drone-user-data.sh) -- has necessarily finished. Without this,
-# this script's first docker command on a fresh box could race that
-# install, or collide with it on network creation. Blocks until cloud-init
-# converges; a no-op (returns immediately) on the long-lived box this
-# script normally targets, where cloud-init finished boots ago.
-cloud-init status --wait >/dev/null 2>&1 || true
+# T-007 review round 1, finding 5, corrected round 2 (BLOCKER): a cloud-init
+# readiness wait (`cloud-init` "status", "--wait") used to live here. It
+# deadlocked: this exact script also runs INSIDE cloud-init on the
+# user_data path (templates/jenkins-bootstrap.sh's `bash "$provision_script"`,
+# itself invoked by cloud-init's own user_data run) -- a script waiting for
+# cloud-init to finish, while it IS the thing cloud-init is currently
+# running, never returns, and the out-of-band SSM copy then times out
+# waiting on the same lock (held by the deadlocked user_data run). The wait
+# this script still needs (so a fresh-replace SSM run doesn't race
+# cloud-init's Docker install/network-create in drone-user-data.sh) now
+# lives ONLY in the SSM command path that is never itself inside cloud-init
+# -- see ci.tf's null_resource.jenkins_provision, which runs that same
+# readiness check as a command BEFORE this script's own content, not
+# inside it. scripts/check-t007-static.sh's Check D fails if this script
+# ever calls that command directly again (deliberately not spelled out
+# verbatim in this comment, so the check stays meaningful).
 
 param() {
   aws ssm get-parameter --with-decryption --region "${aws_region}" \

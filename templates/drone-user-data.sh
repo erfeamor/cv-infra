@@ -76,12 +76,19 @@ docker run -d --name drone-runner --restart unless-stopped \
 # `docker system prune`, which also removes stopped containers and unused
 # networks. -a reaches every unused image, not just dangling ones (that's
 # what actually reclaims an old tag left behind by a base-image bump -- a
-# plain, non -a prune would not), age-filtered to >1 week so an image pulled
-# for a build still in flight this week is never a target. Never touches a
-# running container, a named volume, or the "drone" network -- Drone's own
-# data lives in the /var/lib/drone bind mount above regardless. Idempotent:
-# both unit files are overwritten deterministically and
-# `systemctl enable --now` is a no-op if already enabled.
+# plain, non -a prune would not).
+#
+# Corrected, review round 2 finding 4: `until=168h` filters on the image's
+# CREATION (build) timestamp, not when it was pulled onto this host -- a
+# base image pulled today but built weeks ago (a stock `drone/drone:2` or
+# Flyway image, say) is immediately eligible, same as a genuinely stale
+# one. The safety net against removing something still wanted is `docker
+# image prune`'s own base behaviour, kept regardless of -a or the age
+# filter: an image referenced by ANY container -- running or stopped -- is
+# never a candidate. Never touches a named volume or the "drone" network
+# either -- Drone's own data lives in the /var/lib/drone bind mount above
+# regardless. Idempotent: both unit files are overwritten deterministically
+# and `systemctl enable --now` is a no-op if already enabled.
 cat >/etc/systemd/system/docker-prune.service <<'EOF'
 [Unit]
 Description=Weekly docker image/build-cache prune

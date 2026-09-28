@@ -99,22 +99,31 @@ resource "aws_instance" "drone" {
   # usage exceeds 75% of this 20 GB, file a follow-up to resize rather than
   # letting it fill silently.
   #
-  # REVIEW ROUND 1, FINDING 1 -- read before touching this block or
-  # `metadata_options` below: `encrypted` and a `volume_size` decrease are
-  # both ForceNew on `root_block_device`. `ignore_changes` below covers only
-  # `ami` and the CIKeepAlive tags -- it does NOT cover this block, so once
-  # this PR's config lands, even a PLAIN `terraform plan` (no `-replace`
-  # needed at all) already proposes replacing this instance, because the
-  # live instance's actual root (30 GB, unencrypted -- the ECS AMI's
-  # default) genuinely differs from this config. `-replace` is still the
-  # command used (see docs/t007-ci-host-replace-runbook.md), but only
-  # because it's also needed to force the AMI swap despite
-  # `ignore_changes = [ami]` -- the replacement itself is no longer
-  # optional once this merges. Consequence: this must be applied from the
-  # branch and proven live BEFORE merging to master (same convention as
-  # T-004/T-008's state-affecting changes) -- master must never carry this
-  # diff unapplied, or the next person to run a routine `plan` gets a
-  # surprise instance replacement they didn't ask for.
+  # REVIEW ROUND 1, FINDING 1 (corrected round 2, finding 5) -- read before
+  # touching this block or `metadata_options` below: on the AWS provider
+  # pinned here (5.100.0), only `encrypted` is ForceNew on
+  # `root_block_device` -- a `volume_size` change alone is not (EBS volumes
+  # can grow in place via ModifyVolume; a decrease specifically would just
+  # fail at apply against the real API, not plan a replace). `ignore_changes`
+  # below covers only `ami` and the CIKeepAlive tags -- it does NOT cover
+  # `encrypted`, so once this PR's config lands, even a PLAIN `terraform
+  # plan` (no `-replace` needed at all) already proposes replacing this
+  # instance, because the live instance's actual root (30 GB, unencrypted --
+  # the ECS AMI's default) is unencrypted and this config asks for encrypted.
+  # `-replace` is still the command used (see
+  # docs/t007-ci-host-replace-runbook.md) for clarity/intent, but it is not
+  # uniquely what forces the AMI onto the new host: ANY forced replacement,
+  # by `-replace` or by this `encrypted` diff alone, builds the new resource
+  # instance from the CURRENT config for every attribute, including ones
+  # listed in `ignore_changes` -- that meta-argument only suppresses
+  # in-place UPDATE plans on an existing instance, it has no effect on what
+  # a freshly created replacement instance is built from. Consequence:
+  # because the replacement itself is no longer optional once this merges,
+  # it must be applied from the branch and proven live BEFORE merging to
+  # master (same convention as T-004/T-008's state-affecting changes) --
+  # master must never carry this diff unapplied, or the next person to run
+  # a routine `plan` gets a surprise instance replacement they didn't ask
+  # for.
   root_block_device {
     volume_size = 20
     volume_type = "gp3"
@@ -299,10 +308,21 @@ resource "null_resource" "jenkins_provision" {
         agent_elapsed=$((agent_elapsed + agent_poll_s))
       done
 
+      # T-007 review round 2 (BLOCKER, correcting round 1's finding 5): the
+      # cloud-init wait that guards against racing a fresh replace's own
+      # user_data run must NOT live inside jenkins-provision.sh itself --
+      # that script also runs INSIDE cloud-init on the user_data path
+      # (templates/jenkins-bootstrap.sh), so a wait embedded in it would
+      # deadlock (the script waiting for the very cloud-init run it is
+      # part of) and this SSM copy would then time out on the same lock.
+      # Sent here instead, as its own command BEFORE the script's content,
+      # in a path that is never itself inside cloud-init.
+      # scripts/check-t007-static.sh's Check D pins this split.
       payload_file=$(mktemp)
       trap 'rm -f "$payload_file"' EXIT
       jq -n --rawfile s "${local_file.jenkins_provision_script.filename}" --arg iid "$instance_id" \
-        '{"InstanceIds":[$iid],"DocumentName":"AWS-RunShellScript","Comment":"cv-infra T-002: provision Jenkins + reverse proxy","Parameters":{"commands":[$s]}}' \
+        --arg wait "cloud-init status --wait || true" \
+        '{"InstanceIds":[$iid],"DocumentName":"AWS-RunShellScript","Comment":"cv-infra T-002: provision Jenkins + reverse proxy","Parameters":{"commands":[$wait,$s]}}' \
         >"$payload_file"
       cmd_id=$(aws ssm send-command --region "$region" \
         --cli-input-json "file://$payload_file" \

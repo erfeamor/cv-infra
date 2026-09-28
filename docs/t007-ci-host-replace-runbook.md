@@ -9,18 +9,23 @@ see `../CLAUDE.md`).
 
 ## Background
 
-**Corrected, review round 1, finding 1 -- this PR's own diff already forces
-a replacement, independent of `-replace`.** `aws_instance.drone`
-(`../ci.tf`) carries `lifecycle { ignore_changes = [ami, ...] }`, but that
-list covers only `ami` and the two `CIKeepAlive` tag entries -- **not**
-`root_block_device`. `encrypted` and a `volume_size` decrease are both
-ForceNew on that block, and the live instance's actual root (30 GB,
-unencrypted -- the ECS AMI's default) genuinely differs from this PR's
-explicit `root_block_device { volume_size = 20, encrypted = true }`. That
+**Corrected, review round 1, finding 1, corrected again round 2, finding 5
+-- this PR's own diff already forces a replacement, independent of
+`-replace`.** `aws_instance.drone` (`../ci.tf`) carries
+`lifecycle { ignore_changes = [ami, ...] }`, but that list covers only
+`ami` and the two `CIKeepAlive` tag entries -- **not** `root_block_device`.
+On the AWS provider pinned here (5.100.0), only `encrypted` is ForceNew on
+that block -- a `volume_size` change alone is not (EBS volumes can grow in
+place via ModifyVolume; a decrease specifically would just fail against the
+real API at apply time, not plan a replace). The live instance's actual
+root is unencrypted (the ECS AMI's default), and this PR's explicit
+`root_block_device { encrypted = true }` genuinely differs from that. That
 means once this config exists anywhere `terraform plan` can see it, **a
 plain `terraform plan` -- no `-replace` flag at all -- already proposes
-replacing `aws_instance.drone`.** This is not a false alarm to dismiss; it
-is this task's own change finally becoming visible to Terraform.
+replacing `aws_instance.drone`**, forced by `encrypted` alone (`volume_size`
+just rides along in the same block once the replace happens). This is not a
+false alarm to dismiss; it is this task's own change finally becoming
+visible to Terraform.
 
 Consequence: **this must be applied from the branch and proven live BEFORE
 merging to `master`**, the same convention T-004 and T-008 used for their
@@ -32,15 +37,19 @@ instance, and merging the PR afterward is just catching the code up to
 match what is already true in the account.
 
 `terraform apply -replace=aws_instance.drone` (not a plain apply) is still
-the right command, but for a narrower reason than "this is the only thing
-that can trigger a replace": it is what's needed to make the **AMI**
-attribute actually pick up `data.aws_ami.al2023.id`'s *current* value
-despite `ignore_changes = [ami]`. A plain apply would still replace the
-instance (forced by `root_block_device`) but, per `ignore_changes`
-semantics, would carry the *old* (ECS-optimized) AMI id into the new
-instance -- defeating the entire point of this task. `-replace` overrides
-that hold for the resource instance being replaced, so it is what actually
-gets the plain AL2023 AMI onto the new host.
+the command used, for clarity of intent -- but round 2 corrects an
+overstated claim from round 1: **`-replace` is not uniquely what picks up
+the new AMI.** `ignore_changes = [ami]` only suppresses an in-place
+*update* plan on an *existing* instance; it has no bearing on what a
+freshly created replacement instance is built from. **ANY forced
+replacement -- whether triggered by `-replace` or, as established above, by
+the `encrypted` diff alone -- creates the new instance from the CURRENT
+config for every attribute, including ones listed in `ignore_changes`.** So
+a plain apply (no `-replace`) would ALSO have replaced this instance onto
+the current AL2023 AMI, simply because `encrypted` already forces a
+replace. `-replace` is used here anyway because it is the explicit,
+self-documenting way to say "this apply intentionally replaces this
+instance" -- not because it is technically load-bearing for the AMI.
 
 Drone's own state (repo activations, OAuth token, secrets) is SQLite on the
 instance's root volume, so `-replace` destroys it. [T-008](../../.claude/tasks/T-008-drone-host-backup-and-snapshot.md)
@@ -109,8 +118,10 @@ terraform plan -replace=aws_instance.drone -out=t007.tfplan
 **Expected plan shape (review round 1, finding 6 -- the full list, not an
 abbreviated one)**, all downstream of the one instance replacement:
 
-- `aws_instance.drone` -- replaced (forced by `root_block_device` per the
-  Background section above; `-replace` additionally forces the AMI swap).
+- `aws_instance.drone` -- replaced (forced by `root_block_device.encrypted`
+  per the Background section above; the AMI swap rides along with any
+  forced replacement, not uniquely with `-replace` -- see the correction
+  there).
 - `aws_eip_association.drone` -- updated to point at the new instance id.
 - `aws_iam_role_policy.ci_doorbell` and `aws_iam_role_policy.ci_reaper`
   (`../ci-on-demand.tf`) -- updated: both embed `local.ci_instance_arn`,
@@ -123,6 +134,16 @@ abbreviated one)**, all downstream of the one instance replacement:
 - `null_resource.jenkins_provision` -- replaced: its `triggers.instance_id`
   changes, which is what makes Jenkins re-provision onto the new host in
   this same apply.
+- **Review round 2, finding 3 -- because this PR also edits
+  `templates/jenkins-provision.sh`** (the cloud-init-wait fix and the
+  `DRONE_DATABASE_SECRET` addition to its second `docker run`):
+  `local.jenkins_provision_script`'s content changes, so
+  `local_file.jenkins_provision_script` (`../ci.tf`) is replaced (its
+  `content` is not updatable in place), and `aws_s3_object.jenkins_provision`
+  and `aws_ssm_parameter.jenkins_provision_sha256` (both `../ci-provision.tf`)
+  are updated (new `etag`/`content`, new sha256 value) -- independent of the
+  instance replacement, and would show up even on a plan that touched only
+  this file.
 - **First apply only** (not on a later `-replace`): `random_password.drone_database_secret`
   and `aws_ssm_parameter.drone_database_secret` are created here too, if
   this is the first time this branch's config has been applied.
@@ -155,7 +176,10 @@ trustworthy, not just a box to tick:
    hop limit does **not** cover every container, and this step must not
    claim otherwise):
    - From a container on the host's `drone` BRIDGE network (e.g.
-     `docker run --rm --max-time 5 --network drone curlimages/curl -s -o /dev/null -w '%{http_code}\n' http://169.254.169.254/latest/api/token -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600'`),
+     `docker run --rm --network drone curlimages/curl --max-time 5 -s -o /dev/null -w '%{http_code}\n' -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token`
+     -- review round 2, finding 2: `--max-time 5` is a **curl** argument, so
+     it belongs after the image name, with curl's other flags, not among
+     `docker run`'s own flags before it),
      confirm the request is denied (times out inside the 5s `--max-time`,
      or connection refused -- not a token). This is the case hop-limit-1
      actually protects: a bridge-network hop is one hop further from the

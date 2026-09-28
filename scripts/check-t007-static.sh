@@ -24,6 +24,11 @@
 # once (that remediation block exists because of a drift between them), so
 # this is checked directly rather than trusted to stay in sync.
 #
+# Check D (review round 2, BLOCKER): `cloud-init status --wait` must live
+# ONLY in ci.tf's null_resource.jenkins_provision SSM command, never inside
+# templates/jenkins-provision.sh itself -- that script also runs INSIDE
+# cloud-init on the user_data path, so a wait embedded in it deadlocks.
+#
 # Run alongside fmt/validate/test/check-t008-static.sh as part of this
 # module's offline gate (see cv-infra/CLAUDE.md).
 set -euo pipefail
@@ -140,6 +145,30 @@ if [ -n "$drone_run_violations" ]; then
   fail=1
 else
   echo "OK: every 'docker run ... drone/drone:...' invocation (drone-user-data.sh, jenkins-provision.sh) passes -e DRONE_DATABASE_SECRET"
+fi
+
+# --- Check D (review round 2, BLOCKER): `cloud-init status --wait` must
+# NEVER appear inside templates/jenkins-provision.sh -- that script also
+# runs INSIDE cloud-init on the user_data path
+# (templates/jenkins-bootstrap.sh's `bash "$provision_script"`), so a wait
+# embedded in it deadlocks (it would be waiting for the very cloud-init run
+# it is a part of). The wait belongs only in ci.tf's
+# null_resource.jenkins_provision, as a command that runs BEFORE the
+# script's own content over SSM -- a path that is never itself inside
+# cloud-init. Checked both ways: absent from the shared script, present in
+# the SSM command path.
+if grep -q "cloud-init status --wait" templates/jenkins-provision.sh; then
+  echo "FAIL: templates/jenkins-provision.sh calls 'cloud-init status --wait' -- this deadlocks on the user_data path, where this script runs INSIDE cloud-init (see ci.tf's null_resource.jenkins_provision for where the wait belongs instead)" >&2
+  fail=1
+else
+  echo "OK: templates/jenkins-provision.sh does not call 'cloud-init status --wait' (would deadlock on the user_data path)"
+fi
+
+if grep -q "cloud-init status --wait" ci.tf; then
+  echo "OK: ci.tf still runs 'cloud-init status --wait' (in null_resource.jenkins_provision's SSM command, ahead of the script's own content)"
+else
+  echo "FAIL: ci.tf no longer runs 'cloud-init status --wait' anywhere -- the fresh-replace race with drone-user-data.sh's Docker install (T-007 review round 1, finding 5) is unguarded again" >&2
+  fail=1
 fi
 
 exit $fail

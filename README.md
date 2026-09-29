@@ -15,7 +15,7 @@ Part of the [cv-project](../README.md) multi-repo. No dedicated pipeline yet (Te
 - **S3 + CloudFront** — hosts the built `cv-admin-react` / `cv-public-vanilla` static assets
 - **Cognito user pool + Hosted UI domain** — auth for `cv-admin-react`
 - **CloudWatch log groups** — one per backend service
-- **SSM Parameter Store** — DB password, Cognito issuer URI, CI secrets (`ci/*`, readable by the Drone/Jenkins host role), and the drone-deploy IAM credentials (`deploy/drone-deploy/*`, T-008 — readable by no instance role, only by an operator running `scripts/drone-reseed-secrets.sh`; see `docs/drone-host-backup-and-cutover.md`)
+- **SSM Parameter Store** — DB password, Cognito issuer URI, CI secrets (`ci/*`, readable by the Drone/Jenkins host role), and the drone-deploy IAM credentials (`deploy/drone-deploy/*`, T-008 — readable by no instance role, only by an operator running `scripts/drone-reseed-secrets.sh`; see `docs/runbooks/drone.md`)
 
 Uses the account's default VPC (no NAT gateway) to stay Free Tier-eligible.
 

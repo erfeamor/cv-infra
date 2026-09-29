@@ -13,7 +13,7 @@ resource "aws_ssm_parameter" "db_password" {
 
 # T-007: DRONE_DATABASE_SECRET encrypts sensitive data (repo OAuth tokens,
 # activated-repo secrets) at rest in Drone's SQLite. Drone has run without
-# one since it was first stood up (T-002) -- docs/drone-host-backup-and-cutover.md
+# one since it was first stood up (T-002) -- docs/runbooks/drone.md
 # recorded that gap explicitly. Generated here, not typed into tfvars by
 # hand, so the only copies are Terraform state and this SecureString.
 #
@@ -120,7 +120,7 @@ resource "aws_ssm_parameter" "github_pat_ci" {
 # read_parameters (iam.tf) keeps it from the app host's role. Both are
 # needed; neither alone is sufficient. It is read only by an operator's own
 # credentials, off-host, via scripts/drone-reseed-secrets.sh (see
-# docs/drone-host-backup-and-cutover.md).
+# docs/runbooks/drone.md).
 resource "aws_ssm_parameter" "drone_deploy_access_key_id" {
   name  = "/${var.project_name}/${var.environment}/deploy/drone-deploy/access-key-id"
   type  = "SecureString"

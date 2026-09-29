@@ -818,8 +818,8 @@ run "ci_on_demand" {
 # ignore_changes) and case 8 (the Lambda env vars, which reference
 # aws_instance.drone.id -- a genuinely AWS-computed attribute, unknown at
 # plan for a not-yet-created instance) aren't visible to `terraform test` at
-# all -- both are covered by scripts/check-t007-static.sh instead, the same
-# source-text convention scripts/check-t008-static.sh already uses for this
+# all -- both are covered by scripts/check-static.sh instead, the same
+# source-text convention scripts/check-static.sh already uses for this
 # exact class of gap.
 # ---------------------------------------------------------------------------
 run "t007_ci_host_hardening" {
@@ -1133,7 +1133,7 @@ run "drone_deploy_credentials" {
   # limitation as aws_s3_bucket.backup.arn and aws_eip.drone.public_ip
   # elsewhere in this file; confirmed empirically the same way). This task
   # does not touch that resource at all -- verified by code review (git
-  # diff shows no edit to its block) and by scripts/check-t008-static.sh,
+  # diff shows no edit to its block) and by scripts/check-static.sh,
   # which pins its exact text with a hash so a future edit that changes it
   # fails a fast, offline check instead of only being caught by review.
 }

@@ -902,9 +902,19 @@ run "t034_review_round1" {
     error_message = "Async retries must stay disabled -- a Lambda-initiated retry of the wake+redeliver task would re-run redeliver_failed_deliveries, defeating findings 2/3's single-pass dedup guarantees"
   }
 
+  # Review round 3, finding 6: the budget grew from two named pieces to four
+  # -- the original sum undercounted the worst-case async-task path (a
+  # `stopping` instance waited out, THEN the full healthz wait; plus one
+  # healthz probe's own request-level overshoot). See the locals' comment in
+  # ci-on-demand.tf for what each piece mirrors in lambda/ci_doorbell/index.py.
   assert {
-    condition     = local.ci_doorbell_timeout_seconds == local.ci_doorbell_healthz_timeout_seconds + local.ci_doorbell_github_work_budget_seconds
-    error_message = "local.ci_doorbell_timeout_seconds must equal the sum of its two named pieces -- a bare override would hide the budget this number is supposed to make legible"
+    condition = local.ci_doorbell_timeout_seconds == (
+      local.ci_doorbell_stopping_wait_seconds +
+      local.ci_doorbell_healthz_timeout_seconds +
+      local.ci_doorbell_healthz_probe_timeout_seconds +
+      local.ci_doorbell_github_work_budget_seconds
+    )
+    error_message = "local.ci_doorbell_timeout_seconds must equal the sum of all four named pieces -- a bare override would hide the budget this number is supposed to make legible"
   }
 
   assert {

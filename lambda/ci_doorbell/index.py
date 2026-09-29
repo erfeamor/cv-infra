@@ -72,6 +72,31 @@ far as an unsigned webhook POST would: a log line and nothing else.
 runs strictly AFTER the signature check, as a second, independent layer --
 kept because it costs nothing and narrows the blast radius further even in a
 world where the secret leaked.
+
+--- Review round 3, finding 5: only `push` schedules the async task ---------
+
+Two concurrent async tasks for the same repo would each fetch and dedup
+Drone's delivery list independently, and a redelivery POST landing between
+one task's fetch and its own POST is invisible to the other -- a real path to
+a duplicate redelivery that no single invocation's guid-dedup can catch on
+its own. The doorbell-signed hook (docs/runbooks/drone.md) is subscribed to
+`push` AND `pull_request` (round 1, finding 5), and pushing to a PR branch
+fires BOTH almost simultaneously -- the most common way this race would
+actually happen in practice, not a contrived edge case.
+
+Considered and rejected: a cross-invocation lock (e.g. conditionally
+ec2:CreateTags a marker with the wake_time, checked before scheduling and
+cleared after). Rejected as disproportionate here -- it adds a new IAM grant
+scoped to the one instance, a new tag this task's own ignore_changes list
+would need to keep in sync with the CIKeepAlive convention (docs/runbooks/
+drone.md), and a whole new failure mode (a crashed invocation that never
+clears its own lock, stranding every future wake). Instead: `_handle_webhook`
+only schedules the async task for `event_type == "push"`; a `pull_request`
+delivery still wakes the box through the ordinary synchronous path (no
+redelivery pass of its own), and its own Drone delivery, if it fails, is
+still swept up by a LATER push's redelivery window -- that window has no
+upper bound on how recent a failure must be, only a lower one
+(REDELIVERY_BACKWARD_SLACK_SECONDS before THAT push's own wake).
 """
 
 import base64
@@ -439,12 +464,23 @@ def redeliver_failed_deliveries(repo, wake_time_iso):
         if existing is None or when > existing[0]:
             latest_failed_by_guid[guid] = (when, delivery)
 
+    # Round 3, finding 1: oldest wake first, so master's commits rebuild and
+    # deploy in the order they actually landed -- GitHub's own list order
+    # (newest-first) is exactly backwards for this purpose.
+    oldest_first = sorted(latest_failed_by_guid.items(), key=lambda item: item[1][0])
+
+    attempts = 0
     redelivered = 0
-    for guid, (_when, delivery) in latest_failed_by_guid.items():
-        if redelivered >= MAX_REDELIVERIES_PER_RUN:
+    for guid, (_when, delivery) in oldest_first:
+        # Round 3, finding 2: the cap counts ATTEMPTS, not successes. If it
+        # counted only successes, a GitHub outage (every POST failing) would
+        # never trip it, and this loop would keep attempting every candidate
+        # regardless of MAX_REDELIVERIES_PER_RUN -- running well past the
+        # function's own timeout budget (ci-on-demand.tf).
+        if attempts >= MAX_REDELIVERIES_PER_RUN:
             log.warning(
-                "hit MAX_REDELIVERIES_PER_RUN (%d) for %s; remaining failed deliveries are left for the next wake "
-                "or manual redelivery (docs/runbooks/drone.md)",
+                "hit MAX_REDELIVERIES_PER_RUN (%d) attempts for %s; remaining failed deliveries are left for the next "
+                "wake or manual redelivery (docs/runbooks/drone.md)",
                 MAX_REDELIVERIES_PER_RUN,
                 repo,
             )
@@ -452,6 +488,7 @@ def redeliver_failed_deliveries(repo, wake_time_iso):
         delivery_id = delivery.get("id")
         if delivery_id is None:
             continue
+        attempts += 1
         try:
             _github_request(
                 "POST",
@@ -459,9 +496,11 @@ def redeliver_failed_deliveries(repo, wake_time_iso):
                 token,
             )
             redelivered += 1
-        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
-            # Finding 4: one failed redelivery POST must not stop the rest --
-            # a transient GitHub error on guid A has nothing to do with guid B.
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, http.client.HTTPException) as exc:
+            # Finding 4 (round 1) + finding 3 (round 3): one failed
+            # redelivery attempt, of any of these exception shapes, must not
+            # stop the rest -- a transient GitHub error on guid A has nothing
+            # to do with guid B.
             log.warning("redelivery POST failed for guid=%s delivery_id=%s: %s", guid, delivery_id, exc)
 
     log.info(
@@ -590,23 +629,33 @@ def _handle_async_task(event):
         return {"ok": False, "reason": "describe failed"}
 
     if state == "stopping":
-        # Finding 6: never plunge into an 8-minute healthz wait against a host
-        # that is mid-shutdown and may not come back up as "stopped" in time.
+        # Finding 6 (round 1): never plunge into an 8-minute healthz wait
+        # against a host that is mid-shutdown and may not come back up as
+        # "stopped" in time.
         state = _wait_for_instance_stopped()
-        if state != "stopped":
-            log.error(
-                "instance still %s after waiting up to %ds for it to stop; giving up rather than waiting "
-                "%ds for healthz against a host that may never come up",
-                state,
-                INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS,
-                HEALTHZ_TIMEOUT_SECONDS,
-            )
-            return {"ok": False, "reason": "stuck stopping"}
 
-    if state == "stopped":
+    # Round 3, finding 4: "pending" and "running" both mean the box is
+    # already coming up (started by this task moments ago on a warm retry
+    # path, by a concurrent trigger, or because AWS itself resumed it out of
+    # `stopping` without ever settling on `stopped`) -- not starting again is
+    # correct, and it is NOT the same thing as "stuck". Only a state that is
+    # STILL "stopping" after the bounded wait above counts as stuck; every
+    # other non-pending/running/stopped state is the genuinely unexpected
+    # case this function has always refused to act on.
+    if state in ("pending", "running"):
+        log.info("%s already %s for %s; not starting again", INSTANCE_ID, state, repo)
+    elif state == "stopped":
         ec2.start_instances(InstanceIds=[INSTANCE_ID])
         log.info("started %s for async wake+redeliver of %s", INSTANCE_ID, repo)
-    elif state != "running":
+    elif state == "stopping":
+        log.error(
+            "instance still stopping after waiting up to %ds for it to stop; giving up rather than waiting "
+            "%ds for healthz against a host that may never come up",
+            INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS,
+            HEALTHZ_TIMEOUT_SECONDS,
+        )
+        return {"ok": False, "reason": "stuck stopping"}
+    else:
         log.error("instance in unexpected state %s; not starting", state)
         return {"ok": False, "reason": "unexpected state %s" % state}
 
@@ -660,12 +709,26 @@ def _handle_webhook(event):
         log.warning("rejected: repository %s not in allowlist", repo)
         return _response(403, "repository not allowed")
 
-    if repo in REDELIVER_REPOS:
+    if repo in REDELIVER_REPOS and event_type == "push":
         # T-034: answer at once (GitHub's 10s budget), do nothing else here.
         # Everything slow -- starting the box, waiting for Drone, redelivering
         # -- happens in the async self-invocation, which authenticates its own
         # event with `sig` (see module docstring, finding 1 round 2) and then
         # re-validates repo/wake_time independently as a second layer.
+        #
+        # Round 3, finding 5 (concurrency): restricted to `push` on purpose --
+        # see the module docstring for the full reasoning. In short: pushing
+        # to a PR branch fires BOTH a `push` and a `pull_request` (action=
+        # synchronize) delivery to this same doorbell-signed hook, nearly
+        # simultaneously. Scheduling an async task for each would race two
+        # concurrent redelivery passes against the same hook's deliveries,
+        # risking duplicate POSTs no single invocation's own guid-dedup can
+        # see. Restricting to `push` collapses that pair back down to one
+        # async task. A pull_request event still wakes the box (falls
+        # through to the ordinary synchronous path below); its own Drone
+        # delivery, if it fails, is still covered by a LATER push's
+        # redelivery window (REDELIVERY_BACKWARD_SLACK_SECONDS aside, the
+        # window has no upper bound -- see redeliver_failed_deliveries).
         wake_time_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         sig = _sign_async_task(repo, wake_time_iso)
         _self_invoke({"repo": repo, "wake_time": wake_time_iso, "sig": sig})

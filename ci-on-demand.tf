@@ -91,16 +91,34 @@ locals {
   ci_public_host = aws_eip.drone.public_ip
 
   # Review round 1, finding 4: the budget behind aws_lambda_function.ci_doorbell's
-  # timeout, split into its two named pieces so a reviewer can see where 780s
-  # comes from instead of trusting a bare number. healthz is the PO-settled
-  # ceiling (t034p1-plan.md); the work budget covers, after healthz succeeds,
-  # bounded hooks/deliveries pagination (MAX_LIST_PAGES pages each, index.py)
-  # and up to MAX_REDELIVERIES_PER_RUN redelivery POSTs, each capped at
-  # index.py's HTTP_TIMEOUT_SECONDS (5s) per call -- worst case comfortably
-  # under 300s, with margin, and nowhere near Lambda's 900s hard ceiling.
-  ci_doorbell_healthz_timeout_seconds    = 480
-  ci_doorbell_github_work_budget_seconds = 300
-  ci_doorbell_timeout_seconds            = local.ci_doorbell_healthz_timeout_seconds + local.ci_doorbell_github_work_budget_seconds
+  # timeout, named piece by piece so a reviewer can see where the number comes
+  # from instead of trusting a bare literal. Review round 3, finding 6 added
+  # the first and third pieces below -- the original two-piece budget
+  # undercounted the worst-case async-task path (a `stopping` instance that
+  # needs waiting out, index.py's _wait_for_instance_stopped, THEN the full
+  # healthz wait; and the healthz wait's own final poll can itself overshoot
+  # its nominal ceiling by up to one HTTP request timeout before urlopen gives
+  # up). All four mirror named Python constants in lambda/ci_doorbell/index.py
+  # (kept in sync by hand -- there is no wiring between them beyond this
+  # comment and the env vars actually passed below):
+  #   - stopping_wait  <-> INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS
+  #   - healthz        <-> HEALTHZ_TIMEOUT_SECONDS (PO-settled ceiling, t034p1-plan.md)
+  #   - probe_timeout  <-> HTTP_TIMEOUT_SECONDS (the one extra overshoot noted above)
+  #   - github_work    <-> the budget for bounded hooks/deliveries pagination
+  #     (MAX_LIST_PAGES pages each) and up to MAX_REDELIVERIES_PER_RUN
+  #     redelivery POSTs, each itself capped at HTTP_TIMEOUT_SECONDS
+  # Sum is 895s, comfortably inside Lambda's 900s hard ceiling with 5s to
+  # spare -- see the <= 900 assertion in tests/plan.tftest.hcl.
+  ci_doorbell_stopping_wait_seconds         = 120
+  ci_doorbell_healthz_timeout_seconds       = 480
+  ci_doorbell_healthz_probe_timeout_seconds = 5
+  ci_doorbell_github_work_budget_seconds    = 290
+  ci_doorbell_timeout_seconds = (
+    local.ci_doorbell_stopping_wait_seconds +
+    local.ci_doorbell_healthz_timeout_seconds +
+    local.ci_doorbell_healthz_probe_timeout_seconds +
+    local.ci_doorbell_github_work_budget_seconds
+  )
 }
 
 data "archive_file" "ci_doorbell" {

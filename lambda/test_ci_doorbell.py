@@ -396,6 +396,86 @@ class TestInstanceStopping(DoorbellTestCase):
         self.module.ec2.start_instances.assert_not_called()
         healthz_mock.assert_not_called()
 
+    # --- Review round 3, finding 4 (RED): pending/running are "already
+    # coming up", not "stuck"; only a still-`stopping` state after the
+    # bounded wait counts as stuck. -----------------------------------------
+
+    def test_initial_pending_state_proceeds_without_starting(self):
+        self.set_instance_state("pending")
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
+        with mock.patch.object(self.module, "wait_for_drone_healthz", return_value=True) as healthz_mock, mock.patch.object(
+            self.module, "redeliver_failed_deliveries"
+        ):
+            result = self.module.handler(event, None)
+        self.assertTrue(result["ok"])
+        self.module.ec2.start_instances.assert_not_called()
+        healthz_mock.assert_called_once()
+
+    def test_stopping_resolving_to_pending_proceeds_without_starting(self):
+        states = iter(["stopping", "pending"])
+        self.module.ec2.describe_instances.side_effect = lambda **kw: {
+            "Reservations": [{"Instances": [{"State": {"Name": next(states)}}]}]
+        }
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
+        with mock.patch.object(self.module.time, "sleep"), mock.patch.object(
+            self.module, "wait_for_drone_healthz", return_value=True
+        ) as healthz_mock, mock.patch.object(self.module, "redeliver_failed_deliveries"):
+            result = self.module.handler(event, None)
+        self.assertTrue(result["ok"])
+        self.module.ec2.start_instances.assert_not_called()
+        healthz_mock.assert_called_once()
+
+    def test_stopping_resolving_to_running_proceeds_without_starting(self):
+        states = iter(["stopping", "running"])
+        self.module.ec2.describe_instances.side_effect = lambda **kw: {
+            "Reservations": [{"Instances": [{"State": {"Name": next(states)}}]}]
+        }
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
+        with mock.patch.object(self.module.time, "sleep"), mock.patch.object(
+            self.module, "wait_for_drone_healthz", return_value=True
+        ) as healthz_mock, mock.patch.object(self.module, "redeliver_failed_deliveries"):
+            result = self.module.handler(event, None)
+        self.assertTrue(result["ok"])
+        self.module.ec2.start_instances.assert_not_called()
+        healthz_mock.assert_called_once()
+
+    def test_unexpected_terminal_state_still_gives_up(self):
+        # A genuinely unexpected state (not pending/running/stopped/stopping)
+        # must still be refused -- the fix for pending/running must not widen
+        # into "any non-stopping state is fine".
+        self.set_instance_state("shutting-down")
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
+        with mock.patch.object(self.module, "wait_for_drone_healthz") as healthz_mock:
+            with self.assertLogs(self.module.log, level="ERROR"):
+                result = self.module.handler(event, None)
+        self.assertFalse(result["ok"])
+        self.module.ec2.start_instances.assert_not_called()
+        healthz_mock.assert_not_called()
+
+
+# --- Review round 3, finding 5: concurrency -- only `push` schedules the ---
+# async wake+redeliver task for cv-admin-react. A pull_request event (e.g.
+# the "synchronize" that fires ALONGSIDE a push to a PR branch) still wakes
+# the box through the ordinary synchronous path, but does not itself spawn a
+# second, concurrent async task racing the push's. See the module docstring
+# for the full justification (the alternative to a distributed lock).
+
+
+class TestOnlyPushSchedulesAsyncTask(DoorbellTestCase):
+    def test_pull_request_event_does_not_self_invoke(self):
+        self.set_instance_state("stopped")
+        event = push_event("erfeamor/cv-admin-react", event_type="pull_request")
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 200)
+        self.module.lambda_client.invoke.assert_not_called()
+        self.module.ec2.start_instances.assert_called_once_with(InstanceIds=[ENV["INSTANCE_ID"]])
+
+    def test_push_event_still_self_invokes(self):
+        event = push_event("erfeamor/cv-admin-react", event_type="push")
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.module.lambda_client.invoke.assert_called_once()
+
 
 # --- Case 5: Drone hook discovered by config.url ending in /hook -----------
 
@@ -496,9 +576,44 @@ class TestRedeliverFailedDeliveries(DoorbellTestCase):
         self.assertEqual(len(post_calls), 1)
         self.assertNotIn(" ", post_calls[0].args[1])
 
+    # --- Review round 3, finding 1 (RED): redeliver oldest-first ------------
+
+    def test_redelivered_oldest_first(self):
+        deliveries = [
+            {"id": 1, "guid": "g_newest", "delivered_at": "2026-09-29T00:47:00Z", "status_code": 500},
+            {"id": 2, "guid": "g_oldest", "delivered_at": "2026-09-29T00:46:00Z", "status_code": 500},
+            {"id": 3, "guid": "g_middle", "delivered_at": "2026-09-29T00:46:30Z", "status_code": 500},
+        ]
+        calls = self._run(deliveries)
+        posted_order = [c.args[1].split("/deliveries/")[1].split("/attempts")[0] for c in calls]
+        self.assertEqual(
+            posted_order,
+            ["2", "3", "1"],
+            "must redeliver in chronological order (oldest wake first) so master's commits rebuild/deploy in order",
+        )
+
+    def test_when_capped_the_oldest_are_kept_not_the_newest(self):
+        cap = self.module.MAX_REDELIVERIES_PER_RUN
+        n = cap + 3
+        # id 0 is the NEWEST (highest second), id n-1 is the OLDEST (lowest
+        # second) -- mimicking GitHub's actual newest-first list order, so
+        # this also proves the cap doesn't accidentally rely on list order.
+        deliveries = [
+            {"id": i, "guid": "g%d" % i, "delivered_at": "2026-09-29T00:46:%02dZ" % (n - 1 - i), "status_code": 500}
+            for i in range(n)
+        ]
+        calls = self._run(deliveries)
+        posted_ids = {c.args[1].split("/deliveries/")[1].split("/attempts")[0] for c in calls}
+        self.assertEqual(len(posted_ids), cap)
+        # The 3 newest (ids 0, 1, 2) must be the ones left out.
+        self.assertEqual(posted_ids & {"0", "1", "2"}, set())
+        self.assertIn(str(n - 1), posted_ids)  # the oldest must be kept
+
 
 # --- Review round 1, finding 4 (RED): a failed POST doesn't abort the loop,
-# and redeliveries are capped per run --------------------------------------
+# and redeliveries are capped per run. Review round 3 findings 2+3 (RED):
+# the cap counts ATTEMPTS not successes, and the per-POST handler also
+# catches TimeoutError/OSError/http.client.HTTPException. -------------------
 
 
 class TestRedeliveryResilienceAndCap(DoorbellTestCase):
@@ -517,6 +632,23 @@ class TestRedeliveryResilienceAndCap(DoorbellTestCase):
         post_calls = [c for c in github_request.call_args_list if c.args[0] == "POST"]
         self.assertEqual(len(post_calls), 2, "both guids must still be attempted even though each POST raises")
 
+    def test_various_exception_types_from_post_do_not_abort_the_loop(self):
+        deliveries = [
+            {"id": 1, "guid": "g1", "delivered_at": "2026-09-29T00:46:00Z", "status_code": 500},
+            {"id": 2, "guid": "g2", "delivered_at": "2026-09-29T00:46:05Z", "status_code": 500},
+            {"id": 3, "guid": "g3", "delivered_at": "2026-09-29T00:46:10Z", "status_code": 500},
+        ]
+        exceptions = [TimeoutError("timed out"), OSError("connection reset"), self.module.http.client.BadStatusLine("garbage")]
+        with mock.patch.object(self.module, "find_drone_hook_id", return_value=42), mock.patch.object(
+            self.module, "_github_list", return_value=deliveries
+        ), mock.patch.object(self.module, "_github_request") as github_request:
+            github_request.side_effect = exceptions
+            with self.assertLogs(self.module.log, level="WARNING"):
+                redelivered = self.module.redeliver_failed_deliveries("erfeamor/cv-admin-react", "2026-09-29T00:45:00+00:00")
+        self.assertEqual(redelivered, 0)
+        post_calls = [c for c in github_request.call_args_list if c.args[0] == "POST"]
+        self.assertEqual(len(post_calls), 3, "all three guids must still be attempted despite three different exception types")
+
     def test_redeliveries_are_capped_per_run(self):
         deliveries = [
             {"id": i, "guid": "g%d" % i, "delivered_at": "2026-09-29T00:46:%02dZ" % (i % 60), "status_code": 500}
@@ -530,6 +662,30 @@ class TestRedeliveryResilienceAndCap(DoorbellTestCase):
         self.assertEqual(redelivered, self.module.MAX_REDELIVERIES_PER_RUN)
         post_calls = [c for c in github_request.call_args_list if c.args[0] == "POST"]
         self.assertEqual(len(post_calls), self.module.MAX_REDELIVERIES_PER_RUN)
+
+    def test_cap_counts_failed_attempts_not_only_successes(self):
+        # Round 3, finding 2: if the cap only counted SUCCESSES, a GitHub
+        # outage (every POST fails) would never trip it at all, and the loop
+        # would attempt every candidate regardless of MAX_REDELIVERIES_PER_RUN
+        # -- looping well past the function's own timeout budget.
+        n = self.module.MAX_REDELIVERIES_PER_RUN + 5
+        deliveries = [
+            {"id": i, "guid": "g%d" % i, "delivered_at": "2026-09-29T00:46:%02dZ" % (i % 60), "status_code": 500}
+            for i in range(n)
+        ]
+        with mock.patch.object(self.module, "find_drone_hook_id", return_value=42), mock.patch.object(
+            self.module, "_github_list", return_value=deliveries
+        ), mock.patch.object(self.module, "_github_request") as github_request:
+            github_request.side_effect = self.module.urllib.error.URLError("github is down")
+            with self.assertLogs(self.module.log, level="WARNING"):
+                redelivered = self.module.redeliver_failed_deliveries("erfeamor/cv-admin-react", "2026-09-29T00:45:00+00:00")
+        self.assertEqual(redelivered, 0)
+        post_calls = [c for c in github_request.call_args_list if c.args[0] == "POST"]
+        self.assertEqual(
+            len(post_calls),
+            self.module.MAX_REDELIVERIES_PER_RUN,
+            "the cap must bite on ATTEMPTS even when every single one fails",
+        )
 
 
 # --- Review round 1, finding 8 (RED): pagination follows Link: rel=next ----

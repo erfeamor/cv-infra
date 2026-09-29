@@ -165,3 +165,21 @@ resource "aws_ssm_parameter" "github_webhook_secret" {
     Project = var.project_name
   }
 }
+
+# T-034 H1 correction: a second, narrower GitHub token -- fine-grained,
+# Webhooks read/write on erfeamor/cv-admin-react only -- that the doorbell
+# uses to list/redeliver Drone's hook deliveries after a cold start.
+# Deliberately OUTSIDE ci/*, same reasoning as drone_deploy's key (iam.tf):
+# build containers on the CI host read ci/* today, and this token could
+# create/modify webhooks on cv-admin-react if a compromised build read it
+# out. Readable only by the doorbell Lambda's own role (ci-on-demand.tf) --
+# see the single-parameter ssm:GetParameter grant there.
+resource "aws_ssm_parameter" "github_hooks_token" {
+  name  = "/${var.project_name}/${var.environment}/doorbell/github-hooks-token"
+  type  = "SecureString"
+  value = var.github_hooks_token
+
+  tags = {
+    Project = var.project_name
+  }
+}

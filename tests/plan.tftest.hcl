@@ -49,6 +49,7 @@ variables {
   jenkins_admin_password     = "test-jenkins-password-not-real"
   github_pat_ci              = "test-github-pat-not-real"
   github_webhook_secret      = "test-webhook-secret-not-real"
+  github_hooks_token         = "test-hooks-token-not-real"
 
   # T-011: no default on budget_credit_grant_amount by design (see
   # variables.tf) -- test value only, never a number that could pass for a
@@ -715,14 +716,22 @@ run "ci_on_demand" {
   # public-access block makes the Function URL answer 403 and the handler is
   # never reached. Every other assertion in this file passed while that was
   # broken, which is why it gets one of its own.
+  #
+  # Review round 1 (0567f6a) tried narrowing this to lambda:InvokeFunctionUrl
+  # (finding 1(a)); round 2 (driver review) reverted it -- T-019 (bd65353)
+  # verified LIVE that InvokeFunctionUrl alone is insufficient on this
+  # account. Pinned to InvokeFunction here so a future edit fails THIS
+  # assertion at review time instead of silently 403ing the doorbell on the
+  # next apply. Finding 1's real fix is the async task's own HMAC (see
+  # lambda/ci_doorbell/index.py's _async_task_signature_ok).
   assert {
     condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunction"
-    error_message = "The doorbell needs an unconditioned lambda:InvokeFunction grant or its Function URL returns 403 without ever invoking the handler (verified live 2026-08-19)"
+    error_message = "The doorbell needs an unconditioned lambda:InvokeFunction grant or its Function URL returns 403 without ever invoking the handler (verified live 2026-08-19, T-019 bd65353; re-verified round 2 of T-034's review -- do not narrow this to InvokeFunctionUrl without a live test)"
   }
 
   assert {
     condition     = aws_lambda_permission.ci_doorbell_public_invoke.principal == "*"
-    error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py, not this permission"
+    error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py (both the webhook body signature and, for the async task, its own signature), not this permission"
   }
 
   # The doorbell may START the one instance and nothing else.
@@ -802,6 +811,121 @@ run "ci_on_demand" {
   assert {
     condition     = aws_lambda_function_url.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
     error_message = "The Function URL must be attached to the doorbell Lambda -- an API Gateway would add cost this task cannot justify"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-034 H1 correction -- the doorbell redelivers Drone's own (previously
+# GitHub-signed) webhook deliveries for erfeamor/cv-admin-react instead of
+# forwarding the payload itself, and self-invokes (InvocationType=Event) to
+# do the slow work (start the box, wait for /healthz, call GitHub) outside
+# GitHub's 10-second webhook budget. Cases 12-14 of the plan; case 13's IAM
+# resource scoping (Resource = aws_lambda_function.ci_doorbell.arn) is NOT
+# checkable here -- same unknown-until-apply limitation as every other IAM
+# policy assertion in this file (the ARN is computed) -- and is covered by
+# scripts/check-static.sh instead (case 15).
+# ---------------------------------------------------------------------------
+run "t034_doorbell_redelivery" {
+  command = plan
+
+  # --- Case 12: the hooks token lives outside ci/*, as a SecureString ------
+  assert {
+    condition     = aws_ssm_parameter.github_hooks_token.type == "SecureString"
+    error_message = "The GitHub hooks token must be a SecureString"
+  }
+
+  assert {
+    condition     = startswith(aws_ssm_parameter.github_hooks_token.name, "/${var.project_name}/${var.environment}/doorbell/")
+    error_message = "github_hooks_token must live outside ci/* -- the CI host's role only reads ci/*, and this token must stay unreadable from a build container running on it (same reasoning as drone_deploy's key, iam.tf)"
+  }
+
+  # --- Case 13: self-invoke is InvokeFunction only, and only the doorbell's
+  # own actions grow to include it (never the reaper's) ---------------------
+  assert {
+    condition     = join(",", local.ci_doorbell_lambda_actions) == "lambda:InvokeFunction"
+    error_message = "The doorbell's self-invoke grant must be InvokeFunction only"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["GITHUB_HOOKS_TOKEN_PARAM"] == aws_ssm_parameter.github_hooks_token.name
+    error_message = "The doorbell must read the hooks token from SSM by name, never from a literal"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["SELF_FUNCTION_NAME"] == aws_lambda_function.ci_doorbell.function_name
+    error_message = "The doorbell must self-invoke by its OWN function name -- a literal or mismatched name would either fail at runtime or (worse) target a different function"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["REDELIVER_REPOS"] == "erfeamor/cv-admin-react"
+    error_message = "Only erfeamor/cv-admin-react gets the redeliver path (H1) -- Drone verifies each webhook against its own per-repo secret, so nothing this handler could send it directly would pass that check, and the Jenkins repos already have periodicFolderTrigger discovery"
+  }
+
+  # --- Case 14: the waiting invocation's timeout ----------------------------
+  # Review round 1, finding 4 replaced the bare ">= 540" with the actual
+  # budget the timeout is built from (local.ci_doorbell_healthz_timeout_seconds
+  # + local.ci_doorbell_github_work_budget_seconds, ci-on-demand.tf) -- see
+  # the t034_review_round1 run below for the budget's own assertions.
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.timeout == local.ci_doorbell_timeout_seconds
+    error_message = "aws_lambda_function.ci_doorbell.timeout must come from local.ci_doorbell_timeout_seconds, not a bare literal that could silently drift from the healthz+GitHub-work budget it represents"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-034 review round 1 (0567f6a) findings 4, 7 -- async retries are disabled,
+# the timeout budget is named and bounded, and the reaper's grace variable is
+# actually wired to the Lambda that reads it. Finding 1(a) (the public invoke
+# permission) was tried here as lambda:InvokeFunctionUrl-only and REVERTED in
+# round 2 (driver review) -- T-019 (bd65353) verified live that this account
+# needs the unconditioned InvokeFunction grant; that assertion now lives back
+# in the "ci_on_demand" run above, pinned to InvokeFunction. Finding 1's real
+# fix is the async task's own HMAC signature -- see the
+# t034_async_task_signature run in test_ci_doorbell.py (code-level, not
+# Terraform: the signature covers repo+wake_time, not any IAM-visible
+# property). Finding 10 (one local for the CI host's public address) is a
+# text-level property (aws_eip.drone.public_ip is unknown under
+# `command = plan`, same limitation this file documents throughout) and is
+# covered by scripts/check-static.sh instead, not here.
+# ---------------------------------------------------------------------------
+run "t034_review_round1" {
+  command = plan
+
+  # --- Finding 4: async retries disabled, and the timeout budget -----------
+  assert {
+    condition     = aws_lambda_function_event_invoke_config.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
+    error_message = "The event-invoke config must target the doorbell function"
+  }
+
+  assert {
+    condition     = aws_lambda_function_event_invoke_config.ci_doorbell.maximum_retry_attempts == 0
+    error_message = "Async retries must stay disabled -- a Lambda-initiated retry of the wake+redeliver task would re-run redeliver_failed_deliveries, defeating findings 2/3's single-pass dedup guarantees"
+  }
+
+  # Review round 3, finding 6: the budget grew from two named pieces to four
+  # -- the original sum undercounted the worst-case async-task path (a
+  # `stopping` instance waited out, THEN the full healthz wait; plus one
+  # healthz probe's own request-level overshoot). See the locals' comment in
+  # ci-on-demand.tf for what each piece mirrors in lambda/ci_doorbell/index.py.
+  assert {
+    condition = local.ci_doorbell_timeout_seconds == (
+      local.ci_doorbell_stopping_wait_seconds +
+      local.ci_doorbell_healthz_timeout_seconds +
+      local.ci_doorbell_healthz_probe_timeout_seconds +
+      local.ci_doorbell_github_work_budget_seconds
+    )
+    error_message = "local.ci_doorbell_timeout_seconds must equal the sum of all four named pieces -- a bare override would hide the budget this number is supposed to make legible"
+  }
+
+  assert {
+    condition     = local.ci_doorbell_timeout_seconds <= 900
+    error_message = "900s is Lambda's hard ceiling on any function timeout; the budget must never exceed it"
+  }
+
+  # --- Finding 7: the reaper's grace variable is actually wired ------------
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["POST_START_GRACE_MINUTES"] == tostring(var.ci_post_start_grace_minutes)
+    error_message = "POST_START_GRACE_MINUTES must be wired from var.ci_post_start_grace_minutes -- the variable existed but was never actually passed to the reaper Lambda (review round 1, finding 7), so it silently did nothing"
   }
 }
 

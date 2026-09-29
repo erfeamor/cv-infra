@@ -330,3 +330,24 @@ variable "ci_cpu_busy_percent" {
   type        = number
   default     = 10
 }
+
+# T-034 -----------------------------------------------------------------
+
+variable "ci_post_start_grace_minutes" {
+  description = "Minimum time after a start before the reaper will consider stopping the instance at all (finding 2026-09-27: a single post-boot CPU datapoint was seen satisfying the idle window seconds after a cold start, stopping the box while a just-queued Drone build sat pending)."
+  type        = number
+  default     = 15
+}
+
+variable "github_hooks_token" {
+  # H1 correction, same day: the existing CI token (github_pat_ci) was
+  # checked against the GitHub API and cannot manage webhooks -- 403,
+  # repository_hooks=read required. This is a SEPARATE, narrower token: the
+  # human creates a fine-grained PAT limited to erfeamor/cv-admin-react,
+  # Webhooks read/write only. No default: an empty token would make every
+  # redelivery call fail 401, silently disabling the whole path with no
+  # signal beyond a CloudWatch log line.
+  description = "Fine-grained GitHub PAT, scoped to erfeamor/cv-admin-react + Webhooks read/write only, that the doorbell uses to find Drone's hook and redeliver its failed deliveries after a cold start (T-034 H1 correction)."
+  type        = string
+  sensitive   = true
+}

@@ -56,6 +56,69 @@ locals {
     "ec2:RunInstances",
     "ec2:*",
   ]
+
+  # T-034 H1 correction: the doorbell self-invokes (InvocationType=Event)
+  # rather than standing up a second Lambda for the slow redeliver path --
+  # named here for the same reason as the EC2 action lists above: a reviewer
+  # sees the whole grant in one line, and `terraform test` can assert on it
+  # even though the rendered policy JSON (which embeds this function's own
+  # computed ARN) cannot be jsondecode'd under `command = plan`.
+  ci_doorbell_lambda_actions = ["lambda:InvokeFunction"]
+
+  # Named apart from the function resource so the resource's own
+  # `function_name` argument and this env var can both reference it without
+  # aws_lambda_function.ci_doorbell.function_name being a self-reference
+  # (Terraform rejects a resource referencing its own attribute from within
+  # its own body, even when — as here — the value is a literal known at plan
+  # time, not a computed one).
+  ci_doorbell_function_name = "${var.project_name}-ci-doorbell"
+
+  # H1: redelivery (not forwarding) applies to this repo only. Drone
+  # verifies each webhook against a per-repo secret only it and GitHub know,
+  # so nothing this handler could send Drone directly would pass that check
+  # anyway — the Jenkins repos keep ruling 1's periodicFolderTrigger
+  # discovery and never touch this path.
+  ci_redeliver_repos = ["erfeamor/cv-admin-react"]
+
+  # Review round 1, finding 10: the CI host's one public address, named once.
+  # Phase 2 (T-034) replaces the EIP with a DNS name behind Route 53; when
+  # that lands, this is the ONLY place that changes -- every consumer below
+  # (the reaper's Jenkins URL, the doorbell's Drone healthz URL) references
+  # this local, never aws_eip.drone.public_ip directly. Enforced textually by
+  # scripts/check-static.sh (terraform test cannot see it: the EIP's
+  # public_ip is unknown under `command = plan`, same limitation this file
+  # already documents for other computed attributes).
+  ci_public_host = aws_eip.drone.public_ip
+
+  # Review round 1, finding 4: the budget behind aws_lambda_function.ci_doorbell's
+  # timeout, named piece by piece so a reviewer can see where the number comes
+  # from instead of trusting a bare literal. Review round 3, finding 6 added
+  # the first and third pieces below -- the original two-piece budget
+  # undercounted the worst-case async-task path (a `stopping` instance that
+  # needs waiting out, index.py's _wait_for_instance_stopped, THEN the full
+  # healthz wait; and the healthz wait's own final poll can itself overshoot
+  # its nominal ceiling by up to one HTTP request timeout before urlopen gives
+  # up). All four mirror named Python constants in lambda/ci_doorbell/index.py
+  # (kept in sync by hand -- there is no wiring between them beyond this
+  # comment and the env vars actually passed below):
+  #   - stopping_wait  <-> INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS
+  #   - healthz        <-> HEALTHZ_TIMEOUT_SECONDS (PO-settled ceiling, t034p1-plan.md)
+  #   - probe_timeout  <-> HTTP_TIMEOUT_SECONDS (the one extra overshoot noted above)
+  #   - github_work    <-> the budget for bounded hooks/deliveries pagination
+  #     (MAX_LIST_PAGES pages each) and up to MAX_REDELIVERIES_PER_RUN
+  #     redelivery POSTs, each itself capped at HTTP_TIMEOUT_SECONDS
+  # Sum is 895s, comfortably inside Lambda's 900s hard ceiling with 5s to
+  # spare -- see the <= 900 assertion in tests/plan.tftest.hcl.
+  ci_doorbell_stopping_wait_seconds         = 120
+  ci_doorbell_healthz_timeout_seconds       = 480
+  ci_doorbell_healthz_probe_timeout_seconds = 5
+  ci_doorbell_github_work_budget_seconds    = 290
+  ci_doorbell_timeout_seconds = (
+    local.ci_doorbell_stopping_wait_seconds +
+    local.ci_doorbell_healthz_timeout_seconds +
+    local.ci_doorbell_healthz_probe_timeout_seconds +
+    local.ci_doorbell_github_work_budget_seconds
+  )
 }
 
 data "archive_file" "ci_doorbell" {
@@ -120,6 +183,21 @@ resource "aws_iam_role_policy" "ci_doorbell" {
         Resource = aws_ssm_parameter.github_webhook_secret.arn
       },
       {
+        # T-034: the fine-grained hooks token, scoped to this single
+        # parameter -- see ssm.tf for why it lives outside ci/*.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = aws_ssm_parameter.github_hooks_token.arn
+      },
+      {
+        # T-034 H1 correction: the async redelivery path self-invokes.
+        # Resource-scoped to this function's OWN arn only -- a compromised
+        # doorbell gains nothing by this grant beyond re-queuing itself.
+        Effect   = "Allow"
+        Action   = local.ci_doorbell_lambda_actions
+        Resource = aws_lambda_function.ci_doorbell.arn
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.ci_doorbell.arn}:*"
@@ -129,19 +207,32 @@ resource "aws_iam_role_policy" "ci_doorbell" {
 }
 
 resource "aws_lambda_function" "ci_doorbell" {
-  function_name    = "${var.project_name}-ci-doorbell"
-  role             = aws_iam_role.ci_doorbell.arn
-  handler          = "index.handler"
-  runtime          = "python3.12"
-  timeout          = 10
+  function_name = local.ci_doorbell_function_name
+  role          = aws_iam_role.ci_doorbell.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  # T-034: this same function runs the async wake+redeliver task (self
+  # invocation), which waits up to HEALTHZ_TIMEOUT_SECONDS for Drone's own
+  # /healthz before redelivering, then does bounded GitHub work. See
+  # local.ci_doorbell_timeout_seconds for the budget this number comes from
+  # (review round 1, finding 4) -- the webhook entry point itself still
+  # answers in low single-digit seconds; this timeout is a ceiling, not how
+  # long a normal invocation runs.
+  timeout          = local.ci_doorbell_timeout_seconds
   filename         = data.archive_file.ci_doorbell.output_path
   source_code_hash = data.archive_file.ci_doorbell.output_base64sha256
 
   environment {
     variables = {
-      INSTANCE_ID          = aws_instance.drone.id
-      WEBHOOK_SECRET_PARAM = aws_ssm_parameter.github_webhook_secret.name
-      ALLOWED_REPOS        = join(",", local.ci_allowed_repos)
+      INSTANCE_ID                   = aws_instance.drone.id
+      WEBHOOK_SECRET_PARAM          = aws_ssm_parameter.github_webhook_secret.name
+      ALLOWED_REPOS                 = join(",", local.ci_allowed_repos)
+      REDELIVER_REPOS               = join(",", local.ci_redeliver_repos)
+      GITHUB_HOOKS_TOKEN_PARAM      = aws_ssm_parameter.github_hooks_token.name
+      DRONE_HEALTHZ_URL             = "http://${local.ci_public_host}/healthz"
+      HEALTHZ_TIMEOUT_SECONDS       = tostring(local.ci_doorbell_healthz_timeout_seconds)
+      HEALTHZ_POLL_INTERVAL_SECONDS = "15"
+      SELF_FUNCTION_NAME            = local.ci_doorbell_function_name
     }
   }
 
@@ -186,11 +277,47 @@ resource "aws_lambda_function_url" "ci_doorbell" {
 # returns 401 and starts nothing. Verified live: an unsigned POST through this
 # URL returns "bad signature" and the instance is untouched. If that check is
 # ever weakened, this grant becomes a genuine cost-DoS hole.
+#
+# Review round 1 (0567f6a) tried narrowing this to lambda:InvokeFunctionUrl +
+# function_url_auth_type = "NONE" (finding 1(a)) to stop a direct
+# lambda:InvokeFunction call from reaching _handle_async_task unauthenticated.
+# Round 2 (driver review) reverted that: T-019 (bd65353) verified LIVE that
+# this account's Lambda block-public-access setting makes InvokeFunctionUrl
+# alone insufficient (403, zero invocations) and that the unconditioned
+# InvokeFunction grant is what actually opens the path -- narrowing it here
+# would silently break the doorbell for the Jenkins repos too on the next
+# apply. Finding 1's real fix now lives one layer down: every async task
+# event must itself carry a valid HMAC over (repo, wake_time), verified in
+# _handle_async_task before anything else happens (index.py) -- so a direct,
+# unconditioned InvokeFunction call still reaches the handler, but with
+# nothing to act on unless it also holds the webhook secret. Do NOT narrow
+# this permission again without a LIVE test proving InvokeFunctionUrl alone
+# still works on this account (terraform test pins the action below so a
+# future edit here fails loudly, not silently, at review time).
 resource "aws_lambda_permission" "ci_doorbell_public_invoke" {
   statement_id  = "AllowPublicInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.ci_doorbell.function_name
   principal     = "*"
+}
+
+# Review round 1, finding 4: Lambda's default async-invoke behaviour retries
+# a failing/erroring event up to twice more, minutes apart. A retry of the
+# wake+redeliver task would re-run ec2:StartInstances (harmless -- idempotent
+# against a running instance) but ALSO re-run redeliver_failed_deliveries,
+# which is exactly the double-redelivery this task spent findings 2/3
+# avoiding within a single run; disabling retries keeps "one wake -> at most
+# one redelivery pass" true across the whole async path, not just inside one
+# invocation. maximum_event_age_in_seconds is short because a wake+redeliver
+# task queued but not yet started is only useful while still fresh -- a
+# heavily throttled/delayed first attempt run minutes later would revalidate
+# against a now-stale wake_time (index.py's WAKE_TIME_MAX_AGE_SECONDS) and be
+# rejected anyway, so there is nothing to gain by letting Lambda hold it
+# longer.
+resource "aws_lambda_function_event_invoke_config" "ci_doorbell" {
+  function_name                = aws_lambda_function.ci_doorbell.function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 60
 }
 
 # ---------------------------------------------------------------------------
@@ -267,11 +394,17 @@ resource "aws_lambda_function" "ci_reaper" {
   environment {
     variables = {
       INSTANCE_ID            = aws_instance.drone.id
-      JENKINS_BASE_URL       = "http://${aws_eip.drone.public_ip}/jenkins"
+      JENKINS_BASE_URL       = "http://${local.ci_public_host}/jenkins"
       JENKINS_USER           = var.jenkins_admin_username
       JENKINS_PASSWORD_PARAM = aws_ssm_parameter.jenkins_admin_password.name
       IDLE_WINDOW_MINUTES    = tostring(var.ci_idle_window_minutes)
       CPU_BUSY_PERCENT       = tostring(var.ci_cpu_busy_percent)
+      # Review round 1, finding 7: this was defined in variables.tf
+      # (var.ci_post_start_grace_minutes) but never actually wired to the
+      # Lambda that reads it -- lambda/ci_reaper/index.py's
+      # POST_START_GRACE_MINUTES has a hardcoded "15" fallback, which meant
+      # the variable silently did nothing.
+      POST_START_GRACE_MINUTES = tostring(var.ci_post_start_grace_minutes)
     }
   }
 

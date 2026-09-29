@@ -215,4 +215,51 @@ else
   ok "'cloud-init status --wait' runs only in ci.tf's SSM provisioning path, not in the shared script"
 fi
 
+# --- 8. Any self-invoke grant is scoped to the doorbell's own ARN only -----
+# T-034: the async redelivery path self-invokes (lambda:InvokeFunction).
+# `terraform test` cannot check the Resource value itself -- the rendered
+# policy JSON embeds this function's own computed ARN, unknown under
+# `command = plan` (same class of limitation ci-on-demand.tf documents for
+# the EC2 action lists). Any resource file may carry a lambda:InvokeFunction
+# grant, so every .tf file is scanned, matching the same
+# `Action = ["..."]` / next-non-blank-line `Resource = ...` shape check #3
+# already uses for ssm:GetParameter.
+invoke_violations=""
+for tf_file in *.tf; do
+  v=$(awk '
+    function strip(l,  h) { h = index(l, "#"); if (h > 0) l = substr(l, 1, h - 1); return l }
+    {
+      line = strip($0)
+      if (line ~ /Action[ \t]*=[ \t]*\["lambda:InvokeFunction"\][ \t]*$/) { want = 1; next }
+      if (!want || line ~ /^[ \t]*$/) next
+      want = 0
+      if (line !~ /^[ \t]*Resource[ \t]*=[ \t]*aws_lambda_function\.ci_doorbell\.arn[ \t]*$/) print line
+    }
+  ' "$tf_file")
+  [ -n "$v" ] && invoke_violations="${invoke_violations}${tf_file}: ${v}
+"
+done
+if [ -n "$invoke_violations" ]; then
+  bad "a lambda:InvokeFunction grant does not scope Resource to aws_lambda_function.ci_doorbell.arn exactly:
+${invoke_violations}"
+else
+  ok "every lambda:InvokeFunction grant is scoped to aws_lambda_function.ci_doorbell.arn"
+fi
+
+# --- 9. The CI host's public address is named through ONE local -----------
+# Review round 1, finding 10: DRONE_HEALTHZ_URL and JENKINS_BASE_URL must
+# both build from local.ci_public_host, never from aws_eip.drone.public_ip
+# directly -- so T-034 phase 2 (EIP -> DNS name) changes exactly one line.
+# `terraform test` cannot check this: aws_eip.drone.public_ip is unknown
+# under `command = plan` (documented throughout tests/plan.tftest.hcl), so
+# this is a text-level check, like check #4/#5 above.
+if grep -Eq 'DRONE_HEALTHZ_URL[ \t]*=.*aws_eip\.drone\.public_ip' ci-on-demand.tf ||
+  grep -Eq 'JENKINS_BASE_URL[ \t]*=.*aws_eip\.drone\.public_ip' ci-on-demand.tf; then
+  bad "DRONE_HEALTHZ_URL or JENKINS_BASE_URL references aws_eip.drone.public_ip directly instead of local.ci_public_host -- T-034 phase 2 would then need to change two places instead of one"
+elif ! grep -Eq '^\s*ci_public_host\s*=\s*aws_eip\.drone\.public_ip\s*$' ci-on-demand.tf; then
+  bad "local.ci_public_host (= aws_eip.drone.public_ip) not found in ci-on-demand.tf -- has it been renamed without updating this check?"
+else
+  ok "DRONE_HEALTHZ_URL and JENKINS_BASE_URL both build from local.ci_public_host, not aws_eip.drone.public_ip directly"
+fi
+
 exit $fail

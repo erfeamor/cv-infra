@@ -12,9 +12,10 @@ A replacement **destroys the root disk**, and with it Drone's database and `JENK
 
 ## Procedure
 
-1. **Back up state** (`../../CLAUDE.md` convention: `~/.local/share/cv-infra-state-backups/<date>/`, directory 0700, files 0600):
+1. **Back up state** (`../../CLAUDE.md` convention: directory 0700, files 0600). State holds secrets, so create the directory and write under `umask 077`, and stop if the backup fails:
    ```bash
-   terraform state pull > ~/.local/share/cv-infra-state-backups/$(date +%F)/pre-ci-replace.tfstate
+   D=~/.local/share/cv-infra-state-backups/$(date +%F); ( umask 077; mkdir -p "$D" ); chmod 700 "$D"
+   ( umask 077; terraform state pull > "$D/pre-ci-replace.tfstate" ) && [ -s "$D/pre-ci-replace.tfstate" ] || { echo "state backup failed" >&2; exit 1; }
    ```
 2. **Plan and read the whole shape** before applying:
    ```bash
@@ -42,8 +43,8 @@ Run these on the host with `aws ssm send-command` (AWS-RunShellScript) or an SSM
 
 | Check | Command (on the host unless noted) | Expect |
 |---|---|---|
-| Instance shape | *(operator)* `aws ec2 describe-instances --instance-ids $I --query '…[ImageId,MetadataOptions.HttpTokens,MetadataOptions.HttpPutResponseHopLimit,PublicIpAddress]'` | the expected AMI, `required`, `1`, the same EIP |
-| Root volume | *(operator)* `aws ec2 describe-volumes --volume-ids <root>` | the expected size, `gp3`, `Encrypted: true` |
+| Instance shape | *(operator)* `aws ec2 describe-instances --instance-ids "$I" --query 'Reservations[0].Instances[0].[ImageId,MetadataOptions.HttpTokens,MetadataOptions.HttpPutResponseHopLimit,PublicIpAddress]' --output text` | the expected AMI, `required`, `1`, the same EIP |
+| Root volume | *(operator)* `V=$(aws ec2 describe-instances --instance-ids "$I" --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text); aws ec2 describe-volumes --volume-ids "$V" --query 'Volumes[0].[Size,VolumeType,Encrypted]' --output text` | the expected size, `gp3`, `True` |
 | No ECS leftovers | `docker ps -a \| grep -c ecs-agent`; `systemctl list-unit-files \| grep -ci ecs` | 0, 0 |
 | No host-network containers | `for c in $(docker ps -q); do docker inspect -f '{{.Name}} {{.HostConfig.NetworkMode}}' $c; done` | all on the `drone` network |
 | IMDS denied to bridge containers | `docker run --rm curlimages/curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'` | `000` (timeout) |

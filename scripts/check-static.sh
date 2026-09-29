@@ -57,27 +57,48 @@ fi
 
 # --- 2. The drone-deploy user's policy stays least-privilege ---------------
 # The deploy key is a long-lived static credential stored in Drone, so its
-# policy must never widen silently: exactly these actions, Allow only, and
-# every Resource a reference to the frontend bucket or distribution (never a
-# literal, never "*"). A deliberate change updates EXPECTED_ACTIONS here.
+# policy must never widen silently. The whole resource block is parsed (not
+# line prefixes, so one-line statements and multi-line lists count too):
+#   - every IAM action string anywhere in it is in EXPECTED_ACTIONS, and all
+#     of them are present
+#   - every Effect is "Allow"
+#   - no NotAction / NotResource / Principal anywhere
+#   - every Resource value is the frontend bucket, its objects, or the
+#     frontend distribution, referenced by resource address (never a literal)
+# A deliberate change updates EXPECTED_ACTIONS here, reviewed as its own decision.
 EXPECTED_ACTIONS="cloudfront:CreateInvalidation s3:DeleteObject s3:GetObject s3:ListBucket s3:PutObject"
 policy_block=$(extract_block '^resource[ \t]+"aws_iam_user_policy"[ \t]+"drone_deploy"[ \t]*{' <iam.tf)
 if [ -z "$policy_block" ]; then
   bad 'resource "aws_iam_user_policy" "drone_deploy" { ... } not found in iam.tf'
 else
-  actions=$(printf '%s\n' "$policy_block" | grep -E '^[ \t]*Action[ \t]*=' | grep -oE '"[^"]+"' | tr -d '"' | sort -u | tr '\n' ' ' | sed 's/ $//')
-  effects=$(printf '%s\n' "$policy_block" | grep -E '^[ \t]*Effect[ \t]*=' | grep -oE '"[^"]+"' | tr -d '"' | sort -u | tr '\n' ' ' | sed 's/ $//')
-  bad_resources=$(printf '%s\n' "$policy_block" | grep -E '^[ \t]*Resource[ \t]*=' |
-    grep -vE '^[ \t]*Resource[ \t]*=[ \t]*("\$\{)?aws_(s3_bucket|cloudfront_distribution)\.frontend\.arn(\}/\*")?[ \t]*$' || true)
-  if [ "$actions" != "$EXPECTED_ACTIONS" ]; then
-    bad "aws_iam_user_policy.drone_deploy actions changed: expected [$EXPECTED_ACTIONS], got [$actions]. A deliberate change is its own reviewed decision; update EXPECTED_ACTIONS here with it."
-  elif [ "$effects" != "Allow" ]; then
-    bad "aws_iam_user_policy.drone_deploy has statement effects [$effects]; expected Allow only"
-  elif [ -n "$bad_resources" ]; then
-    bad "aws_iam_user_policy.drone_deploy has a Resource that is not the frontend bucket/distribution reference:
-${bad_resources}"
+  verdict=$(EXPECTED="$EXPECTED_ACTIONS" python3 -c '
+import os, re, sys
+b = sys.stdin.read()
+expected = set(os.environ["EXPECTED"].split())
+problems = []
+if re.search(r"\b(NotAction|NotResource|Principal|NotPrincipal)\b", b):
+    problems.append("uses NotAction/NotResource/Principal")
+actions = set(re.findall(r"\"([a-z0-9-]+:[A-Za-z0-9*]+)\"", b))
+if actions != expected:
+    problems.append("actions [%s], expected [%s]" % (" ".join(sorted(actions)), " ".join(sorted(expected))))
+effects = set(re.findall(r"\bEffect\s*=\s*\"([A-Za-z]+)\"", b))
+if effects != {"Allow"}:
+    problems.append("effects [%s], expected [Allow]" % " ".join(sorted(effects)))
+allowed = {"aws_s3_bucket.frontend.arn", "\"${aws_s3_bucket.frontend.arn}/*\"", "aws_cloudfront_distribution.frontend.arn"}
+res = re.findall(r"\bResource\s*=\s*(\[[^\]]*\]|\"[^\"]*\"|[A-Za-z0-9_.]+)", b)
+if not res:
+    problems.append("no Resource found")
+for r in res:
+    items = re.findall(r"\"[^\"]*\"|[A-Za-z0-9_.]+", r[1:-1]) if r.startswith("[") else [r]
+    for it in items:
+        if it not in allowed:
+            problems.append("resource %s is not a frontend bucket/distribution reference" % it)
+print("; ".join(problems) if problems else "OK")
+' <<<"$policy_block" || echo "parse error")
+  if [ "$verdict" = "OK" ]; then
+    ok "aws_iam_user_policy.drone_deploy is least-privilege: [$EXPECTED_ACTIONS] on the frontend bucket/distribution only"
   else
-    ok "aws_iam_user_policy.drone_deploy is least-privilege: [$actions] on the frontend bucket/distribution only"
+    bad "aws_iam_user_policy.drone_deploy: $verdict"
   fi
 fi
 

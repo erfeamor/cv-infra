@@ -82,34 +82,51 @@ Use this after a host replacement (the database goes with the root disk), or to 
 
 ## Procedure B: rotate the deploy key
 
-The order matters. **Authenticate the new key, reseed, set the old key Inactive, prove a deploy, and only then delete.** Deletion is the one irreversible step.
+The order matters. **Create the new key alongside the old one, authenticate it, reseed, set the old key Inactive, prove a deploy, and only then delete the old key.** Deletion is the one irreversible step. This is the sequence T-008 ran live.
 
-1. **Pre-check:** the user must have exactly one key. IAM allows two, so a leftover makes the apply fail with LimitExceeded:
+Don't use `terraform apply -replace=aws_iam_access_key.drone_deploy`. The resource has no `create_before_destroy`, so `-replace` deletes the old key *before* creating the new one: no overlap, deploys break until the reseed, and there's no old key left to fall back to. Instead, **release the current key from Terraform's management** so the next apply creates a second key beside it.
+
+1. **Pre-check:** the user must have exactly one key. IAM allows at most two, so a leftover makes step 3 fail with LimitExceeded:
    ```bash
-   aws iam list-access-keys --user-name cv-project-drone-deploy --query 'length(AccessKeyMetadata)'
+   aws iam list-access-keys --user-name cv-project-drone-deploy --query 'length(AccessKeyMetadata)'   # 1
    ```
-2. **Back up state** (`../../CLAUDE.md` convention), then create the new key by replacing the Terraform resource. Use a gitignored plan name, and delete it afterwards:
+2. **Back up state** (`../../CLAUDE.md` convention), then forget the current key in state. It keeps working in AWS; Terraform just stops managing it:
    ```bash
-   terraform plan -replace=aws_iam_access_key.drone_deploy -out=rotate.tfplan && terraform apply rotate.tfplan && rm -f rotate.tfplan
+   D=~/.local/share/cv-infra-state-backups/$(date +%F); ( umask 077; mkdir -p "$D" ); chmod 700 "$D"
+   ( umask 077; terraform state pull > "$D/pre-key-rotation.tfstate" )
+   OLD=$(terraform state show -no-color aws_iam_access_key.drone_deploy | awk -F'"' '/^ *id *=/{print $2; exit}')
+   terraform state rm aws_iam_access_key.drone_deploy
    ```
-   Note: `-replace` destroys the Terraform-managed key and creates a new one, so there's no overlap window. For zero-downtime rotation, instead add a second key resource temporarily, then run steps 3–6 and remove the old resource.
-3. **Authenticate the new key** before touching Drone. Read the values into variables; never print them:
+3. **Create the new key.** The apply creates a new `aws_iam_access_key.drone_deploy` and updates both SSM parameters to it. Use a gitignored plan name and delete it afterwards:
+   ```bash
+   terraform plan -out=rotate.tfplan && terraform apply rotate.tfplan && rm -f rotate.tfplan
+   NEW=$(terraform state show -no-color aws_iam_access_key.drone_deploy | awk -F'"' '/^ *id *=/{print $2; exit}')
+   aws iam list-access-keys --user-name cv-project-drone-deploy --query 'AccessKeyMetadata[].[AccessKeyId,Status]' --output text   # both, both Active
+   ```
+4. **Authenticate the new key** before touching Drone. Read the values into variables; never print them:
    ```bash
    K=$(aws ssm get-parameter --with-decryption --name /cv-project/dev/deploy/drone-deploy/access-key-id --query Parameter.Value --output text)
    S=$(aws ssm get-parameter --with-decryption --name /cv-project/dev/deploy/drone-deploy/secret-access-key --query Parameter.Value --output text)
+   [ "$K" = "$NEW" ] || echo "SSM does not hold the new key" >&2
    env -u AWS_PROFILE -u AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID="$K" AWS_SECRET_ACCESS_KEY="$S" \
      AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null aws sts get-caller-identity --query Arn --output text
    unset K S     # must print …:user/cv-project-drone-deploy
    ```
-4. **Reseed Drone** (Procedure A, step 5).
-5. **Deactivate the old key** (reversible). Derive its id by elimination, never by eye:
+5. **Reseed Drone** (Procedure A, step 5).
+6. **Deactivate the old key.** This is reversible. `OLD` came from state in step 2; cross-check it by elimination, never by eye:
    ```bash
-   NEW=$(terraform state show -no-color aws_iam_access_key.drone_deploy | awk -F'"' '/^ *id *=/{print $2; exit}')
-   OLD=$(aws iam list-access-keys --user-name cv-project-drone-deploy --query "AccessKeyMetadata[?AccessKeyId!='$NEW'].AccessKeyId" --output text)
-   [ "$(echo $OLD | wc -w)" = 1 ] && aws iam update-access-key --user-name cv-project-drone-deploy --access-key-id "$OLD" --status Inactive
+   CHECK=$(aws iam list-access-keys --user-name cv-project-drone-deploy --query "AccessKeyMetadata[?AccessKeyId!='$NEW'].AccessKeyId" --output text)
+   [ -n "$OLD" ] && [ "$CHECK" = "$OLD" ] || { echo "old key id mismatch: state=$OLD list=$CHECK" >&2; exit 1; }
+   aws iam update-access-key --user-name cv-project-drone-deploy --access-key-id "$OLD" --status Inactive
    ```
-6. **Prove a real deploy** is green (Procedure A, step 6). It can only succeed on the new key now. `get-access-key-last-used` lags, so the green deploy with the old key Inactive is the proof.
-7. Delete the old key, then confirm exactly one remains. Rollback before this step is reactivating the old key.
+7. **Prove a real deploy** is green (Procedure A, step 6). It can only succeed on the new key now. `get-access-key-last-used` lags, so the green deploy with the old key Inactive is the proof.
+   **Rollback (up to here):** reactivate the old key (`--status Active`), then fix the new key and reseed. The old key's secret was never in SSM or Drone after step 5, so "rollback" means restoring whatever else used it, not Drone.
+8. **Delete the old key**, which is irreversible, then confirm exactly one key remains:
+   ```bash
+   aws iam delete-access-key --user-name cv-project-drone-deploy --access-key-id "$OLD"
+   aws iam list-access-keys --user-name cv-project-drone-deploy --query 'length(AccessKeyMetadata)'   # 1
+   terraform plan    # No changes
+   ```
 
 ## Pitfalls seen in practice
 

@@ -21,6 +21,17 @@ Two independent signals must agree before the instance is stopped:
 CPU is a VETO, never the sole signal — the failure mode ruling 2 rejected was
 inferring idleness FROM CPU, which kills a build that is waiting on a download.
 Here a low-CPU build is still protected by signal 1.
+
+T-034 finding 2026-09-27 added a THIRD, unconditional check ahead of both: a
+post-start grace period. A single post-boot CloudWatch datapoint (low boot
+CPU, before anything has actually started building) was observed satisfying
+signal 2 within seconds of a cold start, stopping the box while a just-queued
+Drone build sat at "pending" with nowhere to run. No amount of tuning signals
+1/2 fixes that — the box must simply be left alone for a while after every
+start, full stop, before either signal is trusted at all. Deliberately NOT a
+Drone busy check: T-034 H1 settled on CPU alone covering Drone's builds,
+deferring an actual Drone-queue signal (same SQLite-token limitation as
+above).
 """
 
 import datetime
@@ -47,6 +58,7 @@ JENKINS_PASSWORD_PARAM = os.environ["JENKINS_PASSWORD_PARAM"]
 IDLE_WINDOW_MINUTES = int(os.environ.get("IDLE_WINDOW_MINUTES", "20"))
 CPU_BUSY_PERCENT = float(os.environ.get("CPU_BUSY_PERCENT", "10"))
 KEEPALIVE_TAG = os.environ.get("KEEPALIVE_TAG", "CIKeepAlive")
+POST_START_GRACE_MINUTES = int(os.environ.get("POST_START_GRACE_MINUTES", "15"))
 HTTP_TIMEOUT_SECONDS = 5
 
 _password_cache = None
@@ -125,6 +137,13 @@ def cpu_quiet_over_window():
     return True
 
 
+def within_post_start_grace(launch_time, grace_minutes, now=None):
+    """True while the instance is still within grace_minutes of its own
+    LaunchTime. now is injectable so tests never depend on wall-clock time."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return now < launch_time + datetime.timedelta(minutes=grace_minutes)
+
+
 def handler(event, context):
     try:
         instance = ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]
@@ -144,6 +163,12 @@ def handler(event, context):
         # be set and cleared from the console in seconds without an apply.
         log.info("%s=true; leaving instance running", KEEPALIVE_TAG)
         return {"stopped": False, "reason": "keepalive tag set"}
+
+    if within_post_start_grace(instance["LaunchTime"], POST_START_GRACE_MINUTES):
+        # T-034: unconditional, ahead of both other signals -- see the module
+        # docstring. A boot-time CPU datapoint must never count as "idle".
+        log.info("within %d-minute post-start grace; leaving instance running", POST_START_GRACE_MINUTES)
+        return {"stopped": False, "reason": "post-start grace"}
 
     if not cpu_quiet_over_window():
         return {"stopped": False, "reason": "cpu busy"}

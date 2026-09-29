@@ -19,9 +19,15 @@ bash scripts/check-static.sh      # invariants plan-time `terraform test` can't 
 bash bootstrap/check-static.sh    # the state bucket keeps prevent_destroy
 bash scripts/tests/run-drone-reseed-tests.sh   # T-008: offline harness for scripts/drone-reseed-secrets.sh
                                                 # (stubs `aws` and the Drone API; no AWS/network needed)
+python3 -m unittest discover -s lambda -p 'test_*.py'   # T-034: offline unit tests for lambda/ci_doorbell
+                                                          # and lambda/ci_reaper -- boto3/botocore are stubbed
+                                                          # in lambda/testsupport.py (neither is installed here
+                                                          # on purpose: these Lambdas ship as a bare index.py,
+                                                          # no vendored deps), and every urllib call is
+                                                          # monkeypatched per test. No AWS/network needed.
 ```
 
-`scripts/check-static.sh`, `bootstrap/check-static.sh` and `scripts/tests/run-drone-reseed-tests.sh` are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
+`scripts/check-static.sh`, `bootstrap/check-static.sh`, `scripts/tests/run-drone-reseed-tests.sh` and the `lambda/` unit tests are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
 
 Operational procedures live in `docs/runbooks/`: `drone.md` (Drone rebuild, repo secrets, deploy-key rotation, pausing the reaper) and `ci-host-replace.md` (replacing the CI host and verifying the new one).
 

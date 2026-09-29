@@ -215,4 +215,35 @@ else
   ok "'cloud-init status --wait' runs only in ci.tf's SSM provisioning path, not in the shared script"
 fi
 
+# --- 8. Any self-invoke grant is scoped to the doorbell's own ARN only -----
+# T-034: the async redelivery path self-invokes (lambda:InvokeFunction).
+# `terraform test` cannot check the Resource value itself -- the rendered
+# policy JSON embeds this function's own computed ARN, unknown under
+# `command = plan` (same class of limitation ci-on-demand.tf documents for
+# the EC2 action lists). Any resource file may carry a lambda:InvokeFunction
+# grant, so every .tf file is scanned, matching the same
+# `Action = ["..."]` / next-non-blank-line `Resource = ...` shape check #3
+# already uses for ssm:GetParameter.
+invoke_violations=""
+for tf_file in *.tf; do
+  v=$(awk '
+    function strip(l,  h) { h = index(l, "#"); if (h > 0) l = substr(l, 1, h - 1); return l }
+    {
+      line = strip($0)
+      if (line ~ /Action[ \t]*=[ \t]*\["lambda:InvokeFunction"\][ \t]*$/) { want = 1; next }
+      if (!want || line ~ /^[ \t]*$/) next
+      want = 0
+      if (line !~ /^[ \t]*Resource[ \t]*=[ \t]*aws_lambda_function\.ci_doorbell\.arn[ \t]*$/) print line
+    }
+  ' "$tf_file")
+  [ -n "$v" ] && invoke_violations="${invoke_violations}${tf_file}: ${v}
+"
+done
+if [ -n "$invoke_violations" ]; then
+  bad "a lambda:InvokeFunction grant does not scope Resource to aws_lambda_function.ci_doorbell.arn exactly:
+${invoke_violations}"
+else
+  ok "every lambda:InvokeFunction grant is scoped to aws_lambda_function.ci_doorbell.arn"
+fi
+
 exit $fail

@@ -128,6 +128,43 @@ Don't use `terraform apply -replace=aws_iam_access_key.drone_deploy`. The resour
    terraform plan    # No changes
    ```
 
+## T-034: the doorbell-signed hook on cv-admin-react, and manual redelivery
+
+Drone's own hook on `erfeamor/cv-admin-react` (config URL ending in `/hook`, straight to the CI host) is untouched — Drone verifies each delivery against its own per-repo secret, so nothing signed by the doorbell could ever pass that check, and this task never tries. Instead a **second** hook is added, signed with the doorbell's own webhook secret, so a push while the host is stopped wakes it and, once Drone answers `/healthz`, redelivers whatever of Drone's own hook deliveries failed at or after the wake. This second hook is GitHub-side config; Terraform creates the Lambda and its secret but cannot create a hook on a repo it has no admin token for (same reasoning as `github_pat_ci`, ci.tf manual step 5).
+
+### One-time: add the doorbell-signed hook
+
+1. Get the Function URL and the shared secret (never paste the secret anywhere but this form):
+   ```bash
+   terraform output -raw ci_doorbell_url
+   # the secret is var.github_webhook_secret, from terraform.tfvars — read it the same way you'd read any other tfvars value, never echo it to a terminal you'll paste elsewhere
+   ```
+2. On GitHub: `erfeamor/cv-admin-react` → **Settings → Webhooks → Add webhook**.
+   - **Payload URL:** the Function URL from step 1.
+   - **Content type:** `application/json`.
+   - **Secret:** the same `github_webhook_secret` value already used by the Jenkins-repo hooks (ci.tf manual step 5) — **not** a new value; the doorbell only knows one HMAC secret across every repo it fronts.
+   - **Events:** `push` only (this hook exists solely to wake the box and trigger redelivery; it carries no payload the doorbell acts on beyond the repo name).
+3. GitHub sends a `ping` to the new hook immediately — confirm it shows a green check in the Webhooks list. The doorbell answers `ping` without starting anything (see `lambda/ci_doorbell/index.py`).
+4. Leave Drone's original hook exactly as it is. `erfeamor/cv-admin-react` now carries **two** hooks: Drone's own (build trigger) and this one (wake + redeliver).
+
+### Manual redelivery fallback
+
+The async task gives up waiting for Drone's `/healthz` after `HEALTHZ_TIMEOUT_SECONDS` (480s / 8 min) and logs an error instead of redelivering — check CloudWatch Logs on `cv-project-ci-doorbell` for `"skipping redelivery"` if a push to `cv-admin-react` woke the host but no build appeared. Redeliver by hand once the host is confirmed up (`/healthz` returns 200):
+
+```bash
+# On erfeamor/cv-admin-react: Settings -> Webhooks -> the hook whose config URL
+# ends in /hook (Drone's own, NOT the doorbell-signed one) -> Recent Deliveries
+# -> find the failed delivery from around the time of the push -> "Redeliver".
+```
+
+Or via the API, using a token with `repository_hooks` write on this repo (the fine-grained `github_hooks_token` works; so does a personal token with equivalent scope):
+
+```bash
+gh api -X POST "repos/erfeamor/cv-admin-react/hooks/<hook_id>/deliveries/<delivery_id>/attempts"
+```
+
+`<hook_id>` and `<delivery_id>` come from `gh api repos/erfeamor/cv-admin-react/hooks` and that hook's `/deliveries` — the same two calls the doorbell itself makes (`find_drone_hook_id` / `redeliver_failed_deliveries` in `lambda/ci_doorbell/index.py`).
+
 ## Pitfalls seen in practice
 
 - Drone's API omits `false` booleans, so the `pull_request` flags on secrets read back as unset. The reseed script sends them explicitly `false`.

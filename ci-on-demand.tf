@@ -56,6 +56,29 @@ locals {
     "ec2:RunInstances",
     "ec2:*",
   ]
+
+  # T-034 H1 correction: the doorbell self-invokes (InvocationType=Event)
+  # rather than standing up a second Lambda for the slow redeliver path --
+  # named here for the same reason as the EC2 action lists above: a reviewer
+  # sees the whole grant in one line, and `terraform test` can assert on it
+  # even though the rendered policy JSON (which embeds this function's own
+  # computed ARN) cannot be jsondecode'd under `command = plan`.
+  ci_doorbell_lambda_actions = ["lambda:InvokeFunction"]
+
+  # Named apart from the function resource so the resource's own
+  # `function_name` argument and this env var can both reference it without
+  # aws_lambda_function.ci_doorbell.function_name being a self-reference
+  # (Terraform rejects a resource referencing its own attribute from within
+  # its own body, even when — as here — the value is a literal known at plan
+  # time, not a computed one).
+  ci_doorbell_function_name = "${var.project_name}-ci-doorbell"
+
+  # H1: redelivery (not forwarding) applies to this repo only. Drone
+  # verifies each webhook against a per-repo secret only it and GitHub know,
+  # so nothing this handler could send Drone directly would pass that check
+  # anyway — the Jenkins repos keep ruling 1's periodicFolderTrigger
+  # discovery and never touch this path.
+  ci_redeliver_repos = ["erfeamor/cv-admin-react"]
 }
 
 data "archive_file" "ci_doorbell" {
@@ -120,6 +143,21 @@ resource "aws_iam_role_policy" "ci_doorbell" {
         Resource = aws_ssm_parameter.github_webhook_secret.arn
       },
       {
+        # T-034: the fine-grained hooks token, scoped to this single
+        # parameter -- see ssm.tf for why it lives outside ci/*.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = aws_ssm_parameter.github_hooks_token.arn
+      },
+      {
+        # T-034 H1 correction: the async redelivery path self-invokes.
+        # Resource-scoped to this function's OWN arn only -- a compromised
+        # doorbell gains nothing by this grant beyond re-queuing itself.
+        Effect   = "Allow"
+        Action   = local.ci_doorbell_lambda_actions
+        Resource = aws_lambda_function.ci_doorbell.arn
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.ci_doorbell.arn}:*"
@@ -129,19 +167,31 @@ resource "aws_iam_role_policy" "ci_doorbell" {
 }
 
 resource "aws_lambda_function" "ci_doorbell" {
-  function_name    = "${var.project_name}-ci-doorbell"
-  role             = aws_iam_role.ci_doorbell.arn
-  handler          = "index.handler"
-  runtime          = "python3.12"
-  timeout          = 10
+  function_name = local.ci_doorbell_function_name
+  role          = aws_iam_role.ci_doorbell.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  # T-034: this same function runs the async wake+redeliver task (self
+  # invocation), which waits up to HEALTHZ_TIMEOUT_SECONDS (8 min) for
+  # Drone's own /healthz before redelivering. 540s (9 min) leaves a minute
+  # of headroom for the GitHub calls after healthz succeeds. The webhook
+  # entry point itself still answers in low single-digit seconds -- this
+  # timeout is a ceiling, not how long a normal invocation runs.
+  timeout          = 540
   filename         = data.archive_file.ci_doorbell.output_path
   source_code_hash = data.archive_file.ci_doorbell.output_base64sha256
 
   environment {
     variables = {
-      INSTANCE_ID          = aws_instance.drone.id
-      WEBHOOK_SECRET_PARAM = aws_ssm_parameter.github_webhook_secret.name
-      ALLOWED_REPOS        = join(",", local.ci_allowed_repos)
+      INSTANCE_ID                   = aws_instance.drone.id
+      WEBHOOK_SECRET_PARAM          = aws_ssm_parameter.github_webhook_secret.name
+      ALLOWED_REPOS                 = join(",", local.ci_allowed_repos)
+      REDELIVER_REPOS               = join(",", local.ci_redeliver_repos)
+      GITHUB_HOOKS_TOKEN_PARAM      = aws_ssm_parameter.github_hooks_token.name
+      DRONE_HEALTHZ_URL             = "http://${aws_eip.drone.public_ip}/healthz"
+      HEALTHZ_TIMEOUT_SECONDS       = "480"
+      HEALTHZ_POLL_INTERVAL_SECONDS = "15"
+      SELF_FUNCTION_NAME            = local.ci_doorbell_function_name
     }
   }
 

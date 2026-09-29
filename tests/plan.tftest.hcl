@@ -49,6 +49,7 @@ variables {
   jenkins_admin_password     = "test-jenkins-password-not-real"
   github_pat_ci              = "test-github-pat-not-real"
   github_webhook_secret      = "test-webhook-secret-not-real"
+  github_hooks_token         = "test-hooks-token-not-real"
 
   # T-011: no default on budget_credit_grant_amount by design (see
   # variables.tf) -- test value only, never a number that could pass for a
@@ -802,6 +803,60 @@ run "ci_on_demand" {
   assert {
     condition     = aws_lambda_function_url.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
     error_message = "The Function URL must be attached to the doorbell Lambda -- an API Gateway would add cost this task cannot justify"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-034 H1 correction -- the doorbell redelivers Drone's own (previously
+# GitHub-signed) webhook deliveries for erfeamor/cv-admin-react instead of
+# forwarding the payload itself, and self-invokes (InvocationType=Event) to
+# do the slow work (start the box, wait for /healthz, call GitHub) outside
+# GitHub's 10-second webhook budget. Cases 12-14 of the plan; case 13's IAM
+# resource scoping (Resource = aws_lambda_function.ci_doorbell.arn) is NOT
+# checkable here -- same unknown-until-apply limitation as every other IAM
+# policy assertion in this file (the ARN is computed) -- and is covered by
+# scripts/check-static.sh instead (case 15).
+# ---------------------------------------------------------------------------
+run "t034_doorbell_redelivery" {
+  command = plan
+
+  # --- Case 12: the hooks token lives outside ci/*, as a SecureString ------
+  assert {
+    condition     = aws_ssm_parameter.github_hooks_token.type == "SecureString"
+    error_message = "The GitHub hooks token must be a SecureString"
+  }
+
+  assert {
+    condition     = startswith(aws_ssm_parameter.github_hooks_token.name, "/${var.project_name}/${var.environment}/doorbell/")
+    error_message = "github_hooks_token must live outside ci/* -- the CI host's role only reads ci/*, and this token must stay unreadable from a build container running on it (same reasoning as drone_deploy's key, iam.tf)"
+  }
+
+  # --- Case 13: self-invoke is InvokeFunction only, and only the doorbell's
+  # own actions grow to include it (never the reaper's) ---------------------
+  assert {
+    condition     = join(",", local.ci_doorbell_lambda_actions) == "lambda:InvokeFunction"
+    error_message = "The doorbell's self-invoke grant must be InvokeFunction only"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["GITHUB_HOOKS_TOKEN_PARAM"] == aws_ssm_parameter.github_hooks_token.name
+    error_message = "The doorbell must read the hooks token from SSM by name, never from a literal"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["SELF_FUNCTION_NAME"] == aws_lambda_function.ci_doorbell.function_name
+    error_message = "The doorbell must self-invoke by its OWN function name -- a literal or mismatched name would either fail at runtime or (worse) target a different function"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["REDELIVER_REPOS"] == "erfeamor/cv-admin-react"
+    error_message = "Only erfeamor/cv-admin-react gets the redeliver path (H1) -- Drone verifies each webhook against its own per-repo secret, so nothing this handler could send it directly would pass that check, and the Jenkins repos already have periodicFolderTrigger discovery"
+  }
+
+  # --- Case 14: the waiting invocation's timeout ----------------------------
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.timeout >= 540
+    error_message = "The doorbell self-invokes to wait up to 8 minutes (480s) for Drone's /healthz before redelivering; the function's own timeout must be at least 540s (9 min) or Lambda kills that invocation mid-wait, silently dropping the redelivery"
   }
 }
 

@@ -1162,6 +1162,15 @@ run "t034_phase2_dns_tls" {
   # meta-argument, like aws_instance.drone's own ignore_changes elsewhere in
   # this file) -- covered by scripts/check-static.sh check 10 instead.
 
+  # Review round 1, finding 4: without allow_overwrite = true, creating this
+  # record would fail outright if one already existed at this name/type
+  # (e.g. a manual record from before Terraform managed it) -- UPSERT
+  # semantics all the way down, matching the boot updater's own.
+  assert {
+    condition     = aws_route53_record.ci.allow_overwrite == true
+    error_message = "aws_route53_record.ci must set allow_overwrite = true"
+  }
+
   # --- Review round 1, finding 5: the read-only IAM additions --------------
   assert {
     condition     = join(",", local.ci_dns_read_actions) == "route53:ListResourceRecordSets"

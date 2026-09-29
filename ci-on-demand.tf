@@ -23,9 +23,14 @@
 #     unauthenticated endpoint that can start instances is a cost-DoS against a
 #     finite, expiring credit pot — that check is the whole security boundary.
 #
-# The EIP is what makes any of this possible: aws_eip.drone (ci.tf) means the
-# public IP survives a stop/start, so the webhook URL and Drone's OAuth callback
-# stay valid across cycles. Do not release it to save the ~$3.65/mo.
+# T-034 phase 2 released the EIP that used to back this paragraph's claim --
+# there is no more aws_eip.drone (ci.tf; scripts/check-static.sh check 13
+# pins its absence). Stability across a stop/start now comes from
+# var.ci_hostname instead (dns.tf's Route 53 record, kept current on every
+# boot by scripts/ci-dns-updater.sh) -- the webhook URL (the doorbell's own
+# Function URL, unaffected either way) and Drone's OAuth callback
+# (https://ci.erfeamor.com/login) both address the box by that name, never
+# by its public IP directly, so a different IP on every cycle is fine.
 
 locals {
   ci_instance_arn = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/${aws_instance.drone.id}"

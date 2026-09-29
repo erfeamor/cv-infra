@@ -46,8 +46,12 @@
 locals {
   # A plain string rather than a reference to the object, so that the IAM
   # policy and user_data below do not inherit the object's unknown-until-apply
-  # status -- local.jenkins_provision_script embeds aws_eip.drone.public_ip, so
-  # anything derived from the object cannot be asserted under `command = plan`.
+  # status. Pre-T-034-phase-2 this mattered doubly, because
+  # local.jenkins_provision_script also embedded aws_eip.drone.public_ip; it
+  # now renders from var.ci_hostname and a mocked data source instead (both
+  # known under `command = plan`), but the object's own ETag/version-id
+  # attributes are still genuinely unknown-until-apply regardless, so the
+  # plain-string key stays.
   jenkins_provision_key = "jenkins-provision.sh"
 
   # Named so `terraform test` can assert on it: the rendered policy document

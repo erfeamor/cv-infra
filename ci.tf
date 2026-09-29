@@ -3,12 +3,15 @@
 # than a third box. GitHub must reach it for webhooks and Drone's OAuth
 # callback, so it needs a stable address GitHub can keep pointing at across
 # stop/start cycles (T-019). T-034 phase 1 kept that stable via an Elastic
-# IP; phase 2 replaces the EIP with a DNS name (var.ci_hostname, dns.tf) that
-# the host itself keeps current on every boot (scripts/ci-dns-updater.sh) --
-# see this commit's own note on aws_eip.drone below for exactly when the EIP
-# stops existing. A reverse proxy container (Caddy, T-033) fronts both
-# services on the existing 80/443 ingress, terminating TLS -- see
-# templates/jenkins-provision.sh.
+# IP; phase 2 (this commit, the second of its PR) REMOVED the EIP -- there is
+# no more aws_eip.drone or aws_eip_association.drone anywhere in this module
+# (scripts/check-static.sh check 13 pins that). Stability now comes from a
+# DNS name instead (var.ci_hostname, dns.tf) that the host itself keeps
+# current on every boot (scripts/ci-dns-updater.sh) -- the public IP is
+# different on every stop/start cycle now, which is fine, because nothing
+# GitHub-facing addresses it directly any more. A reverse proxy container
+# (Caddy, T-033) fronts both services on the existing 80/443 ingress,
+# terminating TLS -- see templates/jenkins-provision.sh.
 #
 # Manual steps Terraform cannot do:
 #   1. Create a GitHub OAuth app (org erfeamor) with authorization callback
@@ -85,23 +88,6 @@ locals {
     # (scripts/tests/run-ci-dns-updater-tests.sh) are always the same bytes.
     dns_updater_script = file("${path.module}/scripts/ci-dns-updater.sh")
   })
-}
-
-# T-034 phase 2, COMMIT 1 of 2: this resource, aws_eip_association.drone
-# below, and dns.tf's aws_route53_record.ci.records (its only remaining
-# reference) are ALL removed together in the second commit of this same PR,
-# once this commit is applied and proven live -- see that commit's own diff
-# for what replaces the `records` reference. Not removed here because
-# dns.tf's record needs a real, correct initial value (this EIP's current
-# address) for its FIRST apply to create a record that already resolves
-# correctly, before scripts/ci-dns-updater.sh has ever run.
-resource "aws_eip" "drone" {
-  domain = "vpc"
-
-  tags = {
-    Name    = "${var.project_name}-drone"
-    Project = var.project_name
-  }
 }
 
 resource "aws_instance" "drone" {
@@ -250,11 +236,6 @@ resource "aws_instance" "drone" {
     Name    = "${var.project_name}-drone"
     Project = var.project_name
   }
-}
-
-resource "aws_eip_association" "drone" {
-  instance_id   = aws_instance.drone.id
-  allocation_id = aws_eip.drone.id
 }
 
 # Stages the rendered script on disk (gitignored, see .gitignore) so the
@@ -418,9 +399,15 @@ resource "null_resource" "jenkins_provision" {
   }
 
   depends_on = [
-    aws_eip_association.drone,
     aws_ssm_parameter.jenkins_admin_password,
     aws_ssm_parameter.github_pat_ci,
     local_file.jenkins_provision_script,
+    # Review round 1, finding 4: this script's own first action is
+    # `systemctl enable --now ci-dns-updater.service`, which calls Route 53
+    # using the instance role -- that grant, and the record it UPSERTs into,
+    # must both already exist before this SSM push runs, or the very first
+    # invocation fails (loudly, but still: no reason to race it).
+    aws_iam_role_policy.drone_dns_update,
+    aws_route53_record.ci,
   ]
 }

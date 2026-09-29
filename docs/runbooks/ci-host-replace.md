@@ -2,7 +2,9 @@
 
 Use this for any change that replaces `aws_instance.drone` (`../../ci.tf`), which runs Drone and Jenkins behind the `ci-proxy` container. Examples: an AMI bump, an instance-type or root-volume change that forces replacement, or recovering a broken host.
 
-A replacement **destroys the root disk**, and with it Drone's database and `JENKINS_HOME`. Both come back by rebuild: Drone by [drone.md](drone.md) Procedure A, and Jenkins by its provisioning code. The Elastic IP stays, so the GitHub webhooks and Drone's OAuth callback don't change.
+A replacement **destroys the root disk**, and with it Drone's database and `JENKINS_HOME`. Both come back by rebuild: Drone by [drone.md](drone.md) Procedure A, and Jenkins by its provisioning code.
+
+**T-034 phase 2: there is no more Elastic IP.** The GitHub webhooks and Drone's OAuth callback are registered against `https://<var.ci_hostname>` (`ci.erfeamor.com`), not a raw address, so they don't need re-registering across a replacement. What DOES need to happen: the new instance gets a fresh public IP on first boot, and `scripts/ci-dns-updater.sh` (a systemd oneshot unit, `Before=docker.service`, written by `templates/jenkins-provision.sh`) UPSERTs `dns.tf`'s A record to that new IP before anything tries to serve a request. Verify that ran (see "Post-replace verification" below) -- a replacement that skips it leaves DNS pointed at the old, now-terminated instance's address until the next boot happens to fix it.
 
 ## Things to know before you plan
 
@@ -23,7 +25,6 @@ A replacement **destroys the root disk**, and with it Drone's database and `JENK
    ```
    A replacement always moves these, all downstream of the new instance id:
    - `aws_instance.drone`: replaced
-   - `aws_eip_association.drone`: replaced (re-points the same EIP)
    - `aws_iam_role_policy.ci_doorbell` and `aws_iam_role_policy.ci_reaper`: updated (they embed the instance ARN)
    - `aws_lambda_function.ci_doorbell` and `aws_lambda_function.ci_reaper`: updated (their `INSTANCE_ID` env)
    - `null_resource.jenkins_provision`: replaced (it re-provisions Jenkins onto the new host)
@@ -43,7 +44,8 @@ Run these on the host with `aws ssm send-command` (AWS-RunShellScript) or an SSM
 
 | Check | Command (on the host unless noted) | Expect |
 |---|---|---|
-| Instance shape | *(operator)* `aws ec2 describe-instances --instance-ids "$I" --query 'Reservations[0].Instances[0].[ImageId,MetadataOptions.HttpTokens,MetadataOptions.HttpPutResponseHopLimit,PublicIpAddress]' --output text` | the expected AMI, `required`, `1`, the same EIP |
+| Instance shape | *(operator)* `aws ec2 describe-instances --instance-ids "$I" --query 'Reservations[0].Instances[0].[ImageId,MetadataOptions.HttpTokens,MetadataOptions.HttpPutResponseHopLimit,PublicIpAddress]' --output text` | the expected AMI, `required`, `1`, a (new, unpredictable) public IP -- there is no EIP to preserve any more |
+| DNS caught up with the new IP | *(operator)* `dig +short ci.erfeamor.com` compared against the `PublicIpAddress` above; or on the host, `systemctl status ci-dns-updater.service` | they match; the unit's last run is `active (exited)`, status 0 |
 | Root volume | *(operator)* `V=$(aws ec2 describe-instances --instance-ids "$I" --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text); aws ec2 describe-volumes --volume-ids "$V" --query 'Volumes[0].[Size,VolumeType,Encrypted]' --output text` | the expected size, `gp3`, `True` |
 | No ECS leftovers | `docker ps -a \| grep -c ecs-agent`; `systemctl list-unit-files \| grep -ci ecs` | 0, 0 |
 | No host-network containers | `for c in $(docker ps -q); do docker inspect -f '{{.Name}} {{.HostConfig.NetworkMode}}' $c; done` | all on the `drone` network |

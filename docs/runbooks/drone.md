@@ -107,7 +107,7 @@ Don't use `terraform apply -replace=aws_iam_access_key.drone_deploy`. The resour
    ```bash
    K=$(aws ssm get-parameter --with-decryption --name /cv-project/dev/deploy/drone-deploy/access-key-id --query Parameter.Value --output text)
    S=$(aws ssm get-parameter --with-decryption --name /cv-project/dev/deploy/drone-deploy/secret-access-key --query Parameter.Value --output text)
-   [ "$K" = "$NEW" ] || echo "SSM does not hold the new key" >&2
+   [ "$K" = "$NEW" ] || { echo "SSM does not hold the new key; stop" >&2; unset K S; exit 1; }
    env -u AWS_PROFILE -u AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID="$K" AWS_SECRET_ACCESS_KEY="$S" \
      AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null aws sts get-caller-identity --query Arn --output text
    unset K S     # must print …:user/cv-project-drone-deploy

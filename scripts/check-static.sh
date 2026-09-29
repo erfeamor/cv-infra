@@ -78,7 +78,13 @@ expected = set(os.environ["EXPECTED"].split())
 problems = []
 if re.search(r"\b(NotAction|NotResource|Principal|NotPrincipal)\b", b):
     problems.append("uses NotAction/NotResource/Principal")
-actions = set(re.findall(r"\"([a-z0-9-]+:[A-Za-z0-9*]+)\"", b))
+actions = set()
+for v in re.findall(r"\bAction\s*=\s*(\[[^\]]*\]|\"[^\"]*\"|[A-Za-z0-9_.]+)", b):
+    items = re.findall(r"\"[^\"]*\"|[A-Za-z0-9_.]+", v[1:-1]) if v.startswith("[") else [v]
+    for it in items:
+        actions.add(it.strip("\""))
+if not actions:
+    problems.append("no Action found")
 if actions != expected:
     problems.append("actions [%s], expected [%s]" % (" ".join(sorted(actions)), " ".join(sorted(expected))))
 effects = set(re.findall(r"\bEffect\s*=\s*\"([A-Za-z]+)\"", b))

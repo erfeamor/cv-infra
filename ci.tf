@@ -12,7 +12,7 @@
 #   3. Seed the aws_access_key_id / aws_secret_access_key Drone secrets on
 #      cv-admin-react from SSM -- run scripts/drone-reseed-secrets.sh
 #      off-host, through an SSM port-forwarding tunnel to this box (T-008;
-#      see docs/drone-host-backup-and-cutover.md). Terraform creates the
+#      see docs/runbooks/drone.md). Terraform creates the
 #      key itself (aws_iam_access_key.drone_deploy, iam.tf) and its SSM
 #      copies (ssm.tf); it does not call the Drone API.
 #   4. Create the GitHub PAT for Jenkins (repo:status only, or fine-grained
@@ -95,7 +95,7 @@ resource "aws_instance" "drone" {
   # default. gp3 (not gp2) matches the rest of this module's convention, and
   # encrypted at rest with the AWS-managed EBS key -- no CMK needed for this
   # box. Re-measure after the first real build of every repo
-  # (docs/t007-ci-host-replace-runbook.md's post-replace verification): if
+  # (docs/runbooks/ci-host-replace.md's post-replace verification): if
   # usage exceeds 75% of this 20 GB, file a follow-up to resize rather than
   # letting it fill silently.
   #
@@ -111,7 +111,7 @@ resource "aws_instance" "drone" {
   # instance, because the live instance's actual root (30 GB, unencrypted --
   # the ECS AMI's default) is unencrypted and this config asks for encrypted.
   # `-replace` is still the command used (see
-  # docs/t007-ci-host-replace-runbook.md) for clarity/intent, but it is not
+  # docs/runbooks/ci-host-replace.md) for clarity/intent, but it is not
   # uniquely what forces the AMI onto the new host: ANY forced replacement,
   # by `-replace` or by this `encrypted` diff alone, builds the new resource
   # instance from the CURRENT config for every attribute, including ones
@@ -147,7 +147,7 @@ resource "aws_instance" "drone" {
   # runs `docker run --network host ...` gets the instance role's
   # credentials same as before this change. Verify the bridge-network case
   # is denied and record the host-network gap explicitly rather than
-  # claiming full protection (see docs/t007-ci-host-replace-runbook.md) --
+  # claiming full protection (see docs/runbooks/ci-host-replace.md) --
   # closing the host-network gap is T-005's work (docker socket / build
   # isolation), not this task's.
   metadata_options {
@@ -317,7 +317,7 @@ resource "null_resource" "jenkins_provision" {
       # part of) and this SSM copy would then time out on the same lock.
       # Sent here instead, as its own command BEFORE the script's content,
       # in a path that is never itself inside cloud-init.
-      # scripts/check-t007-static.sh's Check D pins this split.
+      # scripts/check-static.sh (check 7) pins this split.
       payload_file=$(mktemp)
       trap 'rm -f "$payload_file"' EXIT
       jq -n --rawfile s "${local_file.jenkins_provision_script.filename}" --arg iid "$instance_id" \

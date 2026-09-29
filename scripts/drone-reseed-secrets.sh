@@ -10,7 +10,7 @@
 #   2. Separately, open an SSM port-forwarding tunnel to the CI host's
 #      Drone server (`aws ssm start-session --document-name
 #      AWS-StartPortForwardingSession ...` -- see
-#      docs/drone-host-backup-and-cutover.md) and point DRONE_SERVER at the
+#      docs/runbooks/drone.md) and point DRONE_SERVER at the
 #      LOCAL end of that tunnel, e.g. http://127.0.0.1:8080. The Drone API
 #      is only ever called over that tunnel -- never over the open
 #      internet with these values.

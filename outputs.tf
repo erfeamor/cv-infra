@@ -42,5 +42,5 @@ output "ci_doorbell_url" {
 # T-008: deliberately NO output for aws_iam_access_key.drone_deploy (its
 # .id or .secret). It leaves this module only via the two SecureStrings in
 # ssm.tf; `terraform output` / `terraform show` must never be the thing
-# that prints it. scripts/check-t008-static.sh enforces that any future
+# that prints it. scripts/check-static.sh enforces that any future
 # output referencing that resource is marked sensitive = true.

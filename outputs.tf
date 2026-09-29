@@ -19,7 +19,9 @@ output "frontend_cloudfront_domain" {
 }
 
 output "drone_server_url" {
-  value = "http://${aws_eip.drone.public_ip}"
+  # T-034 phase 2: https, and the stable DNS name (local.ci_public_host,
+  # ci-on-demand.tf) instead of the EIP that phase 2's second commit removes.
+  value = "https://${local.ci_public_host}"
 }
 
 output "frontend_cloudfront_distribution_id" {

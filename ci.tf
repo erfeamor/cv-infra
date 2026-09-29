@@ -1,13 +1,21 @@
 # CI host for the demo: Drone (cv-admin-react) and, since T-002, Jenkins
 # (cv-domain-service, cv-database) co-located on the same instance rather
 # than a third box. GitHub must reach it for webhooks and Drone's OAuth
-# callback, so it keeps a stable Elastic IP. A reverse proxy container
-# fronts both services on the existing 80/443 ingress -- see
+# callback, so it needs a stable address GitHub can keep pointing at across
+# stop/start cycles (T-019). T-034 phase 1 kept that stable via an Elastic
+# IP; phase 2 replaces the EIP with a DNS name (var.ci_hostname, dns.tf) that
+# the host itself keeps current on every boot (scripts/ci-dns-updater.sh) --
+# see this commit's own note on aws_eip.drone below for exactly when the EIP
+# stops existing. A reverse proxy container (Caddy, T-033) fronts both
+# services on the existing 80/443 ingress, terminating TLS -- see
 # templates/jenkins-provision.sh.
 #
 # Manual steps Terraform cannot do:
 #   1. Create a GitHub OAuth app (org erfeamor) with authorization callback
-#      http://<drone_server_url>/login and put its credentials in tfvars.
+#      https://<ci_hostname>/login and put its credentials in tfvars. T-034
+#      phase 2: this callback moved from http://<the old EIP> to
+#      https://ci.erfeamor.com -- re-registering it on GitHub's OAuth app
+#      settings is a manual step Terraform cannot reach.
 #   2. After first login, activate cv-admin-react in the Drone UI.
 #   3. Seed the aws_access_key_id / aws_secret_access_key Drone secrets on
 #      cv-admin-react from SSM -- run scripts/drone-reseed-secrets.sh
@@ -66,12 +74,27 @@ locals {
     aws_region             = var.aws_region
     project_name           = var.project_name
     environment            = var.environment
-    server_host            = aws_eip.drone.public_ip
+    ci_hostname            = var.ci_hostname
+    route53_zone_id        = data.aws_route53_zone.ci.zone_id
     admin_username         = var.drone_admin_username
     jenkins_admin_username = var.jenkins_admin_username
+    # T-034 phase 2: scripts/ci-dns-updater.sh has zero Terraform `${...}`
+    # placeholders of its own (see its header) -- read verbatim via file(),
+    # not templatefile(), and interpolated whole into this template's own
+    # rendering below, so the deployed copy and the offline-tested copy
+    # (scripts/tests/run-ci-dns-updater-tests.sh) are always the same bytes.
+    dns_updater_script = file("${path.module}/scripts/ci-dns-updater.sh")
   })
 }
 
+# T-034 phase 2, COMMIT 1 of 2: this resource, aws_eip_association.drone
+# below, and dns.tf's aws_route53_record.ci.records (its only remaining
+# reference) are ALL removed together in the second commit of this same PR,
+# once this commit is applied and proven live -- see that commit's own diff
+# for what replaces the `records` reference. Not removed here because
+# dns.tf's record needs a real, correct initial value (this EIP's current
+# address) for its FIRST apply to create a record that already resolves
+# correctly, before scripts/ci-dns-updater.sh has ever run.
 resource "aws_eip" "drone" {
   domain = "vpc"
 
@@ -179,7 +202,7 @@ resource "aws_instance" "drone" {
       aws_region     = var.aws_region
       project_name   = var.project_name
       environment    = var.environment
-      server_host    = aws_eip.drone.public_ip
+      ci_hostname    = var.ci_hostname
       admin_username = var.drone_admin_username
     }),
     templatefile("${path.module}/templates/jenkins-bootstrap.sh", {

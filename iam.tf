@@ -136,6 +136,90 @@ resource "aws_iam_role_policy" "drone_read_ci_parameters" {
   })
 }
 
+
+# T-034 phase 2: the boot-time DNS updater (scripts/ci-dns-updater.sh) needs
+# exactly one Route 53 write. Route 53 has NO record-level ARNs -- the
+# Resource is unavoidably the whole hosted zone -- so the narrowing has to
+# come from the Condition block instead: this account's own T-005 gap notes
+# the CI role is reachable from inside a build, so a compromised build
+# container inheriting this grant must not be able to touch any OTHER record
+# in the zone, any OTHER record type, or do anything but UPSERT.
+# ForAllValues:StringEquals on all three keys, each a single-element list, is
+# what makes this exact rather than merely "includes" -- StringEquals alone
+# (without ForAllValues) would also allow a request whose value SET is a
+# superset of the allowed one. scripts/check-static.sh (check 10) pins the
+# single action, the zone-ARN Resource, and all three condition values
+# textually, since jsondecode CAN run on this specific policy under
+# `command = plan` (data.aws_route53_zone.ci.arn is a MOCKED data source,
+# not a computed resource attribute, so it actually IS known here -- unlike
+# every EC2/Lambda ARN elsewhere in this file) but the plan settled this as a
+# static check anyway, for consistency with how every other IAM exactness
+# check in this module is done.
+locals {
+  # Named for the same reason ci-on-demand.tf names the EC2/Lambda action
+  # lists: `terraform test` can assert on these directly (case 3, no
+  # wildcard names/types/actions), while the full exact-shape check (one
+  # action, the zone ARN as Resource, all three conditions) is
+  # scripts/check-static.sh check 10, per the plan.
+  ci_dns_update_actions       = ["route53:ChangeResourceRecordSets"]
+  ci_dns_update_record_names  = [var.ci_hostname]
+  ci_dns_update_record_types  = ["A"]
+  ci_dns_update_actions_types = ["UPSERT"]
+
+  # Review round 1, finding 5: read-only additions for the updater's
+  # idempotency check (list the current value before deciding whether to
+  # write) and its INSYNC wait. Named separately from the write action above
+  # so check-static's exactness check keeps verifying the WRITE grant
+  # specifically, unaffected by these.
+  ci_dns_read_actions = ["route53:ListResourceRecordSets"]
+
+  # route53:GetChange has NO record- or zone-scoped ARN -- AWS's own
+  # documented resource type for it is `change/<id>`, and the id is only
+  # known AFTER a change is submitted, so `change/*` is the narrowest
+  # Resource this action can ever take, for anyone. Safe regardless of that
+  # width: GetChange is read-only (it returns a change's PENDING/INSYNC
+  # propagation status, nothing about a record's content), and it grants
+  # nothing about any OTHER account's changes -- change ids are scoped to
+  # the account that made them, IAM evaluates this within the CI role's own
+  # account only. It does not widen what this role can WRITE; that stays
+  # exactly the conditioned grant above.
+  ci_dns_get_change_actions   = ["route53:GetChange"]
+  ci_dns_get_change_resources = ["arn:aws:route53:::change/*"]
+}
+
+resource "aws_iam_role_policy" "drone_dns_update" {
+  name = "ci-dns-update"
+  role = aws_iam_role.drone.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = local.ci_dns_update_actions
+        Resource = data.aws_route53_zone.ci.arn
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames" = local.ci_dns_update_record_names
+            "route53:ChangeResourceRecordSetsRecordTypes"           = local.ci_dns_update_record_types
+            "route53:ChangeResourceRecordSetsActions"               = local.ci_dns_update_actions_types
+          }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = local.ci_dns_read_actions
+        Resource = data.aws_route53_zone.ci.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = local.ci_dns_get_change_actions
+        Resource = local.ci_dns_get_change_resources
+      }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "drone" {
   name = "${var.project_name}-drone"
   role = aws_iam_role.drone.name

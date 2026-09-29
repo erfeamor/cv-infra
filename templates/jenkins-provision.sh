@@ -54,6 +54,89 @@ recreate_if_needed() {
   docker run -d --name "$name" --label "cv_config_hash=$config_hash" "$@" "$image"
 }
 
+# T-034 phase 2: the DNS-on-boot updater. Written and enabled here (not just
+# in templates/drone-user-data.sh) because THIS script is the one pushed to
+# the LIVE box out-of-band (ci.tf's null_resource.jenkins_provision) --
+# `systemctl enable` makes it fire on every FUTURE boot automatically, via
+# systemd, with no further action from this script; `--now` also runs it
+# immediately as part of THIS run, which is what gets today's IP recorded.
+# Deliberately BEFORE the docker network/Jenkins/proxy setup below: on a warm
+# reboot (not running this script at all -- see the header comment), Docker
+# itself restarts every `--restart unless-stopped` container, including
+# ci-proxy, the instant docker.service starts. Before=docker.service in the
+# unit itself is what actually wins that race on THOSE boots; ordering it
+# first in THIS script only matters for a run that also touches Docker
+# (a fresh replace, or this SSM push), and costs nothing either way.
+cat >/usr/local/bin/ci-dns-updater.sh <<'DNS_UPDATER_EOF'
+${dns_updater_script}
+DNS_UPDATER_EOF
+chmod 755 /usr/local/bin/ci-dns-updater.sh
+
+# Review round 1, finding 3: restarting on failure (with RestartSec + a
+# start limit, set on the unit below) is a SECOND, systemd-level retry layer
+# on top of
+# scripts/ci-dns-updater.sh's OWN internal retry/backoff -- the script gives
+# up after its own bounded attempts (RETRY_MAX_ATTEMPTS), and if it still
+# exits non-zero, systemd gets another few tries at the whole thing rather
+# than leaving it stopped until the next boot or the next timer tick.
+# StartLimitIntervalSec/StartLimitBurst belong in [Unit], not [Service] --
+# systemd rejects them silently misplaced (they're simply ignored, not an
+# error, which makes this exact mistake easy to ship unnoticed).
+cat >/etc/systemd/system/ci-dns-updater.service <<'DNS_UNIT_EOF'
+[Unit]
+Description=Keep ${ci_hostname} pointed at this host's current public IPv4 (T-034 phase 2)
+Wants=network-online.target
+After=network-online.target
+Before=docker.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+Environment=AWS_REGION=${aws_region}
+Environment=CI_HOSTNAME=${ci_hostname}
+Environment=ROUTE53_ZONE_ID=${route53_zone_id}
+ExecStart=/usr/local/bin/ci-dns-updater.sh
+Restart=on-failure
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target
+DNS_UNIT_EOF
+
+# Review round 1, finding 2: a timer keeps re-running the updater every 5
+# minutes for as long as the host stays up, on top of the boot-time oneshot
+# above -- belt-and-suspenders against anything that could otherwise leave
+# the record stale for a whole uptime (the updater's own idempotency check,
+# scripts/ci-dns-updater.sh, makes every run after the first a cheap read
+# rather than a write, so this costs nothing at rest).
+cat >/etc/systemd/system/ci-dns-updater.timer <<'DNS_TIMER_EOF'
+[Unit]
+Description=Periodically re-check ${ci_hostname}'s Route 53 record (T-034 phase 2 review round 1, finding 2)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=ci-dns-updater.service
+
+[Install]
+WantedBy=timers.target
+DNS_TIMER_EOF
+
+systemctl daemon-reload
+
+# Review round 1, finding 3: a failed run here must not abort the REST of
+# this script (Jenkins, Drone, Caddy still need to come up) -- `set -euo
+# pipefail` is active for the whole file, so an unguarded `systemctl
+# enable --now` would take the exit status of the service's own (already
+# internally retried, scripts/ci-dns-updater.sh) failure and kill
+# provisioning over it. Logged loudly instead: the timer above, and the
+# next boot's oneshot, both get another chance regardless.
+if ! systemctl enable --now ci-dns-updater.service; then
+  echo "jenkins-provision: ci-dns-updater.service failed on this run (DNS may be stale) -- continuing provisioning; the timer and the next boot will retry" >&2
+fi
+systemctl enable --now ci-dns-updater.timer
+
 docker network inspect drone >/dev/null 2>&1 || docker network create drone
 
 # Jenkins: files/image first, containers last (Drone untouched till the end).
@@ -112,7 +195,7 @@ credentials:
 unclassified:
   # Empty root URL => no target URL on the commit status github-branch-source posts.
   location:
-    url: "http://${server_host}/jenkins/"
+    url: "https://${ci_hostname}/jenkins/"
 jobs:
   - script: |
       // T-026: SEED ONLY WHEN ABSENT. JCasC re-applies this whole document on
@@ -327,47 +410,74 @@ recreate_if_needed jenkins cv-jenkins:local "$JENKINS_CONFIG_HASH" \
   -e GITHUB_PAT="$GITHUB_PAT"
 # No -p 8080:8080: Jenkins is reachable only over "drone", via the proxy.
 
-# Reverse proxy fronts Drone (/) and Jenkins (/jenkins/) on 80/443.
-# resolver + variable proxy_pass re-resolve container names per request
-# instead of caching an IP, so an upstream recreate doesn't 502.
-mkdir -p /etc/ci-proxy
-cat >/etc/ci-proxy/nginx.conf <<'NGINX_EOF'
-events {}
-http {
-  resolver 127.0.0.11 valid=10s;
+# Reverse proxy fronts Drone (/) and Jenkins (/jenkins/) on 80/443, and
+# terminates TLS (T-033 H1, option b, Let's Encrypt on the host).
+#
+# T-034 phase 2 replaced nginx with Caddy: automatic Let's Encrypt is
+# Caddy's whole reason for being here -- a site block naming a real hostname
+# gets a PRODUCTION certificate via HTTP-01 with zero extra config, an
+# automatic HTTP->HTTPS redirect (made explicit below anyway, so it's a
+# grep-able fact rather than an implicit default to trust), and its own
+# retry/fallback-to-staging behaviour on failure. `handle` (not
+# `handle_path`) for /jenkins/* is the Caddy equivalent of nginx's bare
+# `proxy_pass $jenkins_upstream` above with no trailing path segment: it
+# passes the ORIGINAL request path through untouched, prefix intact, which
+# `--prefix=/jenkins` (the jenkins docker run below) expects. `handle_path`
+# would strip the matched /jenkins prefix before proxying and break that.
+#
+# Certs and Caddy's own state persist on host bind mounts (/var/lib/caddy-*
+# below) precisely so a stop/start cycle or a reboot -- both routine under
+# T-019's on-demand start/reap, now that there's no EIP keeping the box up
+# -- never has to re-issue a certificate. Let's Encrypt's production CA
+# rate-limits duplicate certificates for the same name to 5/week
+# (docs/runbooks/drone.md) -- losing the persisted cert repeatedly would
+# burn through that fast.
+# Review round 1, finding 6: no manual per-request header overrides below --
+# Caddy's reverse_proxy already sets X-Forwarded-For, X-Forwarded-Proto and
+# X-Forwarded-Host correctly by default, and passes the original Host
+# through unchanged on its own, so the nginx-era manual set was redundant
+# with Caddy's defaults (and, for the manual X-Real-IP specifically, mildly
+# wrong: Caddy's own convention there is X-Forwarded-For, which it already
+# sets). Nothing below needs a {remote_host}-style placeholder either --
+# there's no directive left that takes one.
+mkdir -p /etc/ci-proxy /var/lib/caddy-data /var/lib/caddy-config
+cat >/etc/ci-proxy/Caddyfile <<'CADDY_EOF'
+${ci_hostname} {
+  handle /jenkins/* {
+    reverse_proxy jenkins:8080
+  }
 
-  server {
-    listen 80;
-
-    location /jenkins/ {
-      # No URI part after the variable: with one, nginx replaces the whole
-      # request URI with it on every request (collapsing every path to a
-      # bare /jenkins/); with none, the original URI passes through, which
-      # --prefix=/jenkins expects.
-      set $jenkins_upstream http://jenkins:8080;
-      proxy_pass $jenkins_upstream;
-      proxy_set_header Host $host;
-      proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto $scheme;
-      proxy_redirect http://jenkins:8080/jenkins/ /jenkins/;
-      proxy_read_timeout 90s;
-      proxy_buffering off;
-      proxy_request_buffering off;
-    }
-
-    # Everything else (GitHub /hook, Drone OAuth) goes to Drone untouched.
-    location / {
-      set $drone_upstream http://drone-server:80;
-      proxy_pass $drone_upstream;
-      proxy_set_header Host $host;
-      proxy_set_header X-Real-IP $remote_addr;
-      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto $scheme;
-    }
+  handle {
+    reverse_proxy drone-server:80
   }
 }
-NGINX_EOF
+
+http://${ci_hostname} {
+  redir https://{host}{uri} permanent
+}
+
+# Review round 1, finding 1: anything that reaches this listener with a
+# Host that ISN'T ${ci_hostname} -- a request straight to the instance's raw
+# public IP (SNI-less or IP-SNI), a stray old bookmark, a scanner -- falls
+# through to here rather than to either site block above (Caddy matches the
+# more specific host first). A non-2xx here matters beyond hygiene: Drone's
+# EXISTING hook (never doorbell-signed, re-registered to
+# https://${ci_hostname}/hook by hand post-apply -- see docs/runbooks/
+# drone.md) still targets this same listener, and if it were ever
+# mis-addressed, GitHub's own delivery-status tracking must see that as a
+# clean failure -- 421, not a hang or a 2xx that would stop the doorbell
+# from ever redelivering it. `tls internal` (a locally-generated cert, not a
+# real Let's Encrypt one) is deliberate: this catch-all must never trigger
+# an ACME issuance attempt for whatever hostname a client happens to claim.
+:443 {
+  tls internal
+  respond 421
+}
+
+:80 {
+  respond 421
+}
+CADDY_EOF
 
 # Remediates a drone-server still publishing :80 directly; kept last and
 # tight (secrets fetched right before use). State is on the bind mount, so
@@ -395,35 +505,78 @@ if docker inspect drone-server >/dev/null 2>&1; then
       -e DRONE_GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \
       -e DRONE_RPC_SECRET="$DRONE_RPC_SECRET" \
       -e DRONE_DATABASE_SECRET="$DRONE_DATABASE_SECRET" \
-      -e DRONE_SERVER_HOST="${server_host}" \
-      -e DRONE_SERVER_PROTO=http \
+      -e DRONE_SERVER_HOST="${ci_hostname}" \
+      -e DRONE_SERVER_PROTO=https \
       -e DRONE_USER_CREATE="username:${admin_username},admin:true" \
       -e DRONE_USER_FILTER="${admin_username}" \
       drone/drone:2
   fi
 fi
 
-CI_PROXY_CONFIG_HASH=$(sha256sum /etc/ci-proxy/nginx.conf | awk '{print $1}')
-recreate_if_needed ci-proxy nginx:alpine "$CI_PROXY_CONFIG_HASH" \
+CI_PROXY_CONFIG_HASH=$(sha256sum /etc/ci-proxy/Caddyfile | awk '{print $1}')
+recreate_if_needed ci-proxy caddy:2 "$CI_PROXY_CONFIG_HASH" \
   --restart unless-stopped \
   --network drone \
   -p 80:80 \
-  -v /etc/ci-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+  -p 443:443 \
+  -p 443:443/udp \
+  -v /etc/ci-proxy/Caddyfile:/etc/caddy/Caddyfile:ro \
+  -v /var/lib/caddy-data:/data \
+  -v /var/lib/caddy-config:/config
 
-# Health check: `docker run -d` only proves creation, not serving.
-docker exec ci-proxy nginx -t
-health_elapsed=0
-health_timeout_s=120
-health_poll_s=5
+# Health check: `docker run -d` only proves creation, not serving. Review
+# round 1, finding 5 split this into two genuinely different questions,
+# checked and treated differently:
+#
+#   (a) Is the PROXY ROUTING correct at all -- Caddy is up, its config is
+#       valid, and it forwards /jenkins/login to Jenkins? This is a
+#       configuration/container problem if it fails, has nothing to do with
+#       DNS or ACME, and stays a hard failure: `-k` is used ONLY for this
+#       local liveness probe, to keep it independent of whether a
+#       certificate has been issued yet. --resolve still pins the hostname
+#       to this host's own loopback (this runs ON the CI host, so it can't
+#       rely on the DNS updater having already propagated externally by the
+#       time this line runs) -- `-k` here is about the CERTIFICATE'S
+#       validity, not the hostname routing, which --resolve already gets
+#       right.
+#   (b) Does ci_hostname now present a REAL, browser/GitHub-trusted
+#       certificate? This depends on Let's Encrypt actually having issued
+#       one, which can take a while on a first-ever boot and is NOT this
+#       script's job to force -- Caddy keeps retrying on its own
+#       regardless. A long wait here that only WARNS on timeout (never
+#       fails the apply) reflects that: the box is already usable per (a),
+#       and a still-pending certificate resolves itself without any
+#       operator action.
+docker exec ci-proxy caddy validate --config /etc/caddy/Caddyfile
+
+routing_elapsed=0
+routing_timeout_s=120
+routing_poll_s=5
 while :; do
-  if curl -sf -o /dev/null "http://localhost/jenkins/login"; then
-    echo "jenkins-provision: ci-proxy is serving Jenkins."
+  if curl -sfk -o /dev/null --resolve "${ci_hostname}:443:127.0.0.1" "https://${ci_hostname}/jenkins/login"; then
+    echo "jenkins-provision: ci-proxy is routing to Jenkins over HTTPS (certificate not yet verified)."
     break
   fi
-  if [ "$health_elapsed" -ge "$health_timeout_s" ]; then
-    echo "jenkins-provision: /jenkins/login never came up through ci-proxy within $${health_timeout_s}s" >&2
+  if [ "$routing_elapsed" -ge "$routing_timeout_s" ]; then
+    echo "jenkins-provision: https://${ci_hostname}/jenkins/login never came up through ci-proxy within $${routing_timeout_s}s -- this is a proxy/container problem, not a DNS/certificate one" >&2
     exit 1
   fi
-  sleep "$health_poll_s"
-  health_elapsed=$((health_elapsed + health_poll_s))
+  sleep "$routing_poll_s"
+  routing_elapsed=$((routing_elapsed + routing_poll_s))
+done
+
+cert_elapsed=0
+cert_timeout_s=600
+cert_poll_s=10
+while :; do
+  if curl -sf -o /dev/null --resolve "${ci_hostname}:443:127.0.0.1" "https://${ci_hostname}/jenkins/login"; then
+    echo "jenkins-provision: ci-proxy is presenting a valid certificate for ${ci_hostname}."
+    break
+  fi
+  if [ "$cert_elapsed" -ge "$cert_timeout_s" ]; then
+    echo "jenkins-provision: WARNING -- no valid certificate for ${ci_hostname} within $${cert_timeout_s}s; Caddy will keep retrying issuance on its own -- not failing this run over it" >&2
+    break
+  fi
+  sleep "$cert_poll_s"
+  cert_elapsed=$((cert_elapsed + cert_poll_s))
 done

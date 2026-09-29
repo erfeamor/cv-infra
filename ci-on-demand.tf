@@ -81,14 +81,39 @@ locals {
   ci_redeliver_repos = ["erfeamor/cv-admin-react"]
 
   # Review round 1, finding 10: the CI host's one public address, named once.
-  # Phase 2 (T-034) replaces the EIP with a DNS name behind Route 53; when
-  # that lands, this is the ONLY place that changes -- every consumer below
-  # (the reaper's Jenkins URL, the doorbell's Drone healthz URL) references
-  # this local, never aws_eip.drone.public_ip directly. Enforced textually by
-  # scripts/check-static.sh (terraform test cannot see it: the EIP's
-  # public_ip is unknown under `command = plan`, same limitation this file
-  # already documents for other computed attributes).
-  ci_public_host = aws_eip.drone.public_ip
+  # Phase 2 (T-034) landed: the EIP is replaced by var.ci_hostname (dns.tf's
+  # aws_route53_record, kept current by scripts/ci-dns-updater.sh on every
+  # boot) -- every consumer below (the reaper's Jenkins URL, the doorbell's
+  # Drone healthz URL) references this local, never the hostname variable or
+  # any address literal directly, so a future re-point (a new domain, say)
+  # changes exactly this one line. Enforced textually by
+  # scripts/check-static.sh check 9.
+  ci_public_host = var.ci_hostname
+
+  # T-034 phase 2 review round 1, finding 2 (second half): the reaper and
+  # doorbell still address the host by local.ci_public_host (the DNS name),
+  # NOT by the instance's public IP from their own ec2:DescribeInstances
+  # call, even though that call is already made for other reasons.
+  # Deliberate, not an oversight -- addressing by raw IP would fight the
+  # very security fix finding 1 added: Caddy's catch-all now answers 421 to
+  # any request whose Host isn't ci_hostname (templates/jenkins-provision.sh),
+  # and a raw-IP request's Host header/TLS SNI would BE the IP, not the
+  # hostname -- so switching to IP addressing would need the Lambdas to
+  # connect-by-IP-but-verify/SNI-as-the-hostname (Python's http.client
+  # supports this, but it is real, fragile, untested-here complexity that
+  # re-adds exactly the kind of address coupling T-034 phase 2 exists to
+  # remove). The risk this would guard against -- stale DNS right after a
+  # cold start making the reaper misread Jenkins as unreachable -- is
+  # already bounded three ways without it: (a) jenkins_is_idle() already
+  # treats unreachable as BUSY (T-019 ruling 2, deliberate: cost over
+  # safety), never as a reason to act; (b) the reaper's own post-start grace
+  # (var.ci_post_start_grace_minutes, 15 min) means idleness is never even
+  # evaluated until long after DNS has converged (the updater runs at boot,
+  # Before=docker.service, and the propagation TTL is 60s); (c) the review's
+  # own finding 2 (first half) added a 5-minute re-run timer
+  # (scripts/ci-dns-updater.sh) on top of that. A genuinely broken DNS
+  # record costs money (the box stays running) but never breaks a build --
+  # the same trade-off T-019 ruling 2 already made on purpose.
 
   # Review round 1, finding 4: the budget behind aws_lambda_function.ci_doorbell's
   # timeout, named piece by piece so a reviewer can see where the number comes
@@ -229,7 +254,7 @@ resource "aws_lambda_function" "ci_doorbell" {
       ALLOWED_REPOS                 = join(",", local.ci_allowed_repos)
       REDELIVER_REPOS               = join(",", local.ci_redeliver_repos)
       GITHUB_HOOKS_TOKEN_PARAM      = aws_ssm_parameter.github_hooks_token.name
-      DRONE_HEALTHZ_URL             = "http://${local.ci_public_host}/healthz"
+      DRONE_HEALTHZ_URL             = "https://${local.ci_public_host}/healthz"
       HEALTHZ_TIMEOUT_SECONDS       = tostring(local.ci_doorbell_healthz_timeout_seconds)
       HEALTHZ_POLL_INTERVAL_SECONDS = "15"
       SELF_FUNCTION_NAME            = local.ci_doorbell_function_name
@@ -394,7 +419,7 @@ resource "aws_lambda_function" "ci_reaper" {
   environment {
     variables = {
       INSTANCE_ID            = aws_instance.drone.id
-      JENKINS_BASE_URL       = "http://${local.ci_public_host}/jenkins"
+      JENKINS_BASE_URL       = "https://${local.ci_public_host}/jenkins"
       JENKINS_USER           = var.jenkins_admin_username
       JENKINS_PASSWORD_PARAM = aws_ssm_parameter.jenkins_admin_password.name
       IDLE_WINDOW_MINUTES    = tostring(var.ci_idle_window_minutes)

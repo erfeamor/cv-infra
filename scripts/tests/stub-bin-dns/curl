@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Stub `curl` for scripts/tests/run-ci-dns-updater-tests.sh. Understands only
+# the two calls scripts/ci-dns-updater.sh makes: the IMDSv2 token PUT, and
+# the metadata GET that must carry that exact token as a header.
+#
+#   STUB_CURL_CALLS_LOG        -- append one line per call ("token" or "metadata:<token-header>")
+#   STUB_CURL_TOKEN_VALUE      -- token to hand back (default: fixture-imds-token)
+#   STUB_CURL_EMPTY_TOKEN      -- if set, the token call prints nothing (simulates IMDS being unreachable)
+#   STUB_CURL_PUBLIC_IP        -- value returned for meta-data/public-ipv4
+#   STUB_CURL_EMPTY_PUBLIC_IP  -- if set, the metadata call prints nothing
+#   STUB_CURL_TOKEN_FAIL_TIMES_FILE    -- path to a counter file; while its
+#                                          content is > 0, the token call
+#                                          fails (empty output) and
+#                                          decrements it by one; used to
+#                                          test retry-then-succeed
+set -euo pipefail
+
+_consume_failure() {
+  # $1 = counter file path. Returns 0 (should fail) and decrements if the
+  # file holds a number > 0; returns 1 (should succeed) otherwise. Missing
+  # file/empty content counts as 0 -- no failures queued.
+  local file="$1" n
+  [ -n "$file" ] || return 1
+  [ -f "$file" ] || return 1
+  n=$(cat "$file" 2>/dev/null || echo 0)
+  [ "$n" -gt 0 ] || return 1
+  echo $((n - 1)) >"$file"
+  return 0
+}
+
+is_token_call=0
+is_metadata_call=0
+token_header=""
+
+for arg in "$@"; do
+  case "$arg" in
+  */api/token) is_token_call=1 ;;
+  */meta-data/public-ipv4) is_metadata_call=1 ;;
+  esac
+done
+
+# Walk args again to pull the token header's VALUE off the metadata call
+# (curl's -H takes the whole "Name: value" string as one argument).
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-H" ] && [[ "$arg" == X-aws-ec2-metadata-token:* ]]; then
+    token_header="${arg#X-aws-ec2-metadata-token: }"
+  fi
+  prev="$arg"
+done
+
+if [ "$is_token_call" = "1" ]; then
+  [ -n "${STUB_CURL_CALLS_LOG:-}" ] && echo "token" >>"$STUB_CURL_CALLS_LOG"
+  if [ -n "${STUB_CURL_EMPTY_TOKEN:-}" ] || _consume_failure "${STUB_CURL_TOKEN_FAIL_TIMES_FILE:-}"; then
+    exit 0
+  fi
+  printf '%s' "${STUB_CURL_TOKEN_VALUE:-fixture-imds-token}"
+  exit 0
+fi
+
+if [ "$is_metadata_call" = "1" ]; then
+  [ -n "${STUB_CURL_CALLS_LOG:-}" ] && echo "metadata:${token_header}" >>"$STUB_CURL_CALLS_LOG"
+  if [ -n "${STUB_CURL_EMPTY_PUBLIC_IP:-}" ]; then
+    exit 0
+  fi
+  printf '%s' "${STUB_CURL_PUBLIC_IP:-203.0.113.77}"
+  exit 0
+fi
+
+echo "stub curl: unsupported invocation: $*" >&2
+exit 1

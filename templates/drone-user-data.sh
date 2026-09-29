@@ -47,8 +47,8 @@ docker run -d --name drone-server --restart unless-stopped \
   -e DRONE_GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \
   -e DRONE_RPC_SECRET="$DRONE_RPC_SECRET" \
   -e DRONE_DATABASE_SECRET="$DRONE_DATABASE_SECRET" \
-  -e DRONE_SERVER_HOST="${server_host}" \
-  -e DRONE_SERVER_PROTO=http \
+  -e DRONE_SERVER_HOST="${ci_hostname}" \
+  -e DRONE_SERVER_PROTO=https \
   -e DRONE_USER_CREATE="username:${admin_username},admin:true" \
   -e DRONE_USER_FILTER="${admin_username}" \
   drone/drone:2

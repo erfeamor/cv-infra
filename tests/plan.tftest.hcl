@@ -711,16 +711,14 @@ run "ci_on_demand" {
     error_message = "The GitHub webhook secret must be a SecureString"
   }
 
-  # The permission whose ABSENCE made the whole deployment inert: without an
-  # unconditioned lambda:InvokeFunction grant, this account's default Lambda
-  # public-access block makes the Function URL answer 403 and the handler is
-  # never reached. Every other assertion in this file passed while that was
-  # broken, which is why it gets one of its own.
-  assert {
-    condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunction"
-    error_message = "The doorbell needs an unconditioned lambda:InvokeFunction grant or its Function URL returns 403 without ever invoking the handler (verified live 2026-08-19)"
-  }
-
+  # The permission whose ABSENCE made the whole deployment inert: without SOME
+  # public grant here, this account's default Lambda public-access block
+  # makes the Function URL answer 403 and the handler is never reached.
+  # Every other assertion in this file passed while that was broken, which is
+  # why it gets one of its own. Originally an unconditioned lambda:InvokeFunction
+  # grant (verified live 2026-08-19) -- review round 1, finding 1(a) narrowed
+  # this to lambda:InvokeFunctionUrl (see the t034_review_round1 run below for
+  # why, and the UNVERIFIED note on the resource itself in ci-on-demand.tf).
   assert {
     condition     = aws_lambda_permission.ci_doorbell_public_invoke.principal == "*"
     error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py, not this permission"
@@ -854,9 +852,65 @@ run "t034_doorbell_redelivery" {
   }
 
   # --- Case 14: the waiting invocation's timeout ----------------------------
+  # Review round 1, finding 4 replaced the bare ">= 540" with the actual
+  # budget the timeout is built from (local.ci_doorbell_healthz_timeout_seconds
+  # + local.ci_doorbell_github_work_budget_seconds, ci-on-demand.tf) -- see
+  # the t034_review_round1 run below for the budget's own assertions.
   assert {
-    condition     = aws_lambda_function.ci_doorbell.timeout >= 540
-    error_message = "The doorbell self-invokes to wait up to 8 minutes (480s) for Drone's /healthz before redelivering; the function's own timeout must be at least 540s (9 min) or Lambda kills that invocation mid-wait, silently dropping the redelivery"
+    condition     = aws_lambda_function.ci_doorbell.timeout == local.ci_doorbell_timeout_seconds
+    error_message = "aws_lambda_function.ci_doorbell.timeout must come from local.ci_doorbell_timeout_seconds, not a bare literal that could silently drift from the healthz+GitHub-work budget it represents"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-034 review round 1 (0567f6a) findings 1(a), 4, 7 -- the public invoke
+# permission is scoped to Function-URL invocation, async retries are
+# disabled, the timeout budget is named and bounded, and the reaper's grace
+# variable is actually wired to the Lambda that reads it. Finding 10 (one
+# local for the CI host's public address) is a text-level property
+# (aws_eip.drone.public_ip is unknown under `command = plan`, same
+# limitation this file documents throughout) and is covered by
+# scripts/check-static.sh instead, not here.
+# ---------------------------------------------------------------------------
+run "t034_review_round1" {
+  command = plan
+
+  # --- Finding 1(a): Function-URL-only public invocation -------------------
+  assert {
+    condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunctionUrl"
+    error_message = "The public grant must be lambda:InvokeFunctionUrl, not the generic lambda:InvokeFunction -- the latter also authorizes the plain Invoke API for ANY AWS principal, bypassing the Function URL/HMAC path entirely (review round 1, finding 1(a))"
+  }
+
+  assert {
+    condition     = aws_lambda_permission.ci_doorbell_public_invoke.function_url_auth_type == "NONE"
+    error_message = "The public grant's function_url_auth_type must match the Function URL's own authorization_type (NONE) -- AWS ties the two together for this action"
+  }
+
+  # --- Finding 4: async retries disabled, and the timeout budget -----------
+  assert {
+    condition     = aws_lambda_function_event_invoke_config.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
+    error_message = "The event-invoke config must target the doorbell function"
+  }
+
+  assert {
+    condition     = aws_lambda_function_event_invoke_config.ci_doorbell.maximum_retry_attempts == 0
+    error_message = "Async retries must stay disabled -- a Lambda-initiated retry of the wake+redeliver task would re-run redeliver_failed_deliveries, defeating findings 2/3's single-pass dedup guarantees"
+  }
+
+  assert {
+    condition     = local.ci_doorbell_timeout_seconds == local.ci_doorbell_healthz_timeout_seconds + local.ci_doorbell_github_work_budget_seconds
+    error_message = "local.ci_doorbell_timeout_seconds must equal the sum of its two named pieces -- a bare override would hide the budget this number is supposed to make legible"
+  }
+
+  assert {
+    condition     = local.ci_doorbell_timeout_seconds <= 900
+    error_message = "900s is Lambda's hard ceiling on any function timeout; the budget must never exceed it"
+  }
+
+  # --- Finding 7: the reaper's grace variable is actually wired ------------
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["POST_START_GRACE_MINUTES"] == tostring(var.ci_post_start_grace_minutes)
+    error_message = "POST_START_GRACE_MINUTES must be wired from var.ci_post_start_grace_minutes -- the variable existed but was never actually passed to the reaper Lambda (review round 1, finding 7), so it silently did nothing"
   }
 }
 

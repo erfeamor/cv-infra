@@ -246,4 +246,20 @@ else
   ok "every lambda:InvokeFunction grant is scoped to aws_lambda_function.ci_doorbell.arn"
 fi
 
+# --- 9. The CI host's public address is named through ONE local -----------
+# Review round 1, finding 10: DRONE_HEALTHZ_URL and JENKINS_BASE_URL must
+# both build from local.ci_public_host, never from aws_eip.drone.public_ip
+# directly -- so T-034 phase 2 (EIP -> DNS name) changes exactly one line.
+# `terraform test` cannot check this: aws_eip.drone.public_ip is unknown
+# under `command = plan` (documented throughout tests/plan.tftest.hcl), so
+# this is a text-level check, like check #4/#5 above.
+if grep -Eq 'DRONE_HEALTHZ_URL[ \t]*=.*aws_eip\.drone\.public_ip' ci-on-demand.tf ||
+  grep -Eq 'JENKINS_BASE_URL[ \t]*=.*aws_eip\.drone\.public_ip' ci-on-demand.tf; then
+  bad "DRONE_HEALTHZ_URL or JENKINS_BASE_URL references aws_eip.drone.public_ip directly instead of local.ci_public_host -- T-034 phase 2 would then need to change two places instead of one"
+elif ! grep -Eq '^\s*ci_public_host\s*=\s*aws_eip\.drone\.public_ip\s*$' ci-on-demand.tf; then
+  bad "local.ci_public_host (= aws_eip.drone.public_ip) not found in ci-on-demand.tf -- has it been renamed without updating this check?"
+else
+  ok "DRONE_HEALTHZ_URL and JENKINS_BASE_URL both build from local.ci_public_host, not aws_eip.drone.public_ip directly"
+fi
+
 exit $fail

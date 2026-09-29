@@ -36,31 +36,43 @@ handler has two entry points, dispatched on event shape:
     and answer 202 at once -- see _handle_webhook. All the slow work is handed
     to a SECOND, asynchronous invocation of this SAME function
     (lambda:InvokeFunction, InvocationType="Event", scoped to its own ARN --
-    see ci-on-demand.tf). Self-invoking was chosen over a second Lambda: one
-    deployment artifact, one IAM role, one log group, and the only new grant
-    needed is a single Resource-scoped lambda:InvokeFunction on this
-    function's own ARN -- narrower than the blast radius of standing up and
-    wiring a whole second function for a path this small. The Jenkins repos
-    are unaffected; they keep ruling 1's synchronous start/no-op/transitional
-    response exactly as before.
+    see ci-on-demand.tf).
   - An async task event (no "requestContext", just {"repo", "wake_time"}):
     the self-invocation. It starts the instance if needed, waits (bounded) for
     Drone's own /healthz, then redelivers -- via GitHub's own redeliver API --
-    only the Drone hook's deliveries that failed at or after the wake time.
-    Signatures stay intact end to end: nothing this handler sends to Drone is
-    doorbell-signed: it never talks to Drone directly at all here, only to
-    GitHub, which re-sends Drone's OWN previously-signed delivery.
+    only the Drone hook's deliveries that failed at or after (a slack window
+    before) the wake time. Signatures stay intact end to end: nothing this
+    handler sends to Drone is doorbell-signed; it never talks to Drone
+    directly here, only to GitHub, which re-sends Drone's OWN previously
+    -signed delivery.
+
+--- Review round 1 (0567f6a), finding 1: the async task re-validates its event
+
+The public `lambda:InvokeFunctionUrl` permission (ci-on-demand.tf) is scoped
+to Function-URL invocation, not to the generic `lambda:InvokeFunction` Invoke
+API -- but `aws_lambda_permission` has no generic Condition block (checked
+against the AWS provider's resource schema; only source_arn, source_account,
+principal_org_id, and function_url_auth_type -- the last valid only with
+lambda:InvokeFunctionUrl -- are available), so that IAM scoping is the whole
+defense at that layer. Belt-and-suspenders: _validate_async_task independently
+re-checks the two facts _handle_webhook already checked before scheduling this
+task (repo is in REDELIVER_REPOS; wake_time is recent), so even a same-account
+principal invoking this function directly with an arbitrary payload can, at
+worst, trigger a legitimate wake+redeliver for an already-allowed repo inside
+a narrow recent window -- never an arbitrary action.
 """
 
 import base64
 import datetime
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import boto3
@@ -81,7 +93,8 @@ ALLOWED_REPOS = {r.strip() for r in os.environ.get("ALLOWED_REPOS", "").split(",
 # instead of today's synchronous start. Per H1, this is cv-admin-react only --
 # the Jenkins repos discover a cold-start push via periodicFolderTrigger
 # (ruling 1) and have no per-repo secret a redelivery would even need to
-# thread past.
+# thread past. Also the async task's re-validated allowlist (see module
+# docstring, review round 1 finding 1) -- not just the webhook entry point's.
 REDELIVER_REPOS = {r.strip() for r in os.environ.get("REDELIVER_REPOS", "").split(",") if r.strip()}
 
 GITHUB_HOOKS_TOKEN_PARAM = os.environ["GITHUB_HOOKS_TOKEN_PARAM"]
@@ -92,6 +105,37 @@ SELF_FUNCTION_NAME = os.environ["SELF_FUNCTION_NAME"]
 
 GITHUB_API = "https://api.github.com"
 HTTP_TIMEOUT_SECONDS = 5
+
+# Review round 1, finding 2: a delivery attempted slightly BEFORE the async
+# task's own wake_time timestamp (clock skew between this Lambda and GitHub,
+# or a delivery already in flight the instant the push landed) must not be
+# treated as "before the wake" and skipped -- the window's start is pulled
+# back by this much slack.
+REDELIVERY_BACKWARD_SLACK_SECONDS = 300
+
+# Finding 1: how old a self-invoked task's own wake_time may be before this
+# function refuses to act on it. Matches the reaper's post-start grace
+# (var.ci_post_start_grace_minutes) only by coincidence of round numbers, not
+# by any shared meaning -- the two are unrelated constants.
+WAKE_TIME_MAX_AGE_SECONDS = 900
+
+# Finding 4: bounds on the GitHub work done after healthz succeeds, so a repo
+# with an unusually large delivery backlog cannot run this invocation past its
+# own timeout (see ci-on-demand.tf's timeout budget comment) or hammer GitHub
+# indefinitely. Left-over failed deliveries beyond the cap are picked up by
+# the next wake, or by the manual fallback (docs/runbooks/drone.md).
+MAX_REDELIVERIES_PER_RUN = 20
+
+# Finding 8: GitHub paginates at up to 100 items/page; this bounds how many
+# pages this handler will ever follow for one hooks/deliveries list, so a
+# malformed or malicious `Link` header cannot cause an unbounded loop.
+MAX_LIST_PAGES = 10
+
+# Finding 6: how long to wait for a `stopping` instance to actually reach
+# `stopped` before giving up, rather than plunging into an 8-minute healthz
+# wait against a host that may never come back up from this state.
+INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS = 120
+INSTANCE_STOPPING_POLL_INTERVAL_SECONDS = 10
 
 # Cached across warm invocations: neither secret changes about never, and a
 # GetParameter on every webhook/redelivery is a needless dependency on SSM
@@ -158,17 +202,36 @@ def _drone_healthz_ok(url):
     try:
         with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
             return response.status == 200
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError):
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError, OSError, http.client.HTTPException):
+        # Finding 9: OSError covers connection-level failures urllib doesn't
+        # always wrap in URLError (e.g. a bare ConnectionResetError bubbling
+        # from the socket layer), and HTTPException covers a malformed
+        # response from a half-started Drone. Both must read as "not ready
+        # yet", exactly like every other failure mode here -- never as a
+        # crash that aborts the whole wait.
         return False
 
 
-def wait_for_drone_healthz(url, timeout_seconds, poll_interval_seconds, check_fn=None, sleep_fn=time.sleep, clock_fn=time.monotonic):
+def wait_for_drone_healthz(url, timeout_seconds, poll_interval_seconds, check_fn=None, sleep_fn=None, clock_fn=None):
     """Poll url until it answers 200, or give up after timeout_seconds.
 
     check_fn/sleep_fn/clock_fn default to the real thing but are injectable so
     tests never sleep for real minutes to exercise the timeout path.
+
+    The three are resolved to time.sleep/time.monotonic HERE, inside the
+    function body, rather than as `sleep_fn=time.sleep` in the signature: a
+    default parameter value is bound ONCE, at def time, to whatever object
+    `time.sleep` was at that moment -- a test that later does
+    `mock.patch.object(module.time, "sleep", ...)` changes the `time`
+    module's attribute, but a caller relying on this function's OWN default
+    (as the real _handle_async_task path does) would still get the
+    already-captured original, real time.sleep, and hang for real minutes.
+    Resolving here, on every call, reads the `time` module's CURRENT
+    attribute instead.
     """
     check_fn = check_fn or _drone_healthz_ok
+    sleep_fn = sleep_fn or time.sleep
+    clock_fn = clock_fn or time.monotonic
     deadline = clock_fn() + timeout_seconds
     while True:
         if check_fn(url):
@@ -178,7 +241,65 @@ def wait_for_drone_healthz(url, timeout_seconds, poll_interval_seconds, check_fn
         sleep_fn(poll_interval_seconds)
 
 
+def _quote_repo(repo):
+    """repo is attacker-influenced (it comes from the async task's own event,
+    which review round 1 finding 1 already restricts to REDELIVER_REPOS, but
+    finding 1(c) asks for this independently): never interpolate it into a
+    URL path unescaped. safe="/" keeps the owner/repo separator readable."""
+    return urllib.parse.quote(repo, safe="/")
+
+
+def _next_link(link_header):
+    """The RFC 5988 `Link` header's rel="next" URL, or None on the last page.
+
+    GitHub's pagination is entirely driven by this header; the `page` query
+    parameter is not guaranteed stable across API versions, so this parses
+    the header rather than incrementing a counter.
+    """
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        segments = part.split(";")
+        url_part = segments[0].strip()
+        if not (url_part.startswith("<") and url_part.endswith(">")):
+            continue
+        if any(segment.strip() == 'rel="next"' for segment in segments[1:]):
+            return url_part[1:-1]
+    return None
+
+
+def _github_list(path, token, stop_predicate=None):
+    """GET path and every subsequent page (Link: rel="next"), up to
+    MAX_LIST_PAGES. stop_predicate(item), if given, is checked against every
+    item on each page; the FIRST page containing a match is still included in
+    full, but no further page is fetched -- the caller filters precisely
+    afterwards. Used for both the hooks list and the deliveries list (finding
+    8); the deliveries list is newest-first, so a stop_predicate that means
+    "this item predates the window" makes this stop as soon as it's true.
+    """
+    items = []
+    url = GITHUB_API + path
+    for _ in range(MAX_LIST_PAGES):
+        if not url:
+            break
+        request = urllib.request.Request(url, method="GET")
+        request.add_header("Authorization", "Bearer " + token)
+        request.add_header("Accept", "application/vnd.github+json")
+        request.add_header("X-GitHub-Api-Version", "2022-11-28")
+        request.add_header("User-Agent", "cv-project-ci-doorbell")
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            raw = response.read()
+            page_items = json.loads(raw) if raw else []
+            items.extend(page_items)
+            if stop_predicate and any(stop_predicate(item) for item in page_items):
+                break
+            url = _next_link(response.headers.get("Link"))
+    return items
+
+
 def _github_request(method, path, token, body=None):
+    """A single-shot GitHub API call (no pagination) -- used for the
+    redelivery POST, which returns no list to page through."""
     url = GITHUB_API + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(url, data=data, method=method)
@@ -196,7 +317,7 @@ def find_drone_hook_id(repo, token):
     (its webhook path -- see templates/jenkins-provision.sh's nginx config).
     The doorbell-signed hook added per docs/runbooks/drone.md points at the
     Function URL instead, so this never picks that one up by accident."""
-    hooks = _github_request("GET", "/repos/%s/hooks" % repo, token) or []
+    hooks = _github_list("/repos/%s/hooks?per_page=100" % _quote_repo(repo), token)
     for hook in hooks:
         url = (hook.get("config") or {}).get("url", "")
         if url.endswith("/hook"):
@@ -209,58 +330,119 @@ def find_drone_hook_id(repo, token):
     return None
 
 
+def _parse_delivered_at(raw):
+    if not raw:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _is_success(status_code):
+    return status_code is not None and 200 <= status_code < 300
+
+
 def redeliver_failed_deliveries(repo, wake_time_iso):
-    """Redeliver, via GitHub's own API, only Drone hook deliveries that both
-    failed AND were attempted at or after the wake time -- a delivery that
-    failed hours ago while the box was legitimately stopped is not this
-    handler's business, and a delivery GitHub already retried successfully on
-    its own must not be sent twice."""
+    """Redeliver, via GitHub's own API, only Drone hook deliveries that are
+    still failing as of the wake -- a delivery that failed hours ago while the
+    box was legitimately stopped is not this handler's business, and a
+    delivery GitHub (or an earlier redelivery) already got a 2xx for must not
+    be sent again.
+
+    Grouped by `guid`, not `id` (review round 1 finding 3): GitHub gives every
+    delivery ATTEMPT -- including each redelivery -- its own `id`, but every
+    attempt of the SAME original event shares one `guid`. Deduplicating by
+    `id` alone would happily redeliver a guid that already succeeded on a
+    later attempt than the failed one this handler happened to see first.
+    """
     token = _hooks_token()
     hook_id = find_drone_hook_id(repo, token)
     if hook_id is None:
         return 0
 
+    quoted_repo = _quote_repo(repo)
     wake_time = datetime.datetime.fromisoformat(wake_time_iso)
-    deliveries = _github_request("GET", "/repos/%s/hooks/%s/deliveries" % (repo, hook_id), token) or []
+    window_start = wake_time - datetime.timedelta(seconds=REDELIVERY_BACKWARD_SLACK_SECONDS)
 
-    seen_ids = set()
-    redelivered = 0
+    def predates_window(delivery):
+        when = _parse_delivered_at(delivery.get("delivered_at"))
+        return when is not None and when < window_start
+
+    deliveries = _github_list(
+        "/repos/%s/hooks/%s/deliveries?per_page=100" % (quoted_repo, hook_id),
+        token,
+        stop_predicate=predates_window,
+    )
+
+    in_window = []
     for delivery in deliveries:
+        when = _parse_delivered_at(delivery.get("delivered_at"))
+        if when is not None and when >= window_start:
+            in_window.append((when, delivery))
+
+    succeeded_guids = {d.get("guid") for _, d in in_window if _is_success(d.get("status_code"))}
+
+    latest_failed_by_guid = {}
+    for when, delivery in in_window:
+        guid = delivery.get("guid")
+        if guid is None or guid in succeeded_guids or _is_success(delivery.get("status_code")):
+            continue
+        existing = latest_failed_by_guid.get(guid)
+        if existing is None or when > existing[0]:
+            latest_failed_by_guid[guid] = (when, delivery)
+
+    redelivered = 0
+    for guid, (_when, delivery) in latest_failed_by_guid.items():
+        if redelivered >= MAX_REDELIVERIES_PER_RUN:
+            log.warning(
+                "hit MAX_REDELIVERIES_PER_RUN (%d) for %s; remaining failed deliveries are left for the next wake "
+                "or manual redelivery (docs/runbooks/drone.md)",
+                MAX_REDELIVERIES_PER_RUN,
+                repo,
+            )
+            break
         delivery_id = delivery.get("id")
-        if delivery_id is None or delivery_id in seen_ids:
-            # Idempotency guard: GitHub's delivery list should not contain the
-            # same id twice, but nothing about this handler's correctness
-            # should depend on that holding -- a duplicate must never become a
-            # second POST.
+        if delivery_id is None:
             continue
-        seen_ids.add(delivery_id)
-
-        delivered_at = (delivery.get("delivered_at") or "").replace("Z", "+00:00")
         try:
-            when = datetime.datetime.fromisoformat(delivered_at)
-        except ValueError:
-            continue
-        if when < wake_time:
-            continue
+            _github_request(
+                "POST",
+                "/repos/%s/hooks/%s/deliveries/%s/attempts" % (quoted_repo, hook_id, urllib.parse.quote(str(delivery_id), safe="")),
+                token,
+            )
+            redelivered += 1
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+            # Finding 4: one failed redelivery POST must not stop the rest --
+            # a transient GitHub error on guid A has nothing to do with guid B.
+            log.warning("redelivery POST failed for guid=%s delivery_id=%s: %s", guid, delivery_id, exc)
 
-        status_code = delivery.get("status_code")
-        if status_code is not None and 200 <= status_code < 300:
-            continue  # GitHub already delivered this one successfully
-
-        _github_request("POST", "/repos/%s/hooks/%s/deliveries/%s/attempts" % (repo, hook_id, delivery_id), token)
-        redelivered += 1
-
-    log.info("redelivered %d failed Drone webhook deliveries for %s since %s", redelivered, repo, wake_time_iso)
+    log.info(
+        "redelivered %d/%d still-failing Drone webhook deliveries for %s since %s (-%ds slack)",
+        redelivered,
+        len(latest_failed_by_guid),
+        repo,
+        wake_time_iso,
+        REDELIVERY_BACKWARD_SLACK_SECONDS,
+    )
     return redelivered
+
+
+def _describe_instance_state():
+    try:
+        return ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]["State"]["Name"]
+    except (ClientError, IndexError, KeyError):
+        log.exception("could not read instance state")
+        return None
 
 
 def _start_instance_if_stopped(repo):
     """The pre-T-034 synchronous behaviour, unchanged: still used directly by
-    the Jenkins-repo webhook path, and by the async task for cv-admin-react."""
-    try:
-        state = ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]["State"]["Name"]
-    except (ClientError, IndexError, KeyError):
-        log.exception("could not read instance state")
+    the Jenkins-repo webhook path. NOT used by the async task any more --
+    see _handle_async_task, which additionally waits out a `stopping` state
+    (finding 6) before deciding whether to start."""
+    state = _describe_instance_state()
+    if state is None:
         return None
 
     if state == "running":
@@ -280,18 +462,97 @@ def _start_instance_if_stopped(repo):
     return state
 
 
-def _handle_async_task(event):
-    """The self-invoked half of the T-034 redeliver path. Never reachable
-    from the Function URL: it has no "requestContext" and this handler is
-    only ever invoked this way by _self_invoke, whose Lambda permission is
-    scoped to this function's own ARN."""
+def _wait_for_instance_stopped(
+    timeout_seconds=INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS,
+    poll_interval_seconds=INSTANCE_STOPPING_POLL_INTERVAL_SECONDS,
+    sleep_fn=None,
+    clock_fn=None,
+):
+    """Bounded wait for a `stopping` instance to reach `stopped`. Returns the
+    LAST observed state (which may still be "stopping" on timeout, or None if
+    a describe call failed) -- never raises, and never waits the full 8-minute
+    healthz budget against a host that may never finish stopping.
+
+    sleep_fn/clock_fn resolved here rather than as signature defaults -- see
+    wait_for_drone_healthz's docstring for why that distinction matters.
+    """
+    sleep_fn = sleep_fn or time.sleep
+    clock_fn = clock_fn or time.monotonic
+    deadline = clock_fn() + timeout_seconds
+    while True:
+        state = _describe_instance_state()
+        if state != "stopping":
+            return state
+        if clock_fn() >= deadline:
+            return state
+        sleep_fn(poll_interval_seconds)
+
+
+def _validate_async_task(event):
+    """Defense in depth against direct invocation (module docstring, finding
+    1): independently re-check what _handle_webhook already checked before
+    scheduling this task. Returns (repo, wake_time_iso) or None."""
     repo = event.get("repo")
+    if repo not in REDELIVER_REPOS:
+        log.error("async task rejected: repo %r is not in REDELIVER_REPOS", repo)
+        return None
+
     wake_time_iso = event.get("wake_time")
+    try:
+        wake_time = datetime.datetime.fromisoformat(wake_time_iso)
+    except (TypeError, ValueError):
+        log.error("async task rejected: wake_time %r does not parse as ISO-8601", wake_time_iso)
+        return None
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    earliest = now - datetime.timedelta(seconds=WAKE_TIME_MAX_AGE_SECONDS)
+    if not (earliest <= wake_time <= now):
+        log.error(
+            "async task rejected: wake_time %s is outside [now-%ds, now] (now=%s)",
+            wake_time_iso,
+            WAKE_TIME_MAX_AGE_SECONDS,
+            now.isoformat(),
+        )
+        return None
+
+    return repo, wake_time_iso
+
+
+def _handle_async_task(event):
+    """The self-invoked half of the T-034 redeliver path. Reachable only via
+    _self_invoke's Resource-scoped grant in the ordinary case, but see the
+    module docstring for why _validate_async_task exists regardless."""
+    validated = _validate_async_task(event)
+    if validated is None:
+        return {"ok": False, "reason": "invalid task event"}
+    repo, wake_time_iso = validated
+
     log.info("async wake+redeliver task starting for %s (wake_time=%s)", repo, wake_time_iso)
 
-    state = _start_instance_if_stopped(repo)
+    state = _describe_instance_state()
     if state is None:
         return {"ok": False, "reason": "describe failed"}
+
+    if state == "stopping":
+        # Finding 6: never plunge into an 8-minute healthz wait against a host
+        # that is mid-shutdown and may not come back up as "stopped" in time.
+        state = _wait_for_instance_stopped()
+        if state != "stopped":
+            log.error(
+                "instance still %s after waiting up to %ds for it to stop; giving up rather than waiting "
+                "%ds for healthz against a host that may never come up",
+                state,
+                INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS,
+                HEALTHZ_TIMEOUT_SECONDS,
+            )
+            return {"ok": False, "reason": "stuck stopping"}
+
+    if state == "stopped":
+        ec2.start_instances(InstanceIds=[INSTANCE_ID])
+        log.info("started %s for async wake+redeliver of %s", INSTANCE_ID, repo)
+    elif state != "running":
+        log.error("instance in unexpected state %s; not starting", state)
+        return {"ok": False, "reason": "unexpected state %s" % state}
 
     if not wait_for_drone_healthz(DRONE_HEALTHZ_URL, HEALTHZ_TIMEOUT_SECONDS, HEALTHZ_POLL_INTERVAL_SECONDS):
         log.error(
@@ -308,8 +569,8 @@ def _handle_async_task(event):
 
 
 def _handle_webhook(event):
-    http = event.get("requestContext", {}).get("http", {})
-    method = http.get("method", "")
+    http_ctx = event.get("requestContext", {}).get("http", {})
+    method = http_ctx.get("method", "")
     if method != "POST":
         log.warning("rejected: method %s", method)
         return _response(405, "method not allowed")
@@ -346,7 +607,8 @@ def _handle_webhook(event):
     if repo in REDELIVER_REPOS:
         # T-034: answer at once (GitHub's 10s budget), do nothing else here.
         # Everything slow -- starting the box, waiting for Drone, redelivering
-        # -- happens in the async self-invocation.
+        # -- happens in the async self-invocation, which re-validates repo and
+        # wake_time independently (see module docstring, finding 1).
         wake_time_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _self_invoke({"repo": repo, "wake_time": wake_time_iso})
         log.info("scheduled async wake+redeliver for %s (wake_time=%s)", repo, wake_time_iso)

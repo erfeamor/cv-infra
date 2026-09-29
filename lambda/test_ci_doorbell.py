@@ -76,6 +76,12 @@ class DoorbellTestCase(unittest.TestCase):
             "Reservations": [{"Instances": [{"State": {"Name": state}}]}]
         }
 
+    def sign(self, repo, wake_time_iso):
+        return hmac.new(WEBHOOK_SECRET.encode("utf-8"), ("%s|%s" % (repo, wake_time_iso)).encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def signed_task_event(self, repo, wake_time_iso, sig=None):
+        return {"repo": repo, "wake_time": wake_time_iso, "sig": sig if sig is not None else self.sign(repo, wake_time_iso)}
+
     def now_iso(self):
         return self.module.datetime.datetime.now(self.module.datetime.timezone.utc).isoformat()
 
@@ -138,6 +144,7 @@ class TestAsyncScheduling(DoorbellTestCase):
         payload = json.loads(kwargs["Payload"])
         self.assertEqual(payload["repo"], "erfeamor/cv-admin-react")
         self.assertIn("wake_time", payload)
+        self.assertEqual(payload["sig"], self.sign(payload["repo"], payload["wake_time"]))
 
     def test_admin_react_never_reads_hooks_token_synchronously(self):
         event = push_event("erfeamor/cv-admin-react")
@@ -150,15 +157,15 @@ class TestAsyncScheduling(DoorbellTestCase):
 
 
 class TestAsyncTaskRevalidation(DoorbellTestCase):
-    """A direct, unauthenticated-by-HTTP invocation of the async task shape
-    (no requestContext) must not be trusted just because it reached the
-    function -- see the module docstring. These exercise handler() with a
-    hand-built task event, as if something other than _self_invoke had
-    called this function directly."""
+    """_validate_async_task is the SECOND authentication layer (behind the
+    signature -- see TestAsyncTaskSignature). Every event here carries a
+    correctly computed `sig` for its OWN repo/wake_time, so these exercise
+    revalidation specifically, not the signature check."""
 
     def test_rejects_repo_outside_redeliver_allowlist(self):
+        event = self.signed_task_event("erfeamor/some-other-repo", self.now_iso())
         with self.assertLogs(self.module.log, level="ERROR"):
-            result = self.module.handler({"repo": "erfeamor/some-other-repo", "wake_time": self.now_iso()}, None)
+            result = self.module.handler(event, None)
         self.assertFalse(result["ok"])
         self.module.ec2.describe_instances.assert_not_called()
 
@@ -166,45 +173,136 @@ class TestAsyncTaskRevalidation(DoorbellTestCase):
         # erfeamor/cv-database is a real, allowed repo -- just not one that
         # gets the async redeliver path. It must be rejected here exactly
         # like an unknown repo would be.
+        event = self.signed_task_event("erfeamor/cv-database", self.now_iso())
         with self.assertLogs(self.module.log, level="ERROR"):
-            result = self.module.handler({"repo": "erfeamor/cv-database", "wake_time": self.now_iso()}, None)
+            result = self.module.handler(event, None)
         self.assertFalse(result["ok"])
         self.module.ec2.describe_instances.assert_not_called()
 
     def test_rejects_unparseable_wake_time(self):
+        event = self.signed_task_event("erfeamor/cv-admin-react", "not-a-timestamp")
         with self.assertLogs(self.module.log, level="ERROR"):
-            result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": "not-a-timestamp"}, None)
+            result = self.module.handler(event, None)
         self.assertFalse(result["ok"])
         self.module.ec2.describe_instances.assert_not_called()
 
     def test_rejects_missing_wake_time(self):
-        with self.assertLogs(self.module.log, level="ERROR"):
+        # No wake_time at all -- also has no valid sig (sig covers wake_time),
+        # so this is rejected at the signature layer already; either way,
+        # nothing must be called.
+        with self.assertLogs(self.module.log, level="WARNING"):
             result = self.module.handler({"repo": "erfeamor/cv-admin-react"}, None)
         self.assertFalse(result["ok"])
         self.module.ec2.describe_instances.assert_not_called()
 
     def test_rejects_wake_time_older_than_15_minutes(self):
         stale = (self.module.datetime.datetime.now(self.module.datetime.timezone.utc) - self.module.datetime.timedelta(minutes=20)).isoformat()
+        event = self.signed_task_event("erfeamor/cv-admin-react", stale)
         with self.assertLogs(self.module.log, level="ERROR"):
-            result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": stale}, None)
+            result = self.module.handler(event, None)
         self.assertFalse(result["ok"])
         self.module.ec2.describe_instances.assert_not_called()
 
     def test_rejects_wake_time_in_the_future(self):
         future = (self.module.datetime.datetime.now(self.module.datetime.timezone.utc) + self.module.datetime.timedelta(minutes=5)).isoformat()
+        event = self.signed_task_event("erfeamor/cv-admin-react", future)
         with self.assertLogs(self.module.log, level="ERROR"):
-            result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": future}, None)
+            result = self.module.handler(event, None)
         self.assertFalse(result["ok"])
         self.module.ec2.describe_instances.assert_not_called()
 
     def test_accepts_recent_wake_time_for_redeliver_repo(self):
         self.set_instance_state("running")
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
         with mock.patch.object(self.module, "wait_for_drone_healthz", return_value=True), mock.patch.object(
             self.module, "redeliver_failed_deliveries"
         ) as redeliver_mock:
-            result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": self.now_iso()}, None)
+            result = self.module.handler(event, None)
         self.assertTrue(result["ok"])
         redeliver_mock.assert_called_once()
+
+
+# --- Review round 1 finding 1, round 2 correction (RED): the async task ----
+# authenticates its OWN event with an HMAC signature, since the public IAM
+# permission is deliberately unconditioned (bd65353's live finding) and
+# cannot itself distinguish "arrived via the Function URL" from "arrived via
+# a direct lambda:InvokeFunction call".
+
+
+class TestAsyncTaskSignature(DoorbellTestCase):
+    def test_no_sig_rejected_with_zero_calls(self):
+        with mock.patch.object(self.module, "_github_list") as github_list, mock.patch.object(
+            self.module, "_github_request"
+        ) as github_request:
+            with self.assertLogs(self.module.log, level="WARNING"):
+                result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": self.now_iso()}, None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "bad signature")
+        self.module.ec2.describe_instances.assert_not_called()
+        self.module.ec2.start_instances.assert_not_called()
+        github_list.assert_not_called()
+        github_request.assert_not_called()
+
+    def test_wrong_sig_rejected_with_zero_calls(self):
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso(), sig="0" * 64)
+        with self.assertLogs(self.module.log, level="WARNING"):
+            result = self.module.handler(event, None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "bad signature")
+        self.module.ec2.describe_instances.assert_not_called()
+
+    def test_non_string_sig_rejected(self):
+        event = {"repo": "erfeamor/cv-admin-react", "wake_time": self.now_iso(), "sig": 12345}
+        result = self.module.handler(event, None)
+        self.assertFalse(result["ok"])
+        self.module.ec2.describe_instances.assert_not_called()
+
+    def test_correctly_signed_event_proceeds(self):
+        self.set_instance_state("running")
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
+        with mock.patch.object(self.module, "wait_for_drone_healthz", return_value=True), mock.patch.object(
+            self.module, "redeliver_failed_deliveries"
+        ) as redeliver_mock:
+            result = self.module.handler(event, None)
+        self.assertTrue(result["ok"])
+        redeliver_mock.assert_called_once()
+
+    def test_tampered_repo_after_signing_is_rejected(self):
+        wake_time = self.now_iso()
+        sig = self.sign("erfeamor/cv-admin-react", wake_time)
+        event = {"repo": "erfeamor/some-other-repo", "wake_time": wake_time, "sig": sig}
+        with self.assertLogs(self.module.log, level="WARNING"):
+            result = self.module.handler(event, None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "bad signature")
+        self.module.ec2.describe_instances.assert_not_called()
+
+    def test_tampered_wake_time_after_signing_is_rejected(self):
+        repo = "erfeamor/cv-admin-react"
+        sig = self.sign(repo, self.now_iso())
+        different_wake_time = (
+            self.module.datetime.datetime.now(self.module.datetime.timezone.utc) - self.module.datetime.timedelta(seconds=1)
+        ).isoformat()
+        event = {"repo": repo, "wake_time": different_wake_time, "sig": sig}
+        with self.assertLogs(self.module.log, level="WARNING"):
+            result = self.module.handler(event, None)
+        self.assertFalse(result["ok"])
+        self.module.ec2.describe_instances.assert_not_called()
+
+    def test_http_shaped_event_still_requires_body_hmac_regardless_of_sig_field(self):
+        # A hybrid forged event: HTTP-shaped (has requestContext, so it
+        # dispatches to _handle_webhook) but also carries repo/wake_time/sig
+        # as if trying to smuggle a pre-authenticated async task through the
+        # public entry point. Dispatch is keyed ONLY on "requestContext";
+        # _handle_webhook still demands its own, separate body HMAC and
+        # never even looks at `sig`.
+        wake_time = self.now_iso()
+        event = push_event("erfeamor/cv-admin-react", secret="wrong-secret")
+        event["sig"] = self.sign("erfeamor/cv-admin-react", wake_time)
+        event["wake_time"] = wake_time
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 401)
+        self.module.lambda_client.invoke.assert_not_called()
 
 
 # --- Case 4 (RED): bounded healthz wait -------------------------------------
@@ -240,10 +338,11 @@ class TestHealthzWait(DoorbellTestCase):
 
     def test_async_task_skips_redelivery_when_healthz_never_succeeds(self):
         self.set_instance_state("running")
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
         with mock.patch.object(self.module, "wait_for_drone_healthz", return_value=False) as wait_mock, mock.patch.object(
             self.module, "redeliver_failed_deliveries"
         ) as redeliver_mock:
-            result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": self.now_iso()}, None)
+            result = self.module.handler(event, None)
         wait_mock.assert_called_once()
         redeliver_mock.assert_not_called()
         self.assertFalse(result["ok"])
@@ -273,10 +372,11 @@ class TestInstanceStopping(DoorbellTestCase):
         self.module.ec2.describe_instances.side_effect = lambda **kw: {
             "Reservations": [{"Instances": [{"State": {"Name": next(states)}}]}]
         }
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
         with mock.patch.object(self.module.time, "sleep") as sleep_mock, mock.patch.object(
             self.module, "wait_for_drone_healthz", return_value=True
         ), mock.patch.object(self.module, "redeliver_failed_deliveries"):
-            result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": self.now_iso()}, None)
+            result = self.module.handler(event, None)
         self.assertTrue(result["ok"])
         self.module.ec2.start_instances.assert_called_once_with(InstanceIds=[ENV["INSTANCE_ID"]])
         self.assertTrue(sleep_mock.called)
@@ -286,11 +386,12 @@ class TestInstanceStopping(DoorbellTestCase):
             "Reservations": [{"Instances": [{"State": {"Name": "stopping"}}]}]
         }
         clock = {"t": 0}
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
         with mock.patch.object(self.module.time, "monotonic", side_effect=lambda: clock["t"]), mock.patch.object(
             self.module.time, "sleep", side_effect=lambda s: clock.update(t=clock["t"] + s)
         ), mock.patch.object(self.module, "wait_for_drone_healthz") as healthz_mock:
             with self.assertLogs(self.module.log, level="ERROR"):
-                result = self.module.handler({"repo": "erfeamor/cv-admin-react", "wake_time": self.now_iso()}, None)
+                result = self.module.handler(event, None)
         self.assertFalse(result["ok"])
         self.module.ec2.start_instances.assert_not_called()
         healthz_mock.assert_not_called()

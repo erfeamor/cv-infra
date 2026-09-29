@@ -46,20 +46,32 @@ handler has two entry points, dispatched on event shape:
     directly here, only to GitHub, which re-sends Drone's OWN previously
     -signed delivery.
 
---- Review round 1 (0567f6a), finding 1: the async task re-validates its event
+--- Review round 1 finding 1, round 2 correction: the async task authenticates
+its OWN event, because the IAM layer can't be narrowed here
 
-The public `lambda:InvokeFunctionUrl` permission (ci-on-demand.tf) is scoped
-to Function-URL invocation, not to the generic `lambda:InvokeFunction` Invoke
-API -- but `aws_lambda_permission` has no generic Condition block (checked
-against the AWS provider's resource schema; only source_arn, source_account,
-principal_org_id, and function_url_auth_type -- the last valid only with
-lambda:InvokeFunctionUrl -- are available), so that IAM scoping is the whole
-defense at that layer. Belt-and-suspenders: _validate_async_task independently
-re-checks the two facts _handle_webhook already checked before scheduling this
-task (repo is in REDELIVER_REPOS; wake_time is recent), so even a same-account
-principal invoking this function directly with an arbitrary payload can, at
-worst, trigger a legitimate wake+redeliver for an already-allowed repo inside
-a narrow recent window -- never an arbitrary action.
+The public `aws_lambda_permission` on this function (ci-on-demand.tf) grants
+the plain, unconditioned `lambda:InvokeFunction` action to Principal = "*" --
+deliberately, and it must stay that way: T-019 (bd65353) verified LIVE that
+this account's Lambda block-public-access setting makes the narrower
+`lambda:InvokeFunctionUrl` grant insufficient on its own (403, zero
+invocations), so IAM cannot distinguish "arrived via the Function URL" from
+"arrived via a direct Invoke API call" here. That means ANY AWS principal in
+ANY account can invoke this function directly, with an arbitrary payload,
+bypassing the Function URL entirely -- including one shaped like the async
+task event (no "requestContext").
+
+The fix is therefore in the payload, not the transport: `_handle_webhook`
+signs {repo, wake_time} with the SAME webhook secret already used for
+GitHub's own signature (see `_sign_async_task`), and `_handle_async_task`
+verifies that signature with `hmac.compare_digest` BEFORE anything else --
+before touching EC2, before touching SSM for the hooks token, before any
+GitHub call. An attacker who can invoke this function directly still cannot
+produce a valid signature without the webhook secret, so they get exactly as
+far as an unsigned webhook POST would: a log line and nothing else.
+`_validate_async_task` (the REDELIVER_REPOS allowlist, the wake_time window)
+runs strictly AFTER the signature check, as a second, independent layer --
+kept because it costs nothing and narrows the blast radius further even in a
+world where the secret leaked.
 """
 
 import base64
@@ -149,6 +161,41 @@ def _webhook_secret():
     if _secret_cache is None:
         _secret_cache = ssm.get_parameter(Name=SECRET_PARAM, WithDecryption=True)["Parameter"]["Value"]
     return _secret_cache
+
+
+def _canonical_async_task(repo, wake_time_iso):
+    """The exact bytes _sign_async_task signs over. A fixed, simple format
+    (not json.dumps) so signing and verifying can never disagree about key
+    order or whitespace -- the classic way a "sign the dict" scheme quietly
+    breaks."""
+    return "%s|%s" % (repo, wake_time_iso)
+
+
+def _sign_async_task(repo, wake_time_iso):
+    """HMAC over (repo, wake_time), using the SAME secret GitHub's own webhook
+    signature already relies on (_webhook_secret) -- no new secret to
+    provision. This is round 2's fix for review round 1 finding 1: see the
+    module docstring for why the IAM layer alone can't close this."""
+    return hmac.new(
+        _webhook_secret().encode("utf-8"),
+        _canonical_async_task(repo, wake_time_iso).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _async_task_signature_ok(event):
+    """True only if event carries a `sig` that verifies against event's OWN
+    repo/wake_time. compare_digest, not ==, for the same timing reason as the
+    webhook body check. Deliberately tolerant of missing/wrong-typed fields
+    (returns False, never raises) -- a malformed forgery attempt is exactly
+    as unauthenticated as a well-formed one."""
+    repo = event.get("repo")
+    wake_time_iso = event.get("wake_time")
+    sig = event.get("sig")
+    if not isinstance(sig, str) or not sig or repo is None or wake_time_iso is None:
+        return False
+    expected = _sign_async_task(repo, wake_time_iso)
+    return hmac.compare_digest(sig, expected)
 
 
 def _hooks_token():
@@ -519,9 +566,18 @@ def _validate_async_task(event):
 
 
 def _handle_async_task(event):
-    """The self-invoked half of the T-034 redeliver path. Reachable only via
-    _self_invoke's Resource-scoped grant in the ordinary case, but see the
-    module docstring for why _validate_async_task exists regardless."""
+    """The self-invoked half of the T-034 redeliver path. The public
+    aws_lambda_permission on this function is deliberately unconditioned
+    (ci-on-demand.tf), so this event may have arrived via a direct
+    lambda:InvokeFunction call from any AWS principal, not only via
+    _self_invoke -- see the module docstring for why. Signature verification
+    MUST run before anything else: before EC2, before SSM, before any GitHub
+    call. _validate_async_task runs only after a valid signature, as a second,
+    independent layer."""
+    if not _async_task_signature_ok(event):
+        log.warning("async task rejected: missing or invalid signature")
+        return {"ok": False, "reason": "bad signature"}
+
     validated = _validate_async_task(event)
     if validated is None:
         return {"ok": False, "reason": "invalid task event"}
@@ -607,10 +663,12 @@ def _handle_webhook(event):
     if repo in REDELIVER_REPOS:
         # T-034: answer at once (GitHub's 10s budget), do nothing else here.
         # Everything slow -- starting the box, waiting for Drone, redelivering
-        # -- happens in the async self-invocation, which re-validates repo and
-        # wake_time independently (see module docstring, finding 1).
+        # -- happens in the async self-invocation, which authenticates its own
+        # event with `sig` (see module docstring, finding 1 round 2) and then
+        # re-validates repo/wake_time independently as a second layer.
         wake_time_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        _self_invoke({"repo": repo, "wake_time": wake_time_iso})
+        sig = _sign_async_task(repo, wake_time_iso)
+        _self_invoke({"repo": repo, "wake_time": wake_time_iso, "sig": sig})
         log.info("scheduled async wake+redeliver for %s (wake_time=%s)", repo, wake_time_iso)
         return _response(202, "accepted")
 

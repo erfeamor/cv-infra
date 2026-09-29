@@ -711,17 +711,27 @@ run "ci_on_demand" {
     error_message = "The GitHub webhook secret must be a SecureString"
   }
 
-  # The permission whose ABSENCE made the whole deployment inert: without SOME
-  # public grant here, this account's default Lambda public-access block
-  # makes the Function URL answer 403 and the handler is never reached.
-  # Every other assertion in this file passed while that was broken, which is
-  # why it gets one of its own. Originally an unconditioned lambda:InvokeFunction
-  # grant (verified live 2026-08-19) -- review round 1, finding 1(a) narrowed
-  # this to lambda:InvokeFunctionUrl (see the t034_review_round1 run below for
-  # why, and the UNVERIFIED note on the resource itself in ci-on-demand.tf).
+  # The permission whose ABSENCE made the whole deployment inert: without an
+  # unconditioned lambda:InvokeFunction grant, this account's default Lambda
+  # public-access block makes the Function URL answer 403 and the handler is
+  # never reached. Every other assertion in this file passed while that was
+  # broken, which is why it gets one of its own.
+  #
+  # Review round 1 (0567f6a) tried narrowing this to lambda:InvokeFunctionUrl
+  # (finding 1(a)); round 2 (driver review) reverted it -- T-019 (bd65353)
+  # verified LIVE that InvokeFunctionUrl alone is insufficient on this
+  # account. Pinned to InvokeFunction here so a future edit fails THIS
+  # assertion at review time instead of silently 403ing the doorbell on the
+  # next apply. Finding 1's real fix is the async task's own HMAC (see
+  # lambda/ci_doorbell/index.py's _async_task_signature_ok).
+  assert {
+    condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunction"
+    error_message = "The doorbell needs an unconditioned lambda:InvokeFunction grant or its Function URL returns 403 without ever invoking the handler (verified live 2026-08-19, T-019 bd65353; re-verified round 2 of T-034's review -- do not narrow this to InvokeFunctionUrl without a live test)"
+  }
+
   assert {
     condition     = aws_lambda_permission.ci_doorbell_public_invoke.principal == "*"
-    error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py, not this permission"
+    error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py (both the webhook body signature and, for the async task, its own signature), not this permission"
   }
 
   # The doorbell may START the one instance and nothing else.
@@ -863,28 +873,23 @@ run "t034_doorbell_redelivery" {
 }
 
 # ---------------------------------------------------------------------------
-# T-034 review round 1 (0567f6a) findings 1(a), 4, 7 -- the public invoke
-# permission is scoped to Function-URL invocation, async retries are
-# disabled, the timeout budget is named and bounded, and the reaper's grace
-# variable is actually wired to the Lambda that reads it. Finding 10 (one
-# local for the CI host's public address) is a text-level property
-# (aws_eip.drone.public_ip is unknown under `command = plan`, same
-# limitation this file documents throughout) and is covered by
-# scripts/check-static.sh instead, not here.
+# T-034 review round 1 (0567f6a) findings 4, 7 -- async retries are disabled,
+# the timeout budget is named and bounded, and the reaper's grace variable is
+# actually wired to the Lambda that reads it. Finding 1(a) (the public invoke
+# permission) was tried here as lambda:InvokeFunctionUrl-only and REVERTED in
+# round 2 (driver review) -- T-019 (bd65353) verified live that this account
+# needs the unconditioned InvokeFunction grant; that assertion now lives back
+# in the "ci_on_demand" run above, pinned to InvokeFunction. Finding 1's real
+# fix is the async task's own HMAC signature -- see the
+# t034_async_task_signature run in test_ci_doorbell.py (code-level, not
+# Terraform: the signature covers repo+wake_time, not any IAM-visible
+# property). Finding 10 (one local for the CI host's public address) is a
+# text-level property (aws_eip.drone.public_ip is unknown under
+# `command = plan`, same limitation this file documents throughout) and is
+# covered by scripts/check-static.sh instead, not here.
 # ---------------------------------------------------------------------------
 run "t034_review_round1" {
   command = plan
-
-  # --- Finding 1(a): Function-URL-only public invocation -------------------
-  assert {
-    condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunctionUrl"
-    error_message = "The public grant must be lambda:InvokeFunctionUrl, not the generic lambda:InvokeFunction -- the latter also authorizes the plain Invoke API for ANY AWS principal, bypassing the Function URL/HMAC path entirely (review round 1, finding 1(a))"
-  }
-
-  assert {
-    condition     = aws_lambda_permission.ci_doorbell_public_invoke.function_url_auth_type == "NONE"
-    error_message = "The public grant's function_url_auth_type must match the Function URL's own authorization_type (NONE) -- AWS ties the two together for this action"
-  }
 
   # --- Finding 4: async retries disabled, and the timeout budget -----------
   assert {

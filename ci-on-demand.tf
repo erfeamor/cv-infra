@@ -234,54 +234,53 @@ resource "aws_lambda_function_url" "ci_doorbell" {
   authorization_type = "NONE"
 }
 
-# WITHOUT SOME PUBLIC PERMISSION HERE THE FUNCTION URL RETURNS 403 AND THE
-# LAMBDA IS NEVER INVOKED -- found at stage-4 verification (T-019), not by
-# reading anything: every request came back as AWS's own
-# AccessDeniedException with zero invocations logged, while a direct `lambda
-# invoke` of the same function worked perfectly. Accounts created after
-# ~2024 — this one dates to 2026-07 — have Lambda's "block public access"
-# behaviour on by default, and at that time only granting the generic
-# `lambda:InvokeFunction` action (not the Function-URL-specific
-# `lambda:InvokeFunctionUrl`) was found to clear it.
+# WITHOUT THIS THE FUNCTION URL RETURNS 403 AND THE LAMBDA IS NEVER INVOKED.
 #
-# Review round 1 (0567f6a), finding 1(a): that original grant --
-# `action = "lambda:InvokeFunction"`, `principal = "*"`, no scoping -- let
-# ANY AWS principal invoke this function directly through the ordinary
-# Invoke API, bypassing the Function URL/HMAC path entirely and reaching
-# _handle_async_task with an attacker-chosen payload (mitigated in code by
-# index.py's _validate_async_task regardless, but the IAM layer should not
-# rely on that alone). This resource is now the AWS-documented, narrower
-# grant for a public NONE-auth Function URL: action =
-# "lambda:InvokeFunctionUrl" + function_url_auth_type = "NONE". That
-# action is checked ONLY on requests that arrive through the Function URL
-# itself; the plain Invoke API requires "lambda:InvokeFunction", which is
-# no longer granted to Principal = "*" at all, so a direct
-# `aws lambda invoke` from an external account is denied.
+# Found at stage-4 verification, not by reading anything: every request to the
+# URL came back as AWS's own AccessDeniedException with zero invocations
+# logged, while a direct `lambda invoke` of the same function worked perfectly.
 #
-# `aws_lambda_permission` has no generic Condition block (checked against
-# the aws provider's resource schema: only source_arn, source_account,
-# principal_org_id and function_url_auth_type exist, the last valid only
-# with lambda:InvokeFunctionUrl) -- so a condition like
-# "lambda:InvokedViaFunctionUrl" cannot be bolted onto a broader
-# InvokeFunction grant; narrowing the ACTION itself is the only tool this
-# resource offers, which is what the change above does.
+# Accounts created after ~2024 — this one dates to 2026-07 — have Lambda's
+# "block public access" behaviour on by default. Under it, the
+# `lambda:InvokeFunctionUrl` grant that `aws_lambda_function_url` creates for
+# an AuthType=NONE url is NOT sufficient on its own: the block specifically
+# stops that permission from conferring public access. An unconditioned
+# `lambda:InvokeFunction` grant is what actually opens the path.
 #
-# UNVERIFIED, on purpose, under this task's hard rule against real AWS
-# calls: this reverses the exact grant the 2026-07 stage-4 session found
-# necessary against this account's Lambda public-access-block setting.
-# If the block genuinely requires unconditioned InvokeFunction regardless
-# of action (rather than the InvokeFunctionUrl action specifically, which
-# is what the account's own IAM/Lambda docs describe as the intended
-# mechanism), the Function URL will 403 again after the next apply. That
-# is a live-verification item for the driver (see the PR), not something
-# to silently "fix" by reverting this without another security pass —
-# _validate_async_task's re-check stays either way.
+# Note the asymmetry, because it wastes an hour otherwise: this statement must
+# NOT carry function_url_auth_type. AWS rejects that outright —
+# "FunctionUrlAuthType is only supported for lambda:InvokeFunctionUrl action".
+#
+# On Principal = "*", which a reviewer should stop at: it is genuinely
+# unconditioned, and it means anyone may invoke this function. That is
+# acceptable here for one specific reason — **the authentication is in the
+# handler, not in the transport**. index.py verifies GitHub's HMAC over the raw
+# body before it touches the EC2 API, so an unsigned invocation, by any route,
+# returns 401 and starts nothing. Verified live: an unsigned POST through this
+# URL returns "bad signature" and the instance is untouched. If that check is
+# ever weakened, this grant becomes a genuine cost-DoS hole.
+#
+# Review round 1 (0567f6a) tried narrowing this to lambda:InvokeFunctionUrl +
+# function_url_auth_type = "NONE" (finding 1(a)) to stop a direct
+# lambda:InvokeFunction call from reaching _handle_async_task unauthenticated.
+# Round 2 (driver review) reverted that: T-019 (bd65353) verified LIVE that
+# this account's Lambda block-public-access setting makes InvokeFunctionUrl
+# alone insufficient (403, zero invocations) and that the unconditioned
+# InvokeFunction grant is what actually opens the path -- narrowing it here
+# would silently break the doorbell for the Jenkins repos too on the next
+# apply. Finding 1's real fix now lives one layer down: every async task
+# event must itself carry a valid HMAC over (repo, wake_time), verified in
+# _handle_async_task before anything else happens (index.py) -- so a direct,
+# unconditioned InvokeFunction call still reaches the handler, but with
+# nothing to act on unless it also holds the webhook secret. Do NOT narrow
+# this permission again without a LIVE test proving InvokeFunctionUrl alone
+# still works on this account (terraform test pins the action below so a
+# future edit here fails loudly, not silently, at review time).
 resource "aws_lambda_permission" "ci_doorbell_public_invoke" {
-  statement_id           = "AllowPublicInvokeViaFunctionUrl"
-  action                 = "lambda:InvokeFunctionUrl"
-  function_name          = aws_lambda_function.ci_doorbell.function_name
-  principal              = "*"
-  function_url_auth_type = "NONE"
+  statement_id  = "AllowPublicInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ci_doorbell.function_name
+  principal     = "*"
 }
 
 # Review round 1, finding 4: Lambda's default async-invoke behaviour retries

@@ -88,6 +88,73 @@ resource "aws_instance" "drone" {
   vpc_security_group_ids = [aws_security_group.drone.id]
   iam_instance_profile   = aws_iam_instance_profile.drone.name
 
+  # T-007 (H1 decision 2): the plain AL2023 AMI defaults to an 8 GB root --
+  # too small for this host's measured ~17 GiB of whole-disk usage (T-007's
+  # disk measurement, 2026-09-24 -- Docker images/build cache, not the only
+  # consumer). Explicit and sized with headroom, not left to the AMI
+  # default. gp3 (not gp2) matches the rest of this module's convention, and
+  # encrypted at rest with the AWS-managed EBS key -- no CMK needed for this
+  # box. Re-measure after the first real build of every repo
+  # (docs/t007-ci-host-replace-runbook.md's post-replace verification): if
+  # usage exceeds 75% of this 20 GB, file a follow-up to resize rather than
+  # letting it fill silently.
+  #
+  # REVIEW ROUND 1, FINDING 1 (corrected round 2, finding 5) -- read before
+  # touching this block or `metadata_options` below: on the AWS provider
+  # pinned here (5.100.0), only `encrypted` is ForceNew on
+  # `root_block_device` -- a `volume_size` change alone is not (EBS volumes
+  # can grow in place via ModifyVolume; a decrease specifically would just
+  # fail at apply against the real API, not plan a replace). `ignore_changes`
+  # below covers only `ami` and the CIKeepAlive tags -- it does NOT cover
+  # `encrypted`, so once this PR's config lands, even a PLAIN `terraform
+  # plan` (no `-replace` needed at all) already proposes replacing this
+  # instance, because the live instance's actual root (30 GB, unencrypted --
+  # the ECS AMI's default) is unencrypted and this config asks for encrypted.
+  # `-replace` is still the command used (see
+  # docs/t007-ci-host-replace-runbook.md) for clarity/intent, but it is not
+  # uniquely what forces the AMI onto the new host: ANY forced replacement,
+  # by `-replace` or by this `encrypted` diff alone, builds the new resource
+  # instance from the CURRENT config for every attribute, including ones
+  # listed in `ignore_changes` -- that meta-argument only suppresses
+  # in-place UPDATE plans on an existing instance, it has no effect on what
+  # a freshly created replacement instance is built from. Consequence:
+  # because the replacement itself is no longer optional once this merges,
+  # it must be applied from the branch and proven live BEFORE merging to
+  # master (same convention as T-004/T-008's state-affecting changes) --
+  # master must never carry this diff unapplied, or the next person to run
+  # a routine `plan` gets a surprise instance replacement they didn't ask
+  # for.
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+    encrypted   = true
+  }
+
+  # T-007 (H1 decision 3, carried from T-005): require IMDSv2 and cap the hop
+  # limit at 1. This denies IMDS to any container reachable through this
+  # host's Docker BRIDGE networks (e.g. the "drone" network drone-server/
+  # drone-runner share) -- hop 1 stops it one hop short of the host's own
+  # loopback route. Host-side `param()` (templates/drone-user-data.sh) and
+  # SSM Session Manager both go through the SSM agent/AWS CLI on the host
+  # itself, which is hop 0 from its own perspective, so neither is affected.
+  #
+  # REVIEW ROUND 1, FINDING 2 -- KNOWN GAP, NOT CLOSED BY THIS: a container
+  # started with `--network host` is NOT one hop away, it IS the host's own
+  # network namespace, so the hop-1 cap does not apply to it and it CAN
+  # fetch IMDS credentials. drone-runner mounts /var/run/docker.sock
+  # (templates/drone-user-data.sh) and Jenkins build steps run against the
+  # same socket (templates/jenkins-provision.sh), so any build step that
+  # runs `docker run --network host ...` gets the instance role's
+  # credentials same as before this change. Verify the bridge-network case
+  # is denied and record the host-network gap explicitly rather than
+  # claiming full protection (see docs/t007-ci-host-replace-runbook.md) --
+  # closing the host-network gap is T-005's work (docker socket / build
+  # isolation), not this task's.
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
   # Concatenated so a *future* replacement instance boots straight into
   # Drone + Jenkins + proxy. Deliberately NOT paired with
   # user_data_replace_on_change (see header comment) -- on the box that is
@@ -135,6 +202,7 @@ resource "aws_instance" "drone" {
     aws_ssm_parameter.drone_rpc_secret,
     aws_ssm_parameter.drone_github_client_id,
     aws_ssm_parameter.drone_github_client_secret,
+    aws_ssm_parameter.drone_database_secret,
     aws_ssm_parameter.jenkins_admin_password,
     aws_ssm_parameter.github_pat_ci,
     aws_ssm_parameter.jenkins_provision_sha256,
@@ -240,10 +308,21 @@ resource "null_resource" "jenkins_provision" {
         agent_elapsed=$((agent_elapsed + agent_poll_s))
       done
 
+      # T-007 review round 2 (BLOCKER, correcting round 1's finding 5): the
+      # cloud-init wait that guards against racing a fresh replace's own
+      # user_data run must NOT live inside jenkins-provision.sh itself --
+      # that script also runs INSIDE cloud-init on the user_data path
+      # (templates/jenkins-bootstrap.sh), so a wait embedded in it would
+      # deadlock (the script waiting for the very cloud-init run it is
+      # part of) and this SSM copy would then time out on the same lock.
+      # Sent here instead, as its own command BEFORE the script's content,
+      # in a path that is never itself inside cloud-init.
+      # scripts/check-t007-static.sh's Check D pins this split.
       payload_file=$(mktemp)
       trap 'rm -f "$payload_file"' EXIT
       jq -n --rawfile s "${local_file.jenkins_provision_script.filename}" --arg iid "$instance_id" \
-        '{"InstanceIds":[$iid],"DocumentName":"AWS-RunShellScript","Comment":"cv-infra T-002: provision Jenkins + reverse proxy","Parameters":{"commands":[$s]}}' \
+        --arg wait "cloud-init status --wait || true" \
+        '{"InstanceIds":[$iid],"DocumentName":"AWS-RunShellScript","Comment":"cv-infra T-002: provision Jenkins + reverse proxy","Parameters":{"commands":[$wait,$s]}}' \
         >"$payload_file"
       cmd_id=$(aws ssm send-command --region "$region" \
         --cli-input-json "file://$payload_file" \

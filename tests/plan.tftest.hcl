@@ -806,6 +806,223 @@ run "ci_on_demand" {
 }
 
 # ---------------------------------------------------------------------------
+# T-007 -- CI host replaced onto a plain AL2023 AMI with a measured root,
+# IMDSv2 hardening, and DRONE_DATABASE_SECRET. Cases 1-3 and 6 are knowable
+# under `command = plan`: the AMI filter, root_block_device and
+# metadata_options are all explicit config on aws_instance.drone (not
+# AWS-computed), and the rendered user_data is a pure function of the
+# templatefile() inputs. Case 4 (the SSM param's value) needs `command =
+# apply` -- random_password.result is generated at Create time, so it is
+# unknown-until-apply even under mock_provider (same class of limitation as
+# aws_eip.drone.public_ip elsewhere in this file). Case 5 (lifecycle
+# ignore_changes) and case 8 (the Lambda env vars, which reference
+# aws_instance.drone.id -- a genuinely AWS-computed attribute, unknown at
+# plan for a not-yet-created instance) aren't visible to `terraform test` at
+# all -- both are covered by scripts/check-t007-static.sh instead, the same
+# source-text convention scripts/check-t008-static.sh already uses for this
+# exact class of gap.
+# ---------------------------------------------------------------------------
+run "t007_ci_host_hardening" {
+  command = plan
+
+  # Case 1: the premise correction (2026-09-25) established that ci.tf's
+  # aws_instance.drone already resolves data.aws_ami.al2023 -- the SAME
+  # plain-AL2023 data source domain_service uses -- and that ignore_changes
+  # alone is what has kept the live host on the old ECS-optimized image.
+  # Nothing about the filter itself needed to change; this pins that so a
+  # future edit can't silently point either instance back at an
+  # ECS-optimized filter without failing here.
+  # data.aws_ami.al2023.filter is a set of objects (no addressable index),
+  # so every check below flattens across the whole set rather than indexing
+  # element 0.
+  assert {
+    condition     = anytrue([for f in data.aws_ami.al2023.filter : f.name == "name"])
+    error_message = "data.aws_ami.al2023 must filter on the AMI name"
+  }
+
+  assert {
+    condition     = alltrue(flatten([for f in data.aws_ami.al2023.filter : [for v in f.values : !can(regex("ecs", v))]]))
+    error_message = "data.aws_ami.al2023's filter values must not match the ECS-optimized AMI variant"
+  }
+
+  assert {
+    condition     = contains(flatten([for f in data.aws_ami.al2023.filter : f.values]), "al2023-ami-2023.*-x86_64")
+    error_message = "data.aws_ami.al2023 must keep the plain AL2023 filter -- a looser pattern also matches the ECS-optimized variant"
+  }
+
+  assert {
+    condition     = aws_instance.drone.ami == data.aws_ami.al2023.id
+    error_message = "aws_instance.drone must resolve its AMI from the plain AL2023 data source"
+  }
+
+  # Case 2: explicit, measured root -- not the plain AMI's 8 GB default.
+  assert {
+    condition     = aws_instance.drone.root_block_device[0].volume_size == 20
+    error_message = "aws_instance.drone's root volume must be sized to 20 GB (T-007 H1 decision 2, from the ~17 GiB measured in use) -- the plain AL2023 AMI defaults to 8 GB, which would not fit today's contents"
+  }
+
+  assert {
+    condition     = aws_instance.drone.root_block_device[0].volume_type == "gp3"
+    error_message = "aws_instance.drone's root volume must be gp3, matching the rest of this module's convention"
+  }
+
+  assert {
+    condition     = aws_instance.drone.root_block_device[0].encrypted == true
+    error_message = "aws_instance.drone's root volume must be encrypted at rest"
+  }
+
+  # Case 3: IMDSv2 required, hop limit 1 (T-007 H1 decision 3 / T-005).
+  assert {
+    condition     = aws_instance.drone.metadata_options[0].http_tokens == "required"
+    error_message = "aws_instance.drone must require IMDSv2 tokens"
+  }
+
+  assert {
+    condition     = aws_instance.drone.metadata_options[0].http_put_response_hop_limit == 1
+    error_message = "aws_instance.drone's metadata hop limit must be 1, so a container cannot reach IMDS through a Docker network hop"
+  }
+
+  # Case 4 (plan-time half): the parameter exists, is a SecureString, and
+  # lives under ci/drone/ -- the value itself (traced to random_password,
+  # not a literal) needs `command = apply`, see the run below.
+  assert {
+    condition     = aws_ssm_parameter.drone_database_secret.type == "SecureString"
+    error_message = "DRONE_DATABASE_SECRET must be stored as a SecureString"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.drone_database_secret.name == "/${var.project_name}/${var.environment}/ci/drone/database-secret"
+    error_message = "DRONE_DATABASE_SECRET must live at ci/drone/database-secret -- under ci/*, so the Drone host's own instance role (drone_read_ci_parameters) can read it, matching every other Drone boot secret"
+  }
+
+  # Case 6 and case 7 (review round 1, finding 9: dropped from here, not
+  # duplicated): the <8 KB user_data wall against this exact templatefile()
+  # call is already asserted once, in "ci_on_demand" above -- re-asserting
+  # the identical computed value under a second name proves nothing extra
+  # and doubles the maintenance cost of the 8192 constant. Likewise
+  # `aws_instance.drone.user_data_replace_on_change != true` is already
+  # asserted in "plan_succeeds" above. Both keep working unchanged by this
+  # task; see those two run blocks instead of repeating them here.
+
+  # Review round 1, finding 9 -- RED FIRST: DRONE_DATABASE_SECRET must
+  # actually reach the drone-server container (not just exist in SSM), and
+  # the param() path it's read from must be the exact path segment that
+  # builds aws_ssm_parameter.drone_database_secret.name above
+  # ("drone/database-secret", under the ci/ prefix param() always
+  # prepends) -- a typo in either place would pass every other assertion in
+  # this run and still leave DRONE_DATABASE_SECRET unset or fetched from
+  # the wrong SSM path at boot.
+  assert {
+    condition = length(regexall("-e DRONE_DATABASE_SECRET=", templatefile("${path.module}/templates/drone-user-data.sh", {
+      aws_region     = var.aws_region
+      project_name   = var.project_name
+      environment    = var.environment
+      server_host    = "203.0.113.10"
+      admin_username = var.drone_admin_username
+    }))) == 1
+    error_message = "templates/drone-user-data.sh must pass -e DRONE_DATABASE_SECRET to the drone-server container exactly once"
+  }
+
+  assert {
+    condition = length(regexall("param drone/database-secret", templatefile("${path.module}/templates/drone-user-data.sh", {
+      aws_region     = var.aws_region
+      project_name   = var.project_name
+      environment    = var.environment
+      server_host    = "203.0.113.10"
+      admin_username = var.drone_admin_username
+    }))) == 1
+    error_message = "templates/drone-user-data.sh must read DRONE_DATABASE_SECRET via `param drone/database-secret` -- the same ci/drone/database-secret path aws_ssm_parameter.drone_database_secret.name builds"
+  }
+
+  # Review round 1, finding 9 -- RED FIRST: the prune timer must run the
+  # PO-decided commands (image/build-cache only, age-filtered, never
+  # containers/networks), never the broader `docker system prune`.
+  # Anchored on the literal `ExecStart=` prefix, not a bare substring search
+  # -- this script's own explanatory comments quote these exact commands by
+  # name (both the wanted ones and, in the "deliberately NOT" sentence, the
+  # unwanted one), so a substring-only search would double-count against
+  # the comment text and could never legitimately assert "0 occurrences" of
+  # the forbidden command below.
+  assert {
+    condition = (
+      length(regexall("ExecStart=/usr/bin/docker image prune -af --filter until=168h", templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }))) == 1 &&
+      length(regexall("ExecStart=/usr/bin/docker builder prune -af --filter until=168h", templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }))) == 1
+    )
+    error_message = "docker-prune.service must run `docker image prune -af --filter until=168h` and `docker builder prune -af --filter until=168h` as ExecStart lines (PO decision, review round 1 finding 3)"
+  }
+
+  assert {
+    condition = length(regexall("ExecStart=.*docker system prune", templatefile("${path.module}/templates/drone-user-data.sh", {
+      aws_region     = var.aws_region
+      project_name   = var.project_name
+      environment    = var.environment
+      server_host    = "203.0.113.10"
+      admin_username = var.drone_admin_username
+    }))) == 0
+    error_message = "docker-prune.service must not run `docker system prune` -- it also removes stopped containers and unused networks, not just images/build cache (review round 1, finding 3)"
+  }
+
+  assert {
+    condition = (
+      length(regexall("After=docker.service", templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }))) == 1 &&
+      length(regexall("Requires=docker.service", templatefile("${path.module}/templates/drone-user-data.sh", {
+        aws_region     = var.aws_region
+        project_name   = var.project_name
+        environment    = var.environment
+        server_host    = "203.0.113.10"
+        admin_username = var.drone_admin_username
+      }))) == 1
+    )
+    error_message = "docker-prune.service must declare After=docker.service and Requires=docker.service"
+  }
+}
+
+# Case 4 (value half): random_password.result is generated at apply, so this
+# needs `command = apply` -- safe under mock_provider (aws_ssm_parameter's
+# create is mocked; random_password computes locally, no network either
+# way). Scoped to just these two resources so null_resource.jenkins_provision
+# (ci.tf) -- whose local-exec shells out to real `aws ssm` regardless of the
+# AWS provider being mocked -- is never reached, same rationale as
+# "backup_iam_scoping" above.
+run "t007_drone_database_secret_value" {
+  command = apply
+
+  plan_options {
+    target = [
+      aws_ssm_parameter.drone_database_secret,
+    ]
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.drone_database_secret.value == random_password.drone_database_secret.result
+    error_message = "aws_ssm_parameter.drone_database_secret must store random_password.drone_database_secret.result, not a tfvars literal or a separately-typed value"
+  }
+
+  assert {
+    condition     = length(random_password.drone_database_secret.result) == 32
+    error_message = "random_password.drone_database_secret must generate a 32-character (32-byte ASCII) secret -- the format Drone's DRONE_DATABASE_SECRET expects"
+  }
+}
+
+# ---------------------------------------------------------------------------
 # T-008 -- the drone-deploy IAM user's own access key moves into Terraform +
 # SSM (iam.tf, ssm.tf), so the CI host's Drone SQLite stops being the only
 # copy of this credential. Everything here is known at plan time: the user's

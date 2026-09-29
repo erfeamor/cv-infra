@@ -12,6 +12,23 @@ if ! flock -w 1500 200; then
   exit 1
 fi
 
+# T-007 review round 1, finding 5, corrected round 2 (BLOCKER): a cloud-init
+# readiness wait (`cloud-init` "status", "--wait") used to live here. It
+# deadlocked: this exact script also runs INSIDE cloud-init on the
+# user_data path (templates/jenkins-bootstrap.sh's `bash "$provision_script"`,
+# itself invoked by cloud-init's own user_data run) -- a script waiting for
+# cloud-init to finish, while it IS the thing cloud-init is currently
+# running, never returns, and the out-of-band SSM copy then times out
+# waiting on the same lock (held by the deadlocked user_data run). The wait
+# this script still needs (so a fresh-replace SSM run doesn't race
+# cloud-init's Docker install/network-create in drone-user-data.sh) now
+# lives ONLY in the SSM command path that is never itself inside cloud-init
+# -- see ci.tf's null_resource.jenkins_provision, which runs that same
+# readiness check as a command BEFORE this script's own content, not
+# inside it. scripts/check-t007-static.sh's Check D fails if this script
+# ever calls that command directly again (deliberately not spelled out
+# verbatim in this comment, so the check stays meaningful).
+
 param() {
   aws ssm get-parameter --with-decryption --region "${aws_region}" \
     --name "/${project_name}/${environment}/ci/$1" \
@@ -361,6 +378,14 @@ if docker inspect drone-server >/dev/null 2>&1; then
     DRONE_RPC_SECRET=$(param drone-rpc-secret)
     GITHUB_CLIENT_ID=$(param github-client-id)
     GITHUB_CLIENT_SECRET=$(param github-client-secret)
+    # T-007 review round 1, finding 8: this is a second, independent
+    # drone-server invocation from templates/drone-user-data.sh's -- it
+    # drifted once already (this whole block exists to fix a :80-publish
+    # drift), so DRONE_DATABASE_SECRET is fetched and passed here too rather
+    # than assuming the two copies stay in sync. scripts/check-t007-static.sh
+    # pins this: every `docker run ... drone/drone:...` invocation, in
+    # either template, must carry -e DRONE_DATABASE_SECRET.
+    DRONE_DATABASE_SECRET=$(param drone/database-secret)
     echo "jenkins-provision: recreating drone-server without the direct :80 publish"
     docker rm -f drone-server
     docker run -d --name drone-server --restart unless-stopped \
@@ -369,6 +394,7 @@ if docker inspect drone-server >/dev/null 2>&1; then
       -e DRONE_GITHUB_CLIENT_ID="$GITHUB_CLIENT_ID" \
       -e DRONE_GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \
       -e DRONE_RPC_SECRET="$DRONE_RPC_SECRET" \
+      -e DRONE_DATABASE_SECRET="$DRONE_DATABASE_SECRET" \
       -e DRONE_SERVER_HOST="${server_host}" \
       -e DRONE_SERVER_PROTO=http \
       -e DRONE_USER_CREATE="username:${admin_username},admin:true" \

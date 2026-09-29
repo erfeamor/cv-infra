@@ -15,11 +15,15 @@ terraform test                    # tests/plan.tftest.hcl — runs OFFLINE via m
 bash scripts/check-t008-static.sh          # T-008: two properties plan-time `terraform test` can't see
                                             # (a sensitive output, a policy pinned by hash) — see the
                                             # script's own header for why
+bash scripts/check-t007-static.sh          # T-007: lifecycle ignore_changes contents, the doorbell/reaper
+                                            # Lambdas' INSTANCE_ID wiring, and every `docker run … drone/drone`
+                                            # carrying DRONE_DATABASE_SECRET — same class of plan-invisible gap
+                                            # as check-t008-static.sh (shares scripts/lib/extract-block.sh with it)
 bash scripts/tests/run-drone-reseed-tests.sh   # T-008: offline harness for scripts/drone-reseed-secrets.sh
                                                 # (stubs `aws` and the Drone API; no AWS/network needed)
 ```
 
-Both `scripts/check-t008-static.sh` and `scripts/tests/run-drone-reseed-tests.sh` are cv-infra-local additions (T-008) — they are not part of the meta repo's `scripts/lint-all.sh` / `scripts/test-all.sh` orchestration, so run them directly from here as shown above.
+`scripts/check-t008-static.sh`, `scripts/check-t007-static.sh`, and `scripts/tests/run-drone-reseed-tests.sh` are cv-infra-local additions (T-008/T-007) — they are not part of the meta repo's `scripts/lint-all.sh` / `scripts/test-all.sh` orchestration, so run them directly from here as shown above.
 
 Real usage (needs AWS credentials, `terraform.tfvars`, and the state bucket/table from `bootstrap/` to already exist — see `bootstrap/README.md`):
 

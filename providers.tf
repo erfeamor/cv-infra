@@ -24,6 +24,12 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.4"
     }
+    # T-007: random_password.drone_database_secret (ssm.tf) generates
+    # DRONE_DATABASE_SECRET so it never has to be typed into tfvars by hand.
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
   }
 
   # T-004 part 2: bootstrap/ (its own local state) creates this bucket and

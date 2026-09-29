@@ -29,8 +29,16 @@ param() {
 DRONE_RPC_SECRET=$(param drone-rpc-secret)
 GITHUB_CLIENT_ID=$(param github-client-id)
 GITHUB_CLIENT_SECRET=$(param github-client-secret)
+# T-007: encrypts sensitive data (OAuth tokens, activated-repo secrets) at
+# rest in Drone's SQLite. Never echoed or logged -- read straight into the
+# env var docker run below reads from.
+DRONE_DATABASE_SECRET=$(param drone/database-secret)
 
-docker network create drone
+# Idempotent (review round 1, finding 5): templates/jenkins-provision.sh
+# creates this same network with the identical guard, and either script can
+# run first on a fresh boot -- a bare `docker network create` would make the
+# loser of that race fail on "network already exists".
+docker network inspect drone >/dev/null 2>&1 || docker network create drone
 
 docker run -d --name drone-server --restart unless-stopped \
   --network drone \
@@ -38,6 +46,7 @@ docker run -d --name drone-server --restart unless-stopped \
   -e DRONE_GITHUB_CLIENT_ID="$GITHUB_CLIENT_ID" \
   -e DRONE_GITHUB_CLIENT_SECRET="$GITHUB_CLIENT_SECRET" \
   -e DRONE_RPC_SECRET="$DRONE_RPC_SECRET" \
+  -e DRONE_DATABASE_SECRET="$DRONE_DATABASE_SECRET" \
   -e DRONE_SERVER_HOST="${server_host}" \
   -e DRONE_SERVER_PROTO=http \
   -e DRONE_USER_CREATE="username:${admin_username},admin:true" \
@@ -55,3 +64,54 @@ docker run -d --name drone-runner --restart unless-stopped \
   -e DRONE_RUNNER_CAPACITY=1 \
   -e DRONE_RUNNER_NAME="${project_name}-runner" \
   drone/drone-runner-docker:1
+
+# T-007 (H1 decision 2, commands per review round 1 finding 3): nothing on
+# this host prunes Docker images -- every base-image/tool bump (e.g. Flyway)
+# adds a layer set beside the old one, and that whole-disk growth is what
+# forced the disk measurement behind this task's root-size choice. A weekly
+# sweep keeps the 20 GB root from filling silently between replacements.
+#
+# `docker image prune -af --filter until=168h` and
+# `docker builder prune -af --filter until=168h` -- deliberately NOT
+# `docker system prune`, which also removes stopped containers and unused
+# networks. -a reaches every unused image, not just dangling ones (that's
+# what actually reclaims an old tag left behind by a base-image bump -- a
+# plain, non -a prune would not).
+#
+# Corrected, review round 2 finding 4: `until=168h` filters on the image's
+# CREATION (build) timestamp, not when it was pulled onto this host -- a
+# base image pulled today but built weeks ago (a stock `drone/drone:2` or
+# Flyway image, say) is immediately eligible, same as a genuinely stale
+# one. The safety net against removing something still wanted is `docker
+# image prune`'s own base behaviour, kept regardless of -a or the age
+# filter: an image referenced by ANY container -- running or stopped -- is
+# never a candidate. Never touches a named volume or the "drone" network
+# either -- Drone's own data lives in the /var/lib/drone bind mount above
+# regardless. Idempotent: both unit files are overwritten deterministically
+# and `systemctl enable --now` is a no-op if already enabled.
+cat >/etc/systemd/system/docker-prune.service <<'EOF'
+[Unit]
+Description=Weekly docker image/build-cache prune
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker image prune -af --filter until=168h
+ExecStart=/usr/bin/docker builder prune -af --filter until=168h
+EOF
+
+cat >/etc/systemd/system/docker-prune.timer <<'EOF'
+[Unit]
+Description=Weekly timer for docker-prune.service
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now docker-prune.timer

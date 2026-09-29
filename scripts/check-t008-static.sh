@@ -10,6 +10,8 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# shellcheck source=lib/extract-block.sh
+source scripts/lib/extract-block.sh
 
 fail=0
 
@@ -74,25 +76,10 @@ fi
 # (comments stripped) to the version this task shipped against -- T-008
 # adds an access key, it does not touch this policy's actions/resources.
 # Same "#`-only, no /* */" rationale as check 1 above -- this resource's
-# body embeds wildcard ARNs too (.../*").
-extract_block() {
-  awk -v pat="$1" '
-    BEGIN { depth = 0; found = 0 }
-    {
-      line = $0
-      h = index(line, "#")
-      if (h > 0) line = substr(line, 1, h - 1)
-
-      if (!found) {
-        if (line ~ pat) { found = 1; depth = 0 } else next
-      }
-      n = gsub(/\{/, "{", line); depth += n
-      m = gsub(/\}/, "}", line); depth -= m
-      print line
-      if (depth == 0) exit
-    }
-  '
-}
+# body embeds wildcard ARNs too (.../*"). Uses extract_block, sourced from
+# scripts/lib/extract-block.sh (shared with scripts/check-t007-static.sh
+# since T-007 review round 1, finding 10 -- this script used to carry its
+# own copy of this exact function).
 
 EXPECTED_POLICY_SHA256=2b3cf748ef9bce16ba6d273f59ac1dfd70e0f3818977f858613ec8f92d243845
 

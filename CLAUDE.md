@@ -49,16 +49,16 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 
 ## Binding constraints & decisions
 
-- **Cost model — read this before citing "Free Tier". Figures measured 2026-08-19 (T-020); re-read them, do not inherit them.** This account was created 2026-07-12, so it is on AWS's **post-July-2025 Free Tier**: a fixed pot of signup credits and a 6-month window, **not** the legacy 12-month allowance. There is **no 750 h/month EC2 allowance here**, so every instance-hour bills and is paid from credits (net invoice $0 so far).
+- **Cost model — read this before citing "Free Tier". The account moved to the Paid plan on 2026-09-29; figures re-measured that day (T-012/T-020). Re-read them, don't inherit them.** The account was created 2026-07-12 on AWS's post-July-2025 Free Tier (a fixed pot of signup credits, **not** the legacy 12-month/750-hour allowance). There's **no free EC2 allowance**, so every instance-hour bills and is paid from the remaining credits first. **Since the Paid upgrade, anything the credits don't cover bills the card**: the Free plan's hard stop is gone, and the budget alarms (`budgets.tf`, two budgets, SNS to a confirmed email) are the only guard.
 
-  | Measured 2026-08-19 | |
+  | Measured 2026-09-29 | |
   |---|---|
-  | Plan | **FREE**, ACTIVE, expires **2027-01-12** |
-  | Credits remaining | **$111.08** of a **$160** grant |
-  | Run rate | **~$0.68/day ≈ $21/month** |
-  | Binding constraint | **the window**, not the credits (credits last to ~2027-01-28) |
+  | Plan | **PAID**, ACTIVE (upgraded 2026-09-29) |
+  | Credits remaining | **$102.13** (grant ~$180: signup plus four $20 activities; Bedrock's +$20 is still open) |
+  | Run rate | **~$0.69/day ≈ $21/month** (09-20 to 09-28: $0.67–0.80/day, the higher days being CI host sessions) |
+  | Binding constraint | **the credits**: about 4½ months at this rate, then the bill is real money. Check the Billing console's Credits page for any expiry date (the API doesn't expose one). |
 
-  **The rate assumes a specific instance state, and that is the whole point of writing it down**: `cv-project-domain-service` (`t3.micro`) running 24/7, and the `cv-project-drone` CI host (`t3.small`) **stopped except during builds** — which is what T-019's on-demand automation now enforces. Leave that CI host running continuously and the rate goes to **~$1.23/day ≈ $37/month**, which pushes credit exhaustion forward to **~2026-11-17** and makes the credits bind ~8 weeks before the window. The crossover is **$0.76/day**: below it the window binds, above it the credits do. So "is the CI host up?" is a runway question, not a convenience one.
+  **The rate assumes a specific instance state, and that is the whole point of writing it down**: `cv-project-domain-service` (`t3.micro`) running 24/7, and the `cv-project-drone` CI host (`t3.small`) **stopped except during builds**, which the reaper enforces. Leave that CI host running continuously and the rate goes to **~$1.23/day ≈ $37/month**, burning the credits roughly twice as fast and then billing the card at that rate. So "is the CI host up?" is a money question, not a convenience one.
 
   Read the numbers yourself rather than trusting this table — the console is **not** required, contrary to what T-010 recorded:
 
@@ -71,7 +71,7 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 
   That last filter is not optional: without it Cost Explorer nets credits out and reports ~$0, which is the same "reads green until it doesn't" trap `budgets.tf` exists to avoid.
 
-  Two $20 credit-earning activities remain `NOT_STARTED` (Bedrock, Lambda). They are **optional** — while the window binds first, extra credits buy nothing. The binding constraint is **credit runway and the 6-month cliff, not instance class** — decision tracked as T-012 (due **2026-11-01**), model as T-020. Keep resources modest because credits are finite, not because a class is "free".
+  One $20 credit-earning activity remains `NOT_STARTED` (**Bedrock playground**; Lambda, EC2, RDS and Budgets are done). It's worth doing: under Paid, every credit dollar is a card dollar saved. The endgame decision is T-012 (A, go Paid, trimmed), the model T-020. Keep resources modest because the money is real now, not because a class is "free".
   - Still true regardless: **no NAT gateway** (~$32/mo — that single resource would cost more than the entire current bill), CloudFront default cert, and note that **every public IPv4 costs ~$3.60/mo** — the two EIPs are now **~34%** of the bill (they were ~26% when the rate was $28/mo; a fixed cost becomes a bigger share as the variable part shrinks, so this percentage moves without anyone touching an EIP).
   - T-019 and T-009 added two Lambdas, an EventBridge schedule, a Function URL and a private S3 bucket. All are **effectively $0** at this volume — a few invocations a month and a 14 KB object — and none changes the table above.
   - `aws_instance.drone` is `t3.small` (T-002) for Maven headroom. `terraform test` asserts instance classes; those assertions now encode a cost-discipline convention rather than a Free Tier boundary.
@@ -91,7 +91,7 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 Priorities, ranked:
 
 1. **Security exposure.** Any new ingress rule wider than the resource needs (especially `0.0.0.0/0` on a non-web port), SSH/port-22 ingress or key pairs reintroduced, or a secret placed in a committed file rather than SSM Parameter Store / `terraform.tfvars` (gitignored).
-2. **Cost drift.** A resized instance class, an added NAT gateway, an extra public IPv4, or any materially expensive resource without an explicit, deliberate note — `terraform test` assertions must be updated in the same PR if a class changes. Judge this against **credit burn** (**~$21/mo measured 2026-08-19** with the CI host stopped between builds; finite pot, 6-month cliff — see the cost model above, and T-020 for how it was measured), not against Free Tier eligibility. Note the largest single lever is not a resource at all: leaving the CI host running 24/7 adds **~$17/month**, more than any instance class change in this repo.
+2. **Cost drift.** A resized instance class, an added NAT gateway, an extra public IPv4, or any materially expensive resource without an explicit, deliberate note — `terraform test` assertions must be updated in the same PR if a class changes. Judge this against **real monthly cost** (**~$21/mo measured 2026-09-29** with the CI host stopped between builds; paid from the remaining credits, then the card; see the cost model above and T-020), not against Free Tier eligibility. Note the largest single lever is not a resource at all: leaving the CI host running 24/7 adds **~$17/month**, more than any instance class change in this repo.
 3. **`user_data` changes without `user_data_replace_on_change`.** A bootstrap-script edit that doesn't force instance replacement will silently update Terraform state without ever re-provisioning the box (this exact bug shipped once — see git history on `compute.tf`).
 4. IAM policy changes broader than least-privilege (e.g. `Resource: "*"` where a scoped ARN would do).
 

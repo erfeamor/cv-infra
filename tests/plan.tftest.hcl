@@ -31,6 +31,18 @@ mock_provider "aws" {
     }
   }
 
+  # T-034 phase 2: the human's real, pre-existing hosted zone (erfeamor.com,
+  # Z0608270B7WND031GVOW) -- read as a data source, never imported (dns.tf).
+  # Mocked so dns.tf's record/IAM can be asserted offline; the real zone's
+  # arn/zone_id are account facts, not something this module computes.
+  mock_data "aws_route53_zone" {
+    defaults = {
+      zone_id = "Z0608270B7WND031GVOW"
+      arn     = "arn:aws:route53:::hostedzone/Z0608270B7WND031GVOW"
+      name    = "erfeamor.com."
+    }
+  }
+
   mock_data "aws_caller_identity" {
     defaults = {
       account_id = "123456789012"
@@ -149,22 +161,19 @@ run "plan_succeeds" {
     error_message = "The Jenkins GitHub PAT must follow the existing /project/env/ci/... SSM naming convention"
   }
 
-  # NOT tested here, deliberately: whether the Jenkins multibranch job
-  # configs declare traits{} (and never gitHubForkDiscovery) lives inside
-  # local.jenkins_provision_script, which embeds aws_eip.drone.public_ip
-  # (via templatefile's server_host argument). That EIP doesn't exist yet
-  # in this run's plan, so its public_ip -- and therefore the whole
-  # rendered string -- is unknown-until-apply, not just at this specific
-  # spot but for the entire templatefile() output. Terraform test's
-  # `command = plan` cannot evaluate a condition against an unknown value
-  # (confirmed by trying: "Condition expression could not be evaluated...
-  # execute an `apply` command from this `run` block"), so no assertion
-  # against this local's content -- strong or weak -- has purchase here.
-  # A real check would need a `command = apply` run (safe under
-  # mock_provider, since nothing real gets created, but a bigger change to
-  # this test file's structure than this directed fix warrants) or a
-  # parallel test-only render that doesn't actually verify the deployed
-  # artifact. Left for a future task rather than invented here.
+  # NOT tested here: whether the Jenkins multibranch job configs declare
+  # traits{} (and never gitHubForkDiscovery) lives inside
+  # local.jenkins_provision_script. T-034 phase 2 incidentally RESOLVED the
+  # reason this used to be untestable (it embedded aws_eip.drone.public_ip,
+  # unknown-until-apply for the whole rendered string) -- it now renders from
+  # var.ci_hostname and data.aws_route53_zone.ci.zone_id, both known at plan
+  # time under this file's mocks, so `local.jenkins_provision_script` itself
+  # is a genuinely knowable string here now. Still not asserted against
+  # directly: doing so is an improvement orthogonal to phase 2's own scope,
+  # left for a future task rather than invented here. The "ci_on_demand" run
+  # below (periodicFolderTrigger, the 8 KB wall) already exercises a
+  # PARALLEL re-render with fixture values instead, which is why it still
+  # needs its own separate templatefile() call.
 
   # Review finding N5: catches a copy-paste that assigns the wrong variable
   # to a secret parameter -- it would otherwise pass every assertion above.
@@ -629,7 +638,7 @@ run "ci_on_demand" {
         aws_region     = var.aws_region
         project_name   = var.project_name
         environment    = var.environment
-        server_host    = "203.0.113.10"
+        ci_hostname    = "203.0.113.10"
         admin_username = var.drone_admin_username
       }),
       templatefile("${path.module}/templates/jenkins-bootstrap.sh", {
@@ -650,11 +659,284 @@ run "ci_on_demand" {
       aws_region             = var.aws_region
       project_name           = var.project_name
       environment            = var.environment
-      server_host            = "203.0.113.10"
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
       admin_username         = var.drone_admin_username
       jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
     }))) == 2
     error_message = "Both multibranch jobs must carry a periodicFolderTrigger -- without it a push that arrives while the CI host is stopped is never built (T-019 ruling 1)"
+  }
+
+  # --- T-034 phase 2 + T-033 (case 10): Caddyfile routing parity with the old
+  # nginx config, checked against the actual rendered template content, not a
+  # separate hand-copied fixture. ---------------------------------------------
+  assert {
+    condition = length(regexall("handle /jenkins/\\* \\{[^}]*reverse_proxy jenkins:8080", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The Caddyfile must route /jenkins/* to jenkins:8080 via `handle` (not `handle_path`, which would strip the prefix --prefix=/jenkins expects)"
+  }
+
+  assert {
+    condition = length(regexall("reverse_proxy drone-server:80", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The Caddyfile must route everything else (GitHub /hook, Drone OAuth) to drone-server:80, unchanged from the old nginx `location /`"
+  }
+
+  # --- Case 11: the HTTP->HTTPS redirect is explicit, not left implicit -----
+  assert {
+    condition = length(regexall("redir https://\\{host\\}\\{uri\\} permanent", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The Caddyfile must carry an explicit permanent HTTP->HTTPS redirect, not rely on Caddy's implicit default going ungrepped"
+  }
+
+  # --- Certs/state persist on the host, not the container's own filesystem --
+  assert {
+    condition = length(regexall("-v /var/lib/caddy-data:/data", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "ci-proxy must bind-mount its Let's Encrypt cert storage onto the host -- otherwise every stop/start (T-019) or reboot re-issues a certificate, and LE's production CA rate-limits duplicate certs to 5/week"
+  }
+
+  # --- Review round 1, finding 1: a catch-all answers non-2xx to any Host
+  # that isn't ci_hostname ----------------------------------------------------
+  assert {
+    condition = length(regexall(":443 \\{[^}]*respond 421", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The Caddyfile must answer a mismatched-Host request on :443 with a non-2xx (421) -- otherwise a misdirected delivery looks like success to GitHub instead of a failure the doorbell would redeliver"
+  }
+
+  assert {
+    condition = length(regexall(":80 \\{[^}]*respond 421", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The Caddyfile must answer a mismatched-Host request on :80 with a non-2xx (421) too"
+  }
+
+  # --- Review round 1, finding 6: no manual header_up lines left -----------
+  assert {
+    condition = length(regexall("header_up", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 0
+    error_message = "No manual header_up lines should remain in the Caddyfile -- Caddy's reverse_proxy defaults already set X-Forwarded-For/Proto/Host correctly"
+  }
+
+  # --- Review round 1, finding 2: the re-run timer is present and enabled --
+  assert {
+    condition = length(regexall("ci-dns-updater\\.timer", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 2 # the unit file is written under its own name, and "systemctl enable --now ci-dns-updater.timer" enables it
+    error_message = "ci-dns-updater.timer must be written and enabled, re-running the updater periodically (not just once at boot)"
+  }
+
+  assert {
+    condition = length(regexall("StartLimitIntervalSec=600", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "ci-dns-updater.service must set a start limit (StartLimitIntervalSec, in [Unit]) alongside Restart=on-failure"
+  }
+
+  assert {
+    condition = length(regexall("OnUnitActiveSec=5min", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The timer must re-run every 5 minutes"
+  }
+
+  # --- Review round 1, finding 3: Restart=on-failure with a start limit, and
+  # the boot-time enable is not allowed to abort the rest of provisioning --
+  assert {
+    condition = length(regexall("Restart=on-failure", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "ci-dns-updater.service must set Restart=on-failure"
+  }
+
+  assert {
+    condition = length(regexall("if ! systemctl enable --now ci-dns-updater\\.service", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "the boot-time `systemctl enable --now ci-dns-updater.service` must be guarded (an `if !`) so a failure logs loudly but does not abort the rest of provisioning under set -e"
+  }
+
+  # --- Review round 2, finding 2(a): the ExecStop sentinel unit ------------
+  assert {
+    condition = length(regexall("ExecStop=/usr/local/bin/ci-dns-sentinel\\.sh", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "ci-dns-sentinel.service must run scripts/ci-dns-sentinel.sh on ExecStop"
+  }
+
+  assert {
+    condition = length(regexall("RemainAfterExit=yes", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "ci-dns-sentinel.service must set RemainAfterExit=yes -- otherwise it's never 'active' for ExecStop to fire against"
+  }
+
+  # --- Review round 2, finding 4: the local, never-proxied health path -----
+  assert {
+    condition = length(regexall("http://localhost \\{[^}]*__ci_proxy_health", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The Caddyfile must serve /__ci_proxy_health on the Host: localhost block, never proxied, so the routing probe has zero TLS/cert/DNS dependency"
+  }
+
+  assert {
+    condition = length(regexall("-H \"Host: localhost\" \"http://127\\.0\\.0\\.1/__ci_proxy_health\"", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "The routing probe must hit the local health path over plain HTTP with an explicit Host header, not the TLS/--resolve-based /jenkins/login probe (which depends on a certificate existing)"
   }
 
   # --- T-009: the fetch-and-execute path ------------------------------------
@@ -905,16 +1187,24 @@ run "t034_review_round1" {
   # Review round 3, finding 6: the budget grew from two named pieces to four
   # -- the original sum undercounted the worst-case async-task path (a
   # `stopping` instance waited out, THEN the full healthz wait; plus one
-  # healthz probe's own request-level overshoot). See the locals' comment in
-  # ci-on-demand.tf for what each piece mirrors in lambda/ci_doorbell/index.py.
+  # healthz probe's own request-level overshoot). Review round 2, finding
+  # 2(b) added a fifth: the DNS-convergence wait now runs before healthz
+  # too. See the locals' comment in ci-on-demand.tf for what each piece
+  # mirrors in lambda/ci_doorbell/index.py.
   assert {
     condition = local.ci_doorbell_timeout_seconds == (
       local.ci_doorbell_stopping_wait_seconds +
+      local.ci_doorbell_dns_wait_seconds +
       local.ci_doorbell_healthz_timeout_seconds +
       local.ci_doorbell_healthz_probe_timeout_seconds +
       local.ci_doorbell_github_work_budget_seconds
     )
-    error_message = "local.ci_doorbell_timeout_seconds must equal the sum of all four named pieces -- a bare override would hide the budget this number is supposed to make legible"
+    error_message = "local.ci_doorbell_timeout_seconds must equal the sum of all five named pieces -- a bare override would hide the budget this number is supposed to make legible"
+  }
+
+  assert {
+    condition     = local.ci_doorbell_dns_wait_seconds == 60
+    error_message = "The DNS-convergence wait budget drifted from the documented 60s"
   }
 
   assert {
@@ -927,6 +1217,200 @@ run "t034_review_round1" {
     condition     = aws_lambda_function.ci_reaper.environment[0].variables["POST_START_GRACE_MINUTES"] == tostring(var.ci_post_start_grace_minutes)
     error_message = "POST_START_GRACE_MINUTES must be wired from var.ci_post_start_grace_minutes -- the variable existed but was never actually passed to the reaper Lambda (review round 1, finding 7), so it silently did nothing"
   }
+}
+
+# ---------------------------------------------------------------------------
+# T-034 phase 2 + T-033: a stable DNS name (dns.tf) replaces the EIP, and
+# Caddy replaces nginx to terminate TLS. Cases 1, 3, 5, 6 of the plan.
+# Case 2 (the DNS-update IAM statement's exact shape: one action, the zone
+# ARN, all three conditions) is a check-static.sh check (check 10) instead,
+# per the plan -- even though data.aws_route53_zone.ci.arn is a MOCKED data
+# source (genuinely known here, unlike every computed resource ARN
+# elsewhere in this file), for consistency with how every other IAM
+# exactness check in this module is done. Case 4 (the SG) needed no new
+# assertion -- the existing "exactly 2 ingress rules" assertion above
+# already covers "unchanged". Case 7 (no aws_eip.drone reference anywhere)
+# only makes sense AFTER the EIP-removal commit; asserting it here, while
+# aws_eip.drone still legitimately exists (dns.tf's initial `records`
+# value), would be checking the wrong commit.
+# ---------------------------------------------------------------------------
+run "t034_phase2_dns_tls" {
+  command = plan
+
+  # --- Case 1: the record's shape -------------------------------------------
+  assert {
+    condition     = aws_route53_record.ci.zone_id == data.aws_route53_zone.ci.zone_id
+    error_message = "The CI A record must live in the zone dns.tf reads, not a literal zone id"
+  }
+
+  assert {
+    condition     = aws_route53_record.ci.name == var.ci_hostname
+    error_message = "The CI A record's name must be var.ci_hostname, not a second literal that could drift from it"
+  }
+
+  assert {
+    condition     = aws_route53_record.ci.type == "A"
+    error_message = "The CI record must be an A record -- the boot updater UPSERTs an IPv4 address"
+  }
+
+  assert {
+    condition     = aws_route53_record.ci.ttl == 60
+    error_message = "TTL must be 60s -- short enough that a stop/start's new IP propagates quickly, per H1"
+  }
+
+  # ignore_changes = [records] is NOT visible here (a lifecycle
+  # meta-argument, like aws_instance.drone's own ignore_changes elsewhere in
+  # this file) -- covered by scripts/check-static.sh check 10 instead.
+
+  # Review round 1, finding 4: without allow_overwrite = true, creating this
+  # record would fail outright if one already existed at this name/type
+  # (e.g. a manual record from before Terraform managed it) -- UPSERT
+  # semantics all the way down, matching the boot updater's own.
+  assert {
+    condition     = aws_route53_record.ci.allow_overwrite == true
+    error_message = "aws_route53_record.ci must set allow_overwrite = true"
+  }
+
+  # --- Review round 1, finding 5: the read-only IAM additions --------------
+  assert {
+    condition     = join(",", local.ci_dns_read_actions) == "route53:ListResourceRecordSets"
+    error_message = "The updater's idempotency check needs exactly route53:ListResourceRecordSets"
+  }
+
+  assert {
+    condition     = join(",", local.ci_dns_get_change_actions) == "route53:GetChange"
+    error_message = "The updater's INSYNC wait needs exactly route53:GetChange"
+  }
+
+  assert {
+    condition     = join(",", local.ci_dns_get_change_resources) == "arn:aws:route53:::change/*"
+    error_message = "route53:GetChange has no zone- or record-scoped ARN -- change/* is the narrowest Resource this action can ever take (documented in iam.tf)"
+  }
+
+  # --- Case 3: no wildcard names/types/zone in the DNS-update IAM grant ----
+  assert {
+    condition     = join(",", local.ci_dns_update_record_names) == var.ci_hostname
+    error_message = "The DNS-update IAM condition must name exactly var.ci_hostname, never a wildcard"
+  }
+
+  assert {
+    condition     = join(",", local.ci_dns_update_record_types) == "A"
+    error_message = "The DNS-update IAM condition must allow only the A record type"
+  }
+
+  assert {
+    condition     = join(",", local.ci_dns_update_actions_types) == "UPSERT"
+    error_message = "The DNS-update IAM condition must allow only UPSERT, never DELETE or CREATE"
+  }
+
+  # --- Case 5: ci_public_host is the hostname; URLs are https --------------
+  assert {
+    condition     = local.ci_public_host == var.ci_hostname
+    error_message = "local.ci_public_host must be var.ci_hostname now that the EIP is gone -- see ci-on-demand.tf"
+  }
+
+  assert {
+    condition     = startswith(aws_lambda_function.ci_doorbell.environment[0].variables["DRONE_HEALTHZ_URL"], "https://")
+    error_message = "DRONE_HEALTHZ_URL must be https:// now that Caddy terminates TLS (T-033)"
+  }
+
+  assert {
+    condition     = startswith(aws_lambda_function.ci_reaper.environment[0].variables["JENKINS_BASE_URL"], "https://")
+    error_message = "JENKINS_BASE_URL must be https:// now that Caddy terminates TLS (T-033)"
+  }
+
+  # --- Case 6: outputs are https --------------------------------------------
+  # Knowable here (unlike before phase 2): drone_server_url no longer
+  # embeds aws_eip.drone.public_ip, so it's no longer unknown-until-apply.
+  assert {
+    condition     = output.drone_server_url == "https://${var.ci_hostname}"
+    error_message = "drone_server_url must be https and must use the DNS name, not the (now-removed) EIP"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-034 phase 2 review round 2: the DNS sentinel (finding 2) and the
+# doorbell's DNS-convergence wait (finding 2(b)). The reaper's new grant
+# reuses iam.tf's drone_dns_update locals (already asserted exact there);
+# what's new here is that ci_reaper's OWN policy actually includes a
+# statement built from them, and both Lambdas' new env vars are wired.
+# ---------------------------------------------------------------------------
+run "t034_phase2_dns_sentinel" {
+  command = plan
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["CI_HOSTNAME"] == var.ci_hostname
+    error_message = "The doorbell must read CI_HOSTNAME from var.ci_hostname, never a literal, for its DNS-convergence wait"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["DNS_WAIT_TIMEOUT_SECONDS"] == tostring(local.ci_doorbell_dns_wait_seconds)
+    error_message = "DNS_WAIT_TIMEOUT_SECONDS must come from the named budget local, not a second literal"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["CI_HOSTNAME"] == var.ci_hostname
+    error_message = "The reaper must read CI_HOSTNAME from var.ci_hostname for its post-stop sentinel UPSERT"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["ROUTE53_ZONE_ID"] == data.aws_route53_zone.ci.zone_id
+    error_message = "The reaper must read ROUTE53_ZONE_ID from the zone data source, never a literal"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["DNS_SENTINEL_IP"] == local.ci_dns_sentinel_ip
+    error_message = "The reaper's sentinel value must be local.ci_dns_sentinel_ip -- the same one dns.tf's placeholder and the ExecStop unit use"
+  }
+
+  assert {
+    condition     = local.ci_dns_sentinel_ip == "192.0.2.1"
+    error_message = "The DNS sentinel must be TEST-NET-1 (192.0.2.1, RFC 5737) -- guaranteed never to route anywhere real"
+  }
+
+  # The reaper's new statement itself, in the same style as the doorbell
+  # Caddyfile-parity checks: assert against the ACTUAL rendered policy is
+  # not possible (data.aws_route53_zone.ci.arn is a computed-looking
+  # reference even though mocked -- same reasoning iam.tf's own comment
+  # documents), so this reuses the SAME named locals iam.tf's grant already
+  # asserts exactly elsewhere in this file; what matters here is only that
+  # ci_reaper's policy resource references them at all, which check-static
+  # (check 15) verifies textually.
+}
+
+# ---------------------------------------------------------------------------
+# T-034 phase 2 review round 1, finding 10: var.ci_hostname's validation
+# block, checked the way `terraform test` checks any validation -- a `plan`
+# run whose variables are EXPECTED to fail, asserted via `expect_failures`.
+# ---------------------------------------------------------------------------
+run "t034_ci_hostname_validation" {
+  command = plan
+
+  variables {
+    ci_hostname = "CI.Erfeamor.com" # uppercase -- must be rejected
+  }
+
+  expect_failures = [var.ci_hostname]
+}
+
+run "t034_ci_hostname_validation_trailing_dot" {
+  command = plan
+
+  variables {
+    ci_hostname = "ci.erfeamor.com." # trailing dot -- must be rejected
+  }
+
+  expect_failures = [var.ci_hostname]
+}
+
+run "t034_ci_hostname_validation_single_label" {
+  command = plan
+
+  variables {
+    ci_hostname = "localhost" # single label, not a valid FQDN here -- must be rejected
+  }
+
+  expect_failures = [var.ci_hostname]
 }
 
 # ---------------------------------------------------------------------------
@@ -1040,7 +1524,7 @@ run "t007_ci_host_hardening" {
       aws_region     = var.aws_region
       project_name   = var.project_name
       environment    = var.environment
-      server_host    = "203.0.113.10"
+      ci_hostname    = "203.0.113.10"
       admin_username = var.drone_admin_username
     }))) == 1
     error_message = "templates/drone-user-data.sh must pass -e DRONE_DATABASE_SECRET to the drone-server container exactly once"
@@ -1051,7 +1535,7 @@ run "t007_ci_host_hardening" {
       aws_region     = var.aws_region
       project_name   = var.project_name
       environment    = var.environment
-      server_host    = "203.0.113.10"
+      ci_hostname    = "203.0.113.10"
       admin_username = var.drone_admin_username
     }))) == 1
     error_message = "templates/drone-user-data.sh must read DRONE_DATABASE_SECRET via `param drone/database-secret` -- the same ci/drone/database-secret path aws_ssm_parameter.drone_database_secret.name builds"
@@ -1072,14 +1556,14 @@ run "t007_ci_host_hardening" {
         aws_region     = var.aws_region
         project_name   = var.project_name
         environment    = var.environment
-        server_host    = "203.0.113.10"
+        ci_hostname    = "203.0.113.10"
         admin_username = var.drone_admin_username
       }))) == 1 &&
       length(regexall("ExecStart=/usr/bin/docker builder prune -af --filter until=168h", templatefile("${path.module}/templates/drone-user-data.sh", {
         aws_region     = var.aws_region
         project_name   = var.project_name
         environment    = var.environment
-        server_host    = "203.0.113.10"
+        ci_hostname    = "203.0.113.10"
         admin_username = var.drone_admin_username
       }))) == 1
     )
@@ -1091,7 +1575,7 @@ run "t007_ci_host_hardening" {
       aws_region     = var.aws_region
       project_name   = var.project_name
       environment    = var.environment
-      server_host    = "203.0.113.10"
+      ci_hostname    = "203.0.113.10"
       admin_username = var.drone_admin_username
     }))) == 0
     error_message = "docker-prune.service must not run `docker system prune` -- it also removes stopped containers and unused networks, not just images/build cache (review round 1, finding 3)"
@@ -1103,14 +1587,14 @@ run "t007_ci_host_hardening" {
         aws_region     = var.aws_region
         project_name   = var.project_name
         environment    = var.environment
-        server_host    = "203.0.113.10"
+        ci_hostname    = "203.0.113.10"
         admin_username = var.drone_admin_username
       }))) == 1 &&
       length(regexall("Requires=docker.service", templatefile("${path.module}/templates/drone-user-data.sh", {
         aws_region     = var.aws_region
         project_name   = var.project_name
         environment    = var.environment
-        server_host    = "203.0.113.10"
+        ci_hostname    = "203.0.113.10"
         admin_username = var.drone_admin_username
       }))) == 1
     )

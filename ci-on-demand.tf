@@ -81,14 +81,55 @@ locals {
   ci_redeliver_repos = ["erfeamor/cv-admin-react"]
 
   # Review round 1, finding 10: the CI host's one public address, named once.
-  # Phase 2 (T-034) replaces the EIP with a DNS name behind Route 53; when
-  # that lands, this is the ONLY place that changes -- every consumer below
-  # (the reaper's Jenkins URL, the doorbell's Drone healthz URL) references
-  # this local, never aws_eip.drone.public_ip directly. Enforced textually by
-  # scripts/check-static.sh (terraform test cannot see it: the EIP's
-  # public_ip is unknown under `command = plan`, same limitation this file
-  # already documents for other computed attributes).
-  ci_public_host = aws_eip.drone.public_ip
+  # Phase 2 (T-034) landed: the EIP is replaced by var.ci_hostname (dns.tf's
+  # aws_route53_record, kept current by scripts/ci-dns-updater.sh on every
+  # boot) -- every consumer below (the reaper's Jenkins URL, the doorbell's
+  # Drone healthz URL) references this local, never the hostname variable or
+  # any address literal directly, so a future re-point (a new domain, say)
+  # changes exactly this one line. Enforced textually by
+  # scripts/check-static.sh check 9.
+  ci_public_host = var.ci_hostname
+
+  # T-034 phase 2 review round 1, finding 2 (second half): the reaper and
+  # doorbell still address the host by local.ci_public_host (the DNS name),
+  # NOT by the instance's public IP from their own ec2:DescribeInstances
+  # call, even though that call is already made for other reasons.
+  # Deliberate, not an oversight -- addressing by raw IP would fight the
+  # very security fix finding 1 added: Caddy's catch-all now answers 421 to
+  # any request whose Host isn't ci_hostname (templates/jenkins-provision.sh),
+  # and a raw-IP request's Host header/TLS SNI would BE the IP, not the
+  # hostname -- so switching to IP addressing would need the Lambdas to
+  # connect-by-IP-but-verify/SNI-as-the-hostname (Python's http.client
+  # supports this, but it is real, fragile, untested-here complexity that
+  # re-adds exactly the kind of address coupling T-034 phase 2 exists to
+  # remove). The risk this would guard against -- stale DNS right after a
+  # cold start making the reaper misread Jenkins as unreachable -- is
+  # already bounded three ways without it: (a) jenkins_is_idle() already
+  # treats unreachable as BUSY (T-019 ruling 2, deliberate: cost over
+  # safety), never as a reason to act; (b) the reaper's own post-start grace
+  # (var.ci_post_start_grace_minutes, 15 min) means idleness is never even
+  # evaluated until long after DNS has converged (the updater runs at boot,
+  # Before=docker.service, and the propagation TTL is 60s); (c) the review's
+  # own finding 2 (first half) added a 5-minute re-run timer
+  # (scripts/ci-dns-updater.sh) on top of that. A genuinely broken DNS
+  # record costs money (the box stays running) but never breaks a build --
+  # the same trade-off T-019 ruling 2 already made on purpose.
+  #
+  # Review round 2, finding 2(b) update: the doorbell DOES now read the
+  # instance's raw public IP -- but only to COMPARE it against what
+  # CI_HOSTNAME resolves to (wait_for_dns_to_match_instance,
+  # lambda/ci_doorbell/index.py), never as the address it actually connects
+  # to. Every real request (healthz, and Drone/GitHub traffic) still goes to
+  # https://ci_hostname/..., so the reasoning above is unaffected.
+
+  # Review round 2, finding 2: the shared placeholder ALL of dns.tf's
+  # record, the reaper's post-stop UPSERT, and templates/jenkins-provision.sh's
+  # ExecStop unit use -- named once so the three can never drift apart.
+  # 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed to never route anywhere
+  # real, so "the record currently says this" unambiguously means "this
+  # host is not up," never a stale-but-plausible address someone could
+  # mistake for a live one.
+  ci_dns_sentinel_ip = "192.0.2.1"
 
   # Review round 1, finding 4: the budget behind aws_lambda_function.ci_doorbell's
   # timeout, named piece by piece so a reviewer can see where the number comes
@@ -102,6 +143,10 @@ locals {
   # (kept in sync by hand -- there is no wiring between them beyond this
   # comment and the env vars actually passed below):
   #   - stopping_wait  <-> INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS
+  #   - dns_wait       <-> DNS_WAIT_TIMEOUT_SECONDS (review round 2, finding
+  #     2(b) -- waits for CI_HOSTNAME to resolve to the instance's OWN
+  #     current public IP before ever probing healthz, so a probe can never
+  #     hit a stale address or the reaper's own DNS sentinel, finding 2(a))
   #   - healthz        <-> HEALTHZ_TIMEOUT_SECONDS (PO-settled ceiling, t034p1-plan.md)
   #   - probe_timeout  <-> HTTP_TIMEOUT_SECONDS (the one extra overshoot noted above)
   #   - github_work    <-> the budget for bounded hooks/deliveries pagination
@@ -109,12 +154,17 @@ locals {
   #     redelivery POSTs, each itself capped at HTTP_TIMEOUT_SECONDS
   # Sum is 895s, comfortably inside Lambda's 900s hard ceiling with 5s to
   # spare -- see the <= 900 assertion in tests/plan.tftest.hcl.
+  # github_work_budget dropped from 290 to 230 to make room for dns_wait
+  # (60s) at the same 895s total -- nothing about the GitHub work itself
+  # changed, only how the same ceiling is divided.
   ci_doorbell_stopping_wait_seconds         = 120
+  ci_doorbell_dns_wait_seconds              = 60
   ci_doorbell_healthz_timeout_seconds       = 480
   ci_doorbell_healthz_probe_timeout_seconds = 5
-  ci_doorbell_github_work_budget_seconds    = 290
+  ci_doorbell_github_work_budget_seconds    = 230
   ci_doorbell_timeout_seconds = (
     local.ci_doorbell_stopping_wait_seconds +
+    local.ci_doorbell_dns_wait_seconds +
     local.ci_doorbell_healthz_timeout_seconds +
     local.ci_doorbell_healthz_probe_timeout_seconds +
     local.ci_doorbell_github_work_budget_seconds
@@ -229,7 +279,9 @@ resource "aws_lambda_function" "ci_doorbell" {
       ALLOWED_REPOS                 = join(",", local.ci_allowed_repos)
       REDELIVER_REPOS               = join(",", local.ci_redeliver_repos)
       GITHUB_HOOKS_TOKEN_PARAM      = aws_ssm_parameter.github_hooks_token.name
-      DRONE_HEALTHZ_URL             = "http://${local.ci_public_host}/healthz"
+      CI_HOSTNAME                   = local.ci_public_host
+      DRONE_HEALTHZ_URL             = "https://${local.ci_public_host}/healthz"
+      DNS_WAIT_TIMEOUT_SECONDS      = tostring(local.ci_doorbell_dns_wait_seconds)
       HEALTHZ_TIMEOUT_SECONDS       = tostring(local.ci_doorbell_healthz_timeout_seconds)
       HEALTHZ_POLL_INTERVAL_SECONDS = "15"
       SELF_FUNCTION_NAME            = local.ci_doorbell_function_name
@@ -378,6 +430,26 @@ resource "aws_iam_role_policy" "ci_reaper" {
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.ci_reaper.arn}:*"
       },
+      {
+        # Review round 2, finding 2(a): right after stopping the instance,
+        # the reaper UPSERTs the same DNS sentinel the CI host's own
+        # ExecStop unit does (templates/jenkins-provision.sh) -- covers a
+        # GRACEFUL stop; the host's own unit covers an ungraceful one. Same
+        # exact shape as iam.tf's drone_dns_update grant (reusing its named
+        # locals, not duplicating the literals): one action, the zone ARN
+        # (Route 53 has no record-level ARNs), conditioned to this one
+        # record name, type A, UPSERT only.
+        Effect   = "Allow"
+        Action   = local.ci_dns_update_actions
+        Resource = data.aws_route53_zone.ci.arn
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames" = local.ci_dns_update_record_names
+            "route53:ChangeResourceRecordSetsRecordTypes"           = local.ci_dns_update_record_types
+            "route53:ChangeResourceRecordSetsActions"               = local.ci_dns_update_actions_types
+          }
+        }
+      },
     ]
   })
 }
@@ -394,7 +466,7 @@ resource "aws_lambda_function" "ci_reaper" {
   environment {
     variables = {
       INSTANCE_ID            = aws_instance.drone.id
-      JENKINS_BASE_URL       = "http://${local.ci_public_host}/jenkins"
+      JENKINS_BASE_URL       = "https://${local.ci_public_host}/jenkins"
       JENKINS_USER           = var.jenkins_admin_username
       JENKINS_PASSWORD_PARAM = aws_ssm_parameter.jenkins_admin_password.name
       IDLE_WINDOW_MINUTES    = tostring(var.ci_idle_window_minutes)
@@ -405,6 +477,10 @@ resource "aws_lambda_function" "ci_reaper" {
       # POST_START_GRACE_MINUTES has a hardcoded "15" fallback, which meant
       # the variable silently did nothing.
       POST_START_GRACE_MINUTES = tostring(var.ci_post_start_grace_minutes)
+      # Review round 2, finding 2(a): the DNS sentinel UPSERT after stopping.
+      CI_HOSTNAME     = local.ci_public_host
+      ROUTE53_ZONE_ID = data.aws_route53_zone.ci.zone_id
+      DNS_SENTINEL_IP = local.ci_dns_sentinel_ip
     }
   }
 

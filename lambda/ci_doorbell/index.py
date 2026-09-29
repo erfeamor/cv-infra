@@ -107,6 +107,7 @@ import http.client
 import json
 import logging
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -139,6 +140,13 @@ DRONE_HEALTHZ_URL = os.environ["DRONE_HEALTHZ_URL"]
 HEALTHZ_TIMEOUT_SECONDS = int(os.environ.get("HEALTHZ_TIMEOUT_SECONDS", "480"))
 HEALTHZ_POLL_INTERVAL_SECONDS = int(os.environ.get("HEALTHZ_POLL_INTERVAL_SECONDS", "15"))
 SELF_FUNCTION_NAME = os.environ["SELF_FUNCTION_NAME"]
+
+# Review round 2, finding 2(b): the hostname alone (DRONE_HEALTHZ_URL already
+# carries it embedded in a URL, but the DNS-convergence wait below needs it
+# bare, to resolve directly).
+CI_HOSTNAME = os.environ["CI_HOSTNAME"]
+DNS_WAIT_TIMEOUT_SECONDS = int(os.environ.get("DNS_WAIT_TIMEOUT_SECONDS", "60"))
+DNS_WAIT_POLL_INTERVAL_SECONDS = int(os.environ.get("DNS_WAIT_POLL_INTERVAL_SECONDS", "5"))
 
 GITHUB_API = "https://api.github.com"
 HTTP_TIMEOUT_SECONDS = 5
@@ -522,6 +530,57 @@ def _describe_instance_state():
         return None
 
 
+def _current_public_ip():
+    """The instance's OWN current public IPv4, read fresh from EC2 -- never
+    assumed, never cached across invocations (T-019: this changes on every
+    stop/start now that there is no EIP). Absent (None) counts as
+    "not converged" wherever this feeds wait_for_dns_to_match_instance, the
+    same as any other not-yet-ready state -- AWS does not always attach a
+    PublicIpAddress the instant an instance leaves `stopped`."""
+    try:
+        return ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0].get("PublicIpAddress")
+    except (ClientError, IndexError, KeyError):
+        log.exception("could not read the instance's public IP")
+        return None
+
+
+def _resolve_hostname(hostname):
+    try:
+        return socket.gethostbyname(hostname)
+    except OSError:
+        return None
+
+
+def wait_for_dns_to_match_instance(
+    timeout_seconds, poll_interval_seconds, resolve_fn=None, public_ip_fn=None, sleep_fn=None, clock_fn=None
+):
+    """Review round 2, finding 2(b): bounded wait until CI_HOSTNAME resolves
+    to the instance's OWN current public IP (from ec2:DescribeInstances, not
+    assumed), before this task ever probes healthz. Without this, a probe
+    right after a cold start could hit whatever CI_HOSTNAME still pointed at
+    -- a previous boot's address, or the reaper's own DNS sentinel (finding
+    2(a)) if this is a very fast restart after a stop -- neither of which is
+    THIS boot's Drone.
+
+    resolve_fn/public_ip_fn/sleep_fn/clock_fn resolved as call-time defaults,
+    not signature defaults -- see wait_for_drone_healthz's docstring for why
+    that distinction matters (the real functions must never be captured at
+    import time).
+    """
+    resolve_fn = resolve_fn or _resolve_hostname
+    public_ip_fn = public_ip_fn or _current_public_ip
+    sleep_fn = sleep_fn or time.sleep
+    clock_fn = clock_fn or time.monotonic
+    deadline = clock_fn() + timeout_seconds
+    while True:
+        public_ip = public_ip_fn()
+        if public_ip and resolve_fn(CI_HOSTNAME) == public_ip:
+            return True
+        if clock_fn() >= deadline:
+            return False
+        sleep_fn(poll_interval_seconds)
+
+
 def _start_instance_if_stopped(repo):
     """The pre-T-034 synchronous behaviour, unchanged: still used directly by
     the Jenkins-repo webhook path. NOT used by the async task any more --
@@ -658,6 +717,20 @@ def _handle_async_task(event):
     else:
         log.error("instance in unexpected state %s; not starting", state)
         return {"ok": False, "reason": "unexpected state %s" % state}
+
+    # Review round 2, finding 2(b): BEFORE probing healthz, wait for
+    # CI_HOSTNAME to actually resolve to THIS instance's current public IP --
+    # never probe whatever address the record still happens to say (a
+    # previous boot's, or the reaper's own sentinel, finding 2(a)).
+    if not wait_for_dns_to_match_instance(DNS_WAIT_TIMEOUT_SECONDS, DNS_WAIT_POLL_INTERVAL_SECONDS):
+        log.error(
+            "%s did not resolve to %s's current public IP within %ds; skipping healthz/redelivery rather than "
+            "probing a stale or sentinel address -- see docs/runbooks/drone.md",
+            CI_HOSTNAME,
+            INSTANCE_ID,
+            DNS_WAIT_TIMEOUT_SECONDS,
+        )
+        return {"ok": False, "reason": "dns not converged"}
 
     if not wait_for_drone_healthz(DRONE_HEALTHZ_URL, HEALTHZ_TIMEOUT_SECONDS, HEALTHZ_POLL_INTERVAL_SECONDS):
         log.error(

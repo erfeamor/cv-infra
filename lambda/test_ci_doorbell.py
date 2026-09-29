@@ -35,9 +35,12 @@ ENV = {
     "ALLOWED_REPOS": "erfeamor/cv-domain-service,erfeamor/cv-database,erfeamor/cv-admin-react",
     "REDELIVER_REPOS": "erfeamor/cv-admin-react",
     "GITHUB_HOOKS_TOKEN_PARAM": "/cv-project/dev/doorbell/github-hooks-token",
+    "CI_HOSTNAME": "ci.erfeamor.com",
     "DRONE_HEALTHZ_URL": "http://203.0.113.10/healthz",
     "HEALTHZ_TIMEOUT_SECONDS": "480",
     "HEALTHZ_POLL_INTERVAL_SECONDS": "15",
+    "DNS_WAIT_TIMEOUT_SECONDS": "60",
+    "DNS_WAIT_POLL_INTERVAL_SECONDS": "5",
     "SELF_FUNCTION_NAME": "cv-project-ci-doorbell",
 }
 
@@ -60,9 +63,20 @@ def push_event(repo, secret=WEBHOOK_SECRET, event_type="push"):
 
 
 class DoorbellTestCase(unittest.TestCase):
+    # Review round 2, finding 2(b): _handle_async_task now waits for DNS to
+    # converge before probing healthz. Every class EXCEPT
+    # TestDnsConvergenceWait gets that wait auto-stubbed to "already
+    # converged" in setUp, so tests written before this wait existed keep
+    # exercising what they already exercise, without a real bounded wait
+    # running during the test. TestDnsConvergenceWait sets this False so it
+    # tests the REAL function instead of its own class-level override.
+    AUTO_STUB_DNS_WAIT = True
+
     def setUp(self):
         self.module = testsupport.load_lambda_module("t034_ci_doorbell_index_%s" % id(self), INDEX_PATH, ENV)
         self.module.ssm.get_parameter.side_effect = self._ssm_get_parameter
+        if self.AUTO_STUB_DNS_WAIT:
+            self.module.wait_for_dns_to_match_instance = lambda *a, **k: True
 
     def _ssm_get_parameter(self, Name, WithDecryption=True):
         if Name == ENV["WEBHOOK_SECRET_PARAM"]:
@@ -451,6 +465,79 @@ class TestInstanceStopping(DoorbellTestCase):
         self.assertFalse(result["ok"])
         self.module.ec2.start_instances.assert_not_called()
         healthz_mock.assert_not_called()
+
+
+# --- Review round 2, finding 2(b) (RED): wait for DNS to converge to the
+# instance's OWN current public IP before ever probing healthz -----------
+
+
+class TestDnsConvergenceWait(DoorbellTestCase):
+    AUTO_STUB_DNS_WAIT = False
+
+    def test_wait_succeeds_once_resolution_matches_the_instance(self):
+        public_ip_fn = mock.Mock(return_value="203.0.113.50")
+        resolve_fn = mock.Mock(side_effect=["198.51.100.1", "203.0.113.50"])  # stale, then converged
+        sleep_fn = mock.Mock()
+        clock_fn = mock.Mock(side_effect=[0, 0, 0])
+        result = self.module.wait_for_dns_to_match_instance(
+            60, 5, resolve_fn=resolve_fn, public_ip_fn=public_ip_fn, sleep_fn=sleep_fn, clock_fn=clock_fn
+        )
+        self.assertTrue(result)
+        self.assertEqual(resolve_fn.call_count, 2)
+        sleep_fn.assert_called_once_with(5)
+
+    def test_gives_up_after_timeout_if_never_converges(self):
+        clock = {"t": 0}
+        result = self.module.wait_for_dns_to_match_instance(
+            60,
+            5,
+            resolve_fn=lambda host: "198.51.100.1",  # always stale
+            public_ip_fn=lambda: "203.0.113.50",
+            sleep_fn=lambda s: clock.update(t=clock["t"] + s),
+            clock_fn=lambda: clock["t"],
+        )
+        self.assertFalse(result)
+        self.assertGreaterEqual(clock["t"], 60)
+
+    def test_no_public_ip_yet_counts_as_not_converged(self):
+        # The instance may not have a PublicIpAddress in EC2's response yet
+        # (right after start_instances, before AWS has assigned one) --
+        # treated the same as "not converged", never as a match.
+        clock = {"t": 0}
+        result = self.module.wait_for_dns_to_match_instance(
+            10,
+            5,
+            resolve_fn=mock.Mock(),
+            public_ip_fn=lambda: None,
+            sleep_fn=lambda s: clock.update(t=clock["t"] + s),
+            clock_fn=lambda: clock["t"],
+        )
+        self.assertFalse(result)
+
+    def test_async_task_skips_healthz_and_redelivery_when_dns_never_converges(self):
+        self.set_instance_state("running")
+        self.module.wait_for_dns_to_match_instance = lambda *a, **k: False
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
+        with mock.patch.object(self.module, "wait_for_drone_healthz") as healthz_mock, mock.patch.object(
+            self.module, "redeliver_failed_deliveries"
+        ) as redeliver_mock:
+            with self.assertLogs(self.module.log, level="ERROR"):
+                result = self.module.handler(event, None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "dns not converged")
+        healthz_mock.assert_not_called()
+        redeliver_mock.assert_not_called()
+
+    def test_async_task_proceeds_to_healthz_once_dns_converges(self):
+        self.set_instance_state("running")
+        self.module.wait_for_dns_to_match_instance = lambda *a, **k: True
+        event = self.signed_task_event("erfeamor/cv-admin-react", self.now_iso())
+        with mock.patch.object(self.module, "wait_for_drone_healthz", return_value=True) as healthz_mock, mock.patch.object(
+            self.module, "redeliver_failed_deliveries"
+        ):
+            result = self.module.handler(event, None)
+        self.assertTrue(result["ok"])
+        healthz_mock.assert_called_once()
 
 
 # --- Review round 3, finding 5: concurrency -- only `push` schedules the ---

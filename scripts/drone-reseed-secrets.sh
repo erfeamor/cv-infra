@@ -11,18 +11,28 @@
 #      Drone server (`aws ssm start-session --document-name
 #      AWS-StartPortForwardingSession ...` -- see
 #      docs/runbooks/drone.md) and point DRONE_SERVER at the
-#      LOCAL end of that tunnel, e.g. http://127.0.0.1:8080. The Drone API
-#      is only ever called over that tunnel -- never over the open
-#      internet with these values.
+#      LOCAL end of that tunnel -- e.g. https://ci.erfeamor.com:8443, using
+#      the CI HOSTNAME with the tunnel's local port, never 127.0.0.1 (T-034
+#      phase 2 / T-033: Caddy now terminates TLS on the CI host, so the
+#      tunnel forwards to 443, not the old plain :80, and --resolve below
+#      needs the real hostname to verify that certificate for real). The
+#      Drone API is only ever called over that tunnel -- never over the
+#      open internet with these values.
 #   3. Export DRONE_TOKEN yourself (Drone's user-settings personal token).
 #      This script never stores it, never prints it, and never passes it
 #      as a command-line argument (that would show up in `ps`).
 #
 # Usage:
-#   DRONE_SERVER=http://127.0.0.1:8080 \
+#   DRONE_SERVER=https://ci.erfeamor.com:8443 \
 #   DRONE_TOKEN=*** \
 #   AWS_REGION=eu-west-3 PROJECT_NAME=cv-project ENVIRONMENT=dev \
 #   ./scripts/drone-reseed-secrets.sh
+#
+# --resolve (below) pins ci.erfeamor.com:8443 to 127.0.0.1 for this
+# process only, so the request actually travels over the loopback tunnel
+# while curl still verifies the REAL Let's Encrypt certificate against the
+# hostname it was issued for -- no `-k`, no skipped verification, no
+# separate flag to remember to set or unset.
 #
 # AWS_REGION/PROJECT_NAME/ENVIRONMENT default to this repo's usual values;
 # DRONE_REPO defaults to erfeamor/cv-admin-react, the only repo that reads
@@ -45,7 +55,29 @@
 # script ever takes as an argument is a path, never a value.
 set -euo pipefail
 
-: "${DRONE_SERVER:?DRONE_SERVER not set -- point this at the local end of the SSM tunnel to the CI host, e.g. http://127.0.0.1:8080}"
+: "${DRONE_SERVER:?DRONE_SERVER not set -- point this at ci.erfeamor.com over the local end of the SSM tunnel, e.g. https://ci.erfeamor.com:8443 (T-034 phase 2 / T-033: the tunnel now forwards to Caddy on 443, not the old plain :80), and see the --resolve note below for why the HOSTNAME, not 127.0.0.1, belongs in this URL}"
+
+# Review round 1, finding 7: DRONE_SERVER now points at a TLS endpoint
+# reached over a loopback SSM tunnel -- but the URL's HOST must be
+# ci.erfeamor.com itself (a real, resolvable-if-you're-not-tunnelling name),
+# not 127.0.0.1, and --resolve is what makes that connect over the tunnel
+# anyway: it overrides DNS resolution for exactly this host:port to
+# 127.0.0.1, while the TLS handshake still uses ci.erfeamor.com for SNI and
+# certificate verification -- so curl checks the REAL Let's Encrypt
+# certificate against the name it was actually issued for, with no `-k`, no
+# skipped verification, and no separate opt-in flag to remember. Requires
+# DRONE_SERVER to carry an explicit port (the local end of the tunnel) --
+# --resolve's host:port:address form has no "any port" wildcard.
+drone_server_hostport="${DRONE_SERVER#*://}"
+drone_server_hostport="${drone_server_hostport%%/*}"
+case "$drone_server_hostport" in
+*:*) ;;
+*)
+  echo "drone-reseed-secrets: DRONE_SERVER must carry an explicit port (e.g. https://ci.erfeamor.com:8443) for --resolve to pin it to the tunnel" >&2
+  exit 1
+  ;;
+esac
+curl_resolve_opt=(--resolve "${drone_server_hostport}:127.0.0.1")
 
 # NOT `: "${DRONE_TOKEN:?msg}"` -- review round 1: when DRONE_TOKEN IS set,
 # `${DRONE_TOKEN:?msg}` expands to the token itself, so `bash -x` traces
@@ -128,13 +160,13 @@ header = "Authorization: Bearer ${DRONE_TOKEN}"
 EOF
   chmod 600 "$auth_config"
 
-  status=$(curl -sS -o /dev/null -w '%{http_code}' -K "$auth_config" \
+  status=$(curl -sS -o /dev/null -w '%{http_code}' "${curl_resolve_opt[@]}" -K "$auth_config" \
     -X PATCH "${DRONE_SERVER}/api/repos/${DRONE_REPO}/secrets/${name}" \
     -H 'Content-Type: application/json' \
     --data "@${body_file}")
 
   if [ "$status" = "404" ]; then
-    status=$(curl -sS -o /dev/null -w '%{http_code}' -K "$auth_config" \
+    status=$(curl -sS -o /dev/null -w '%{http_code}' "${curl_resolve_opt[@]}" -K "$auth_config" \
       -X POST "${DRONE_SERVER}/api/repos/${DRONE_REPO}/secrets" \
       -H 'Content-Type: application/json' \
       --data "@${body_file}")

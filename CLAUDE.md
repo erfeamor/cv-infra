@@ -25,9 +25,14 @@ python3 -m unittest discover -s lambda -p 'test_*.py'   # T-034: offline unit te
                                                           # on purpose: these Lambdas ship as a bare index.py,
                                                           # no vendored deps), and every urllib call is
                                                           # monkeypatched per test. No AWS/network needed.
+bash scripts/tests/run-ci-dns-updater-tests.sh   # T-034 phase 2: offline harness for scripts/ci-dns-updater.sh
+                                                  # -- stubs `curl` (IMDSv2) and `aws` (route53) via
+                                                  # scripts/tests/stub-bin-dns/, in the same style as the
+                                                  # drone-reseed harness above (a separate stub-bin dir, so
+                                                  # neither harness's fixtures can affect the other)
 ```
 
-`scripts/check-static.sh`, `bootstrap/check-static.sh`, `scripts/tests/run-drone-reseed-tests.sh` and the `lambda/` unit tests are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
+`scripts/check-static.sh`, `bootstrap/check-static.sh`, `scripts/tests/run-drone-reseed-tests.sh`, `scripts/tests/run-ci-dns-updater-tests.sh` and the `lambda/` unit tests are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
 
 Operational procedures live in `docs/runbooks/`: `drone.md` (Drone rebuild, repo secrets, deploy-key rotation, pausing the reaper) and `ci-host-replace.md` (replacing the CI host and verifying the new one).
 

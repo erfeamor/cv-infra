@@ -248,18 +248,182 @@ fi
 
 # --- 9. The CI host's public address is named through ONE local -----------
 # Review round 1, finding 10: DRONE_HEALTHZ_URL and JENKINS_BASE_URL must
-# both build from local.ci_public_host, never from aws_eip.drone.public_ip
-# directly -- so T-034 phase 2 (EIP -> DNS name) changes exactly one line.
-# `terraform test` cannot check this: aws_eip.drone.public_ip is unknown
-# under `command = plan` (documented throughout tests/plan.tftest.hcl), so
-# this is a text-level check, like check #4/#5 above.
+# both build from local.ci_public_host, never from a second literal or
+# reference of their own -- so a future re-point changes exactly one line.
+# UPDATED for T-034 phase 2 (plan case 5): local.ci_public_host is now
+# var.ci_hostname, not aws_eip.drone.public_ip (which no longer exists after
+# the EIP-removal commit) -- and both URLs must be https now that Caddy
+# terminates TLS (T-033). `terraform test` DOES cover the "== var.ci_hostname"
+# and "startswith https://" properties now (t034_phase2_dns_tls,
+# tests/plan.tftest.hcl) since var.ci_hostname is known at plan time, unlike
+# the EIP's public_ip -- this check covers only what that run block cannot:
+# that neither URL has regressed back to a literal address or bare http.
 if grep -Eq 'DRONE_HEALTHZ_URL[ \t]*=.*aws_eip\.drone\.public_ip' ci-on-demand.tf ||
   grep -Eq 'JENKINS_BASE_URL[ \t]*=.*aws_eip\.drone\.public_ip' ci-on-demand.tf; then
-  bad "DRONE_HEALTHZ_URL or JENKINS_BASE_URL references aws_eip.drone.public_ip directly instead of local.ci_public_host -- T-034 phase 2 would then need to change two places instead of one"
-elif ! grep -Eq '^\s*ci_public_host\s*=\s*aws_eip\.drone\.public_ip\s*$' ci-on-demand.tf; then
-  bad "local.ci_public_host (= aws_eip.drone.public_ip) not found in ci-on-demand.tf -- has it been renamed without updating this check?"
+  bad "DRONE_HEALTHZ_URL or JENKINS_BASE_URL references aws_eip.drone.public_ip directly -- that resource no longer exists after T-034 phase 2's EIP-removal commit"
+elif ! grep -Eq '^\s*ci_public_host\s*=\s*var\.ci_hostname\s*$' ci-on-demand.tf; then
+  bad "local.ci_public_host (= var.ci_hostname) not found in ci-on-demand.tf -- has it been renamed without updating this check?"
+elif grep -Eq 'DRONE_HEALTHZ_URL[ \t]*=[ \t]*"http://' ci-on-demand.tf || grep -Eq 'JENKINS_BASE_URL[ \t]*=[ \t]*"http://' ci-on-demand.tf; then
+  bad "DRONE_HEALTHZ_URL or JENKINS_BASE_URL is plain http:// -- Caddy (T-033) terminates TLS, both must be https://"
 else
-  ok "DRONE_HEALTHZ_URL and JENKINS_BASE_URL both build from local.ci_public_host, not aws_eip.drone.public_ip directly"
+  ok "DRONE_HEALTHZ_URL and JENKINS_BASE_URL both build from local.ci_public_host (= var.ci_hostname) over https"
+fi
+
+# --- 10. The DNS-update IAM grant is exactly one action, the zone ARN, and
+# the three conditions the plan specifies -- nothing wider. -----------------
+# T-034 phase 2 (plan case 2): Route 53 has no record-level ARNs, so the
+# Resource is unavoidably the whole zone; the Condition block is the only
+# thing standing between this grant and "any record, any type, any action,
+# in the whole zone" -- the CI role is reachable from inside a build (T-005
+# gap), so this must be checked exactly, not just "present".
+dns_policy_block=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"drone_dns_update"[ \t]*{' <iam.tf)
+if [ -z "$dns_policy_block" ]; then
+  bad 'resource "aws_iam_role_policy" "drone_dns_update" { ... } not found in iam.tf'
+else
+  dns_verdict=$(python3 -c '
+import re, sys
+b = sys.stdin.read()
+problems = []
+if re.search(r"\b(NotAction|NotResource|Principal|NotPrincipal)\b", b):
+    problems.append("uses NotAction/NotResource/Principal")
+if not re.search(r"Action\s*=\s*local\.ci_dns_update_actions\b", b):
+    problems.append("Action is not exactly local.ci_dns_update_actions")
+if not re.search(r"Resource\s*=\s*data\.aws_route53_zone\.ci\.arn\b", b):
+    problems.append("Resource is not exactly data.aws_route53_zone.ci.arn (a literal or a wildcard would widen this past one zone)")
+if "ForAllValues:StringEquals" not in b:
+    problems.append("condition is not ForAllValues:StringEquals (StringEquals alone also allows a request whose value set is a SUPERSET of the allowed one)")
+for key, local_name in [
+    ("route53:ChangeResourceRecordSetsNormalizedRecordNames", "local.ci_dns_update_record_names"),
+    ("route53:ChangeResourceRecordSetsRecordTypes", "local.ci_dns_update_record_types"),
+    ("route53:ChangeResourceRecordSetsActions", "local.ci_dns_update_actions_types"),
+]:
+    m = re.search(re.escape(key) + r"\"?\s*=\s*([A-Za-z0-9_.]+)", b)
+    if not m:
+        problems.append("condition key %s not found" % key)
+    elif m.group(1) != local_name:
+        problems.append("condition key %s = %s, expected %s" % (key, m.group(1), local_name))
+print("; ".join(problems) if problems else "OK")
+' <<<"$dns_policy_block" || echo "parse error")
+  if [ "$dns_verdict" = "OK" ]; then
+    ok "aws_iam_role_policy.drone_dns_update grants exactly route53:ChangeResourceRecordSets on the zone ARN, conditioned ForAllValues:StringEquals on all three keys"
+  else
+    bad "aws_iam_role_policy.drone_dns_update: $dns_verdict"
+  fi
+fi
+
+# --- 11. Every drone-server run pins HOST=ci_hostname and PROTO=https ------
+# T-034 phase 2 extends check #6's shape: the same two `docker run …
+# drone/drone:…` invocations that must carry DRONE_DATABASE_SECRET must also
+# no longer point at the old EIP/http -- DRONE_SERVER_HOST must reference
+# the ci_hostname placeholder and DRONE_SERVER_PROTO must be the literal
+# https (a fixed value, never templated).
+drone_host_proto_violations=""
+for f in templates/drone-user-data.sh templates/jenkins-provision.sh; do
+  v=$(awk '
+    {
+      if (!c) {
+        if ($0 ~ /^[ \t]*docker run /) { c = 1; h = ($0 ~ /-e DRONE_SERVER_HOST="\$\{ci_hostname\}"/); p = ($0 ~ /-e DRONE_SERVER_PROTO=https/); d = ($0 ~ /drone\/drone:/) }
+        next
+      }
+      if ($0 ~ /-e DRONE_SERVER_HOST="\$\{ci_hostname\}"/) h = 1
+      if ($0 ~ /-e DRONE_SERVER_PROTO=https/) p = 1
+      if ($0 ~ /drone\/drone:/) d = 1
+      if ($0 !~ /\\[ \t]*$/) { if (d && !(h && p)) print "VIOLATION"; c = 0 }
+    }
+  ' "$f")
+  [ -n "$v" ] && drone_host_proto_violations="$drone_host_proto_violations $f"
+done
+if [ -n "$drone_host_proto_violations" ]; then
+  bad "a 'docker run … drone/drone:…' is missing -e DRONE_SERVER_HOST=\"\${ci_hostname}\" or -e DRONE_SERVER_PROTO=https in:$drone_host_proto_violations"
+else
+  ok "every 'docker run … drone/drone:…' pins DRONE_SERVER_HOST=\${ci_hostname} and DRONE_SERVER_PROTO=https"
+fi
+
+# --- 12. The CI A record keeps ignore_changes = [records] -------------------
+# T-034 phase 2, case 1: a lifecycle meta-argument, invisible to
+# `terraform test` (same class of gap as aws_instance.drone's own
+# ignore_changes, check #4 above). Without it, the boot updater's own
+# UPSERT (real state, outside Terraform's view) would be reverted to
+# whatever `records` says in config on the next apply.
+record_block=$(extract_block '^resource[ \t]+"aws_route53_record"[ \t]+"ci"[ \t]*{' <dns.tf)
+if [ -z "$record_block" ]; then
+  bad 'resource "aws_route53_record" "ci" { ... } not found in dns.tf'
+else
+  record_lifecycle_block=$(printf '%s\n' "$record_block" | extract_block '^[ \t]*lifecycle[ \t]*{')
+  if printf '%s' "$record_lifecycle_block" | grep -Eq 'ignore_changes[ \t]*=[ \t]*\[records\]'; then
+    ok "aws_route53_record.ci keeps ignore_changes = [records]"
+  else
+    bad "aws_route53_record.ci is missing lifecycle { ignore_changes = [records] } -- the boot updater's own UPSERT would be reverted on the next apply"
+  fi
+fi
+
+# --- 13. null_resource.jenkins_provision waits on the DNS grant + record ---
+# T-034 phase 2 review round 1, finding 4: this SSM push's own first action
+# is `systemctl enable --now ci-dns-updater.service`, which calls Route 53
+# using the instance role -- both the IAM grant and the record it UPSERTs
+# into must already exist, or the very first run fails. `depends_on` is a
+# meta-argument, invisible to `terraform test` (same class of gap as check
+# #4/#12 above), so this checks the source text directly.
+provision_block=$(extract_block '^resource[ \t]+"null_resource"[ \t]+"jenkins_provision"[ \t]*{' <ci.tf)
+if [ -z "$provision_block" ]; then
+  bad 'resource "null_resource" "jenkins_provision" { ... } not found in ci.tf'
+else
+  # extract_block only brace-balances ({}), not brackets ([]), so it can't
+  # isolate the depends_on = [ ... ] list on its own -- these two resource
+  # addresses are distinctive enough (and depends_on is the only place
+  # either could legitimately appear in this resource) to grep for directly
+  # within the whole already-extracted resource body instead.
+  missing=""
+  for want in 'aws_iam_role_policy.drone_dns_update,' 'aws_route53_record.ci,'; do
+    printf '%s' "$provision_block" | grep -qF "$want" || missing="$missing $want"
+  done
+  if [ -n "$missing" ]; then
+    bad "null_resource.jenkins_provision's depends_on is missing:$missing"
+  else
+    ok "null_resource.jenkins_provision depends_on covers aws_iam_role_policy.drone_dns_update and aws_route53_record.ci"
+  fi
+fi
+
+# --- 14. The reaper's DNS-sentinel grant reuses the SAME named locals as
+# drone_dns_update -- nothing wider, nothing duplicated. -------------------
+# T-034 phase 2 review round 2, finding 2(a): aws_iam_role_policy.ci_reaper
+# (ci-on-demand.tf) has several OTHER statements (EC2 stop, describe,
+# cloudwatch, ssm, logs), so unlike check #10 this can't assert the WHOLE
+# body -- it checks that the DNS-specific piece exists, referencing the
+# exact same locals check #10 already verifies the VALUES of (so this check
+# does not re-verify those values -- only that this SECOND policy actually
+# uses them).
+reaper_policy_block=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"ci_reaper"[ \t]*{' <ci-on-demand.tf)
+if [ -z "$reaper_policy_block" ]; then
+  bad 'resource "aws_iam_role_policy" "ci_reaper" { ... } not found in ci-on-demand.tf'
+else
+  reaper_dns_verdict=$(python3 -c '
+import re, sys
+b = sys.stdin.read()
+problems = []
+if not re.search(r"Action\s*=\s*local\.ci_dns_update_actions\b", b):
+    problems.append("no statement with Action = local.ci_dns_update_actions")
+if not re.search(r"Resource\s*=\s*data\.aws_route53_zone\.ci\.arn\b", b):
+    problems.append("no statement with Resource = data.aws_route53_zone.ci.arn")
+if "ForAllValues:StringEquals" not in b:
+    problems.append("condition is not ForAllValues:StringEquals")
+for key, local_name in [
+    ("route53:ChangeResourceRecordSetsNormalizedRecordNames", "local.ci_dns_update_record_names"),
+    ("route53:ChangeResourceRecordSetsRecordTypes", "local.ci_dns_update_record_types"),
+    ("route53:ChangeResourceRecordSetsActions", "local.ci_dns_update_actions_types"),
+]:
+    m = re.search(re.escape(key) + r"\"?\s*=\s*([A-Za-z0-9_.]+)", b)
+    if not m:
+        problems.append("condition key %s not found" % key)
+    elif m.group(1) != local_name:
+        problems.append("condition key %s = %s, expected %s" % (key, m.group(1), local_name))
+print("; ".join(problems) if problems else "OK")
+' <<<"$reaper_policy_block" || echo "parse error")
+  if [ "$reaper_dns_verdict" = "OK" ]; then
+    ok "aws_iam_role_policy.ci_reaper includes the DNS-sentinel statement, reusing iam.tf's drone_dns_update locals exactly"
+  else
+    bad "aws_iam_role_policy.ci_reaper: $reaper_dns_verdict"
+  fi
 fi
 
 exit $fail

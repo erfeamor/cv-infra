@@ -1,13 +1,24 @@
 # CI host for the demo: Drone (cv-admin-react) and, since T-002, Jenkins
 # (cv-domain-service, cv-database) co-located on the same instance rather
 # than a third box. GitHub must reach it for webhooks and Drone's OAuth
-# callback, so it keeps a stable Elastic IP. A reverse proxy container
-# fronts both services on the existing 80/443 ingress -- see
-# templates/jenkins-provision.sh.
+# callback, so it needs a stable address GitHub can keep pointing at across
+# stop/start cycles (T-019). T-034 phase 1 kept that stable via an Elastic
+# IP; phase 2 (this commit, the second of its PR) REMOVED the EIP -- there is
+# no more aws_eip.drone or aws_eip_association.drone anywhere in this module
+# (scripts/check-static.sh check 15 pins that). Stability now comes from a
+# DNS name instead (var.ci_hostname, dns.tf) that the host itself keeps
+# current on every boot (scripts/ci-dns-updater.sh) -- the public IP is
+# different on every stop/start cycle now, which is fine, because nothing
+# GitHub-facing addresses it directly any more. A reverse proxy container
+# (Caddy, T-033) fronts both services on the existing 80/443 ingress,
+# terminating TLS -- see templates/jenkins-provision.sh.
 #
 # Manual steps Terraform cannot do:
 #   1. Create a GitHub OAuth app (org erfeamor) with authorization callback
-#      http://<drone_server_url>/login and put its credentials in tfvars.
+#      https://<ci_hostname>/login and put its credentials in tfvars. T-034
+#      phase 2: this callback moved from http://<the old EIP> to
+#      https://ci.erfeamor.com -- re-registering it on GitHub's OAuth app
+#      settings is a manual step Terraform cannot reach.
 #   2. After first login, activate cv-admin-react in the Drone UI.
 #   3. Seed the aws_access_key_id / aws_secret_access_key Drone secrets on
 #      cv-admin-react from SSM -- run scripts/drone-reseed-secrets.sh
@@ -66,19 +77,21 @@ locals {
     aws_region             = var.aws_region
     project_name           = var.project_name
     environment            = var.environment
-    server_host            = aws_eip.drone.public_ip
+    ci_hostname            = var.ci_hostname
+    route53_zone_id        = data.aws_route53_zone.ci.zone_id
     admin_username         = var.drone_admin_username
     jenkins_admin_username = var.jenkins_admin_username
+    # T-034 phase 2: scripts/ci-dns-updater.sh has zero Terraform `${...}`
+    # placeholders of its own (see its header) -- read verbatim via file(),
+    # not templatefile(), and interpolated whole into this template's own
+    # rendering below, so the deployed copy and the offline-tested copy
+    # (scripts/tests/run-ci-dns-updater-tests.sh) are always the same bytes.
+    dns_updater_script = file("${path.module}/scripts/ci-dns-updater.sh")
+    # Review round 2, finding 2(a): same reasoning, for the ExecStop
+    # sentinel script (scripts/ci-dns-sentinel.sh / run-ci-dns-sentinel-tests.sh).
+    dns_sentinel_script = file("${path.module}/scripts/ci-dns-sentinel.sh")
+    dns_sentinel_ip     = local.ci_dns_sentinel_ip
   })
-}
-
-resource "aws_eip" "drone" {
-  domain = "vpc"
-
-  tags = {
-    Name    = "${var.project_name}-drone"
-    Project = var.project_name
-  }
 }
 
 resource "aws_instance" "drone" {
@@ -179,7 +192,7 @@ resource "aws_instance" "drone" {
       aws_region     = var.aws_region
       project_name   = var.project_name
       environment    = var.environment
-      server_host    = aws_eip.drone.public_ip
+      ci_hostname    = var.ci_hostname
       admin_username = var.drone_admin_username
     }),
     templatefile("${path.module}/templates/jenkins-bootstrap.sh", {
@@ -227,11 +240,6 @@ resource "aws_instance" "drone" {
     Name    = "${var.project_name}-drone"
     Project = var.project_name
   }
-}
-
-resource "aws_eip_association" "drone" {
-  instance_id   = aws_instance.drone.id
-  allocation_id = aws_eip.drone.id
 }
 
 # Stages the rendered script on disk (gitignored, see .gitignore) so the
@@ -395,9 +403,15 @@ resource "null_resource" "jenkins_provision" {
   }
 
   depends_on = [
-    aws_eip_association.drone,
     aws_ssm_parameter.jenkins_admin_password,
     aws_ssm_parameter.github_pat_ci,
     local_file.jenkins_provision_script,
+    # Review round 1, finding 4: this script's own first action is
+    # `systemctl enable --now ci-dns-updater.service`, which calls Route 53
+    # using the instance role -- that grant, and the record it UPSERTs into,
+    # must both already exist before this SSM push runs, or the very first
+    # invocation fails (loudly, but still: no reason to race it).
+    aws_iam_role_policy.drone_dns_update,
+    aws_route53_record.ci,
   ]
 }

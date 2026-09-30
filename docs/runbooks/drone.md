@@ -26,12 +26,14 @@ aws ec2 stop-instances --instance-ids "$I"
 
 ## The SSM tunnel to Drone's API
 
-Needs `session-manager-plugin` on PATH. It keeps API traffic off the plain-HTTP public address (no TLS on the CI host yet; see the TLS task).
+Needs `session-manager-plugin` on PATH. It keeps API traffic off the public address entirely -- forward to **443**, not 80: since T-034 phase 2 / T-033, `ci-proxy` (Caddy) redirects everything on :80 to https, so a plain `curl http://127.0.0.1:8080/healthz` now gets a 301, not Drone's answer.
+
+Review round 1, finding 7: use `--resolve` to pin `ci.erfeamor.com` to the tunnel's local port, not `-k` against `127.0.0.1` -- curl then verifies the REAL Let's Encrypt certificate for real, over the tunnel, instead of skipping verification entirely.
 
 ```bash
 aws ssm start-session --target "$I" --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["80"],"localPortNumber":["8080"]}'      # leave running; idles out after ~20 min
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/healthz   # 200
+  --parameters '{"portNumber":["443"],"localPortNumber":["8443"]}'      # leave running; idles out after ~20 min
+curl -s --resolve ci.erfeamor.com:8443:127.0.0.1 -o /dev/null -w '%{http_code}\n' https://ci.erfeamor.com:8443/healthz   # 200
 ```
 
 Close it by PID afterwards. Don't use `pkill -f <pattern>` from a shell whose own command line contains that pattern, because it kills itself:
@@ -63,18 +65,18 @@ Use this after a host replacement (the database goes with the root disk), or to 
    mv /var/lib/drone/database.sqlite /var/lib/drone/database.sqlite.bak-$(date +%F)
    docker start drone-server
    ```
-3. The **human** opens `http://13.39.59.12`, logs in with GitHub, clicks **Sync**, opens `erfeamor/cv-admin-react` and clicks **Activate** (defaults). Then saves a **fresh** token as above.
+3. The **human** opens `https://ci.erfeamor.com`, logs in with GitHub, clicks **Sync**, opens `erfeamor/cv-admin-react` and clicks **Activate** (defaults). Then saves a **fresh** token as above.
 4. Open the tunnel, then confirm the token and the activation. If the UI activation didn't stick, activate through the API, which re-registers the GitHub webhook:
    ```bash
    C=$(mktemp); { printf 'header = "Authorization: Bearer '; cat ~/.config/cv-drone-token; printf '"\n'; } > "$C"
-   curl -s -K "$C" http://127.0.0.1:8080/api/user                              # login, admin: true
-   curl -s -K "$C" http://127.0.0.1:8080/api/repos/erfeamor/cv-admin-react     # "active": true ?
-   curl -s -K "$C" -X POST http://127.0.0.1:8080/api/repos/erfeamor/cv-admin-react   # activate if not
+   curl -s --resolve ci.erfeamor.com:8443:127.0.0.1 -K "$C" https://ci.erfeamor.com:8443/api/user                              # login, admin: true
+   curl -s --resolve ci.erfeamor.com:8443:127.0.0.1 -K "$C" https://ci.erfeamor.com:8443/api/repos/erfeamor/cv-admin-react     # "active": true ?
+   curl -s --resolve ci.erfeamor.com:8443:127.0.0.1 -K "$C" -X POST https://ci.erfeamor.com:8443/api/repos/erfeamor/cv-admin-react   # activate if not
    rm -f "$C"
    ```
 5. Reseed the secrets (idempotent):
    ```bash
-   DRONE_SERVER=http://127.0.0.1:8080 DRONE_TOKEN="$(cat ~/.config/cv-drone-token)" \
+   DRONE_SERVER=https://ci.erfeamor.com:8443 DRONE_TOKEN="$(cat ~/.config/cv-drone-token)" \
      ./scripts/drone-reseed-secrets.sh
    ```
 6. **Prove a deploy.** `deploy` runs only on a `push` to `master`, and a rebuilt database has no builds to restart. Merge a small PR to `cv-admin-react` and confirm its push build is green **including `deploy`**.
@@ -147,6 +149,29 @@ Drone's own hook on `erfeamor/cv-admin-react` (config URL ending in `/hook`, str
 3. GitHub sends a `ping` to the new hook immediately — confirm it shows a green check in the Webhooks list. The doorbell answers `ping` without starting anything (see `lambda/ci_doorbell/index.py`).
 4. Leave Drone's original hook exactly as it is. `erfeamor/cv-admin-react` now carries **two** hooks: Drone's own (build trigger) and this one (wake + redeliver).
 
+### T-034 phase 2: re-point Drone's own hook, right after apply 1
+
+Drone's own hook on `erfeamor/cv-admin-react` (id `687961843`, config URL `http://13.39.59.12/hook`) still targets the old EIP over plain HTTP. It is **not** re-pointed by Terraform (same reasoning as the doorbell-signed hook above: GitHub hook config is out of Terraform's reach). Do this **immediately after phase 2's first apply** (DNS + Caddy/TLS, EIP still attached -- see `../../ci.tf`'s header for the two-commit shape) and **before** the second apply that releases the EIP.
+
+**Review round 2, finding 1: use the `/config` sub-resource, not `PATCH /hooks/{id}` directly.** `PATCH /repos/{owner}/{repo}/hooks/{id}` REPLACES the whole `config` object with whatever you send -- any field you don't include (here, `secret`) is DROPPED, and Drone then rejects every delivery's signature (it's still signing/expecting the old secret; GitHub has none to sign with any more). `PATCH .../hooks/{id}/config` is the one GitHub endpoint that MERGES into the existing config instead, so `secret` survives untouched:
+
+```bash
+gh api -X PATCH "repos/erfeamor/cv-admin-react/hooks/687961843/config" \
+  -f url=https://ci.erfeamor.com/hook -f content_type=json -f insecure_ssl=0
+gh api "repos/erfeamor/cv-admin-react/hooks/687961843" --jq '.config.url, .active'   # confirm: https://ci.erfeamor.com/hook, true
+gh api -X POST "repos/erfeamor/cv-admin-react/hooks/687961843/pings"                 # confirm ping delivery: 200
+```
+
+**A ping alone does not prove the secret survived** -- verify with a REAL delivery next. Redeliver the most recent one (any delivery from before the PATCH, or push a trivial commit first to generate a fresh one) and confirm Drone itself returns 200, which only happens if Drone's signature check against the (unchanged) secret passes:
+
+```bash
+last_delivery_id=$(gh api "repos/erfeamor/cv-admin-react/hooks/687961843/deliveries" --jq '.[0].id')
+gh api -X POST "repos/erfeamor/cv-admin-react/hooks/687961843/deliveries/${last_delivery_id}/attempts"
+gh api "repos/erfeamor/cv-admin-react/hooks/687961843/deliveries/${last_delivery_id}" --jq '.status_code'   # confirm: 200
+```
+
+Doing this **before** the EIP is released matters: while the EIP is still attached, the old target (`http://13.39.59.12/hook`) still answers (just wrong -- plain HTTP, no TLS), so a delivery misrouted between the PATCH and its confirmation fails cleanly rather than hanging against a dead address. After the second apply, `13.39.59.12` answers nothing at all.
+
 ### Manual redelivery fallback
 
 The async task gives up waiting for Drone's `/healthz` after `HEALTHZ_TIMEOUT_SECONDS` (480s / 8 min) and logs an error instead of redelivering — check CloudWatch Logs on `cv-project-ci-doorbell` for `"skipping redelivery"` if a push to `cv-admin-react` woke the host but no build appeared. Redeliver by hand once the host is confirmed up (`/healthz` returns 200):
@@ -169,4 +194,4 @@ gh api -X POST "repos/erfeamor/cv-admin-react/hooks/<hook_id>/deliveries/<delive
 
 - Drone's API omits `false` booleans, so the `pull_request` flags on secrets read back as unset. The reseed script sends them explicitly `false`.
 - A token file that isn't exactly 32 bytes almost certainly holds page text. Check its length, never its contents.
-- The SSM tunnel idles out after about 20 minutes. Reopen it if a step fails with connection refused on `127.0.0.1:8080`.
+- The SSM tunnel idles out after about 20 minutes. Reopen it if a step fails with connection refused on `ci.erfeamor.com:8443`.

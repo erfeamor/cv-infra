@@ -351,3 +351,30 @@ variable "github_hooks_token" {
   type        = string
   sensitive   = true
 }
+
+# T-034 phase 2 + T-033 ---------------------------------------------------
+
+variable "ci_hostname" {
+  # H1: a CI subdomain in the human's registered zone (erfeamor.com, hosted
+  # zone Z0608270B7WND031GVOW -- see dns.tf's data source), not the apex.
+  # A variable rather than a bare local literal, per the plan ("a variable
+  # is ok") -- this is the ONE place the hostname itself is spelled out;
+  # local.ci_public_host (ci-on-demand.tf) and dns.tf's record both read it
+  # from here, never a second literal.
+  description = "The CI host's stable DNS name (replaces the EIP as of T-034 phase 2). Must be a subdomain of the zone dns.tf reads, never the apex."
+  type        = string
+  default     = "ci.erfeamor.com"
+
+  # Review round 1, finding 10. Lowercase and no trailing dot specifically
+  # because iam.tf's route53:ChangeResourceRecordSetsNormalizedRecordNames
+  # condition compares against this value VERBATIM -- Route 53 normalizes
+  # the record's OWN name (lowercases it, appends a trailing dot) before
+  # evaluating the condition, so if this variable ever carried a different
+  # case or a trailing dot, the updater's every UPSERT would be silently
+  # denied by its own IAM policy, not merely mismatched. The character
+  # class/label-length limits below are RFC 1035's, not invented here.
+  validation {
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.ci_hostname))
+    error_message = "var.ci_hostname must be a lowercase hostname with no trailing dot, at least two labels (e.g. ci.erfeamor.com) -- got \"${var.ci_hostname}\"."
+  }
+}

@@ -50,12 +50,23 @@ log.setLevel(logging.INFO)
 ec2 = boto3.client("ec2")
 ssm = boto3.client("ssm")
 cloudwatch = boto3.client("cloudwatch")
+route53 = boto3.client("route53")
 
 INSTANCE_ID = os.environ["INSTANCE_ID"]
 JENKINS_BASE_URL = os.environ["JENKINS_BASE_URL"].rstrip("/")
 JENKINS_USER = os.environ["JENKINS_USER"]
 JENKINS_PASSWORD_PARAM = os.environ["JENKINS_PASSWORD_PARAM"]
 IDLE_WINDOW_MINUTES = int(os.environ.get("IDLE_WINDOW_MINUTES", "20"))
+
+# Review round 2, finding 2(a): the DNS-update grant (iam.tf's
+# drone_dns_update, mirrored here for this role) needs both to build the
+# same UPSERT this reaper makes.
+CI_HOSTNAME = os.environ["CI_HOSTNAME"]
+ROUTE53_ZONE_ID = os.environ["ROUTE53_ZONE_ID"]
+# TEST-NET-1 (RFC 5737): guaranteed to never route anywhere real, so once
+# the record says this, nothing (GitHub, a stale client, a scanner) can
+# reach whatever AWS reassigns this stopped instance's old public IP to.
+DNS_SENTINEL_IP = os.environ.get("DNS_SENTINEL_IP", "192.0.2.1")
 CPU_BUSY_PERCENT = float(os.environ.get("CPU_BUSY_PERCENT", "10"))
 KEEPALIVE_TAG = os.environ.get("KEEPALIVE_TAG", "CIKeepAlive")
 POST_START_GRACE_MINUTES = int(os.environ.get("POST_START_GRACE_MINUTES", "15"))
@@ -144,6 +155,41 @@ def within_post_start_grace(launch_time, grace_minutes, now=None):
     return now < launch_time + datetime.timedelta(minutes=grace_minutes)
 
 
+def _upsert_dns_sentinel():
+    """Best-effort: right after stopping the instance, UPSERT CI_HOSTNAME to
+    DNS_SENTINEL_IP (review round 2, finding 2(a)). This covers a GRACEFUL
+    stop (this call, from here); the instance's OWN ExecStop systemd unit
+    (templates/jenkins-provision.sh) covers an UNGRACEFUL one (a manual
+    `ec2 stop-instances`, a crash) that never reaches this Lambda at all --
+    neither alone covers both cases, so both exist.
+
+    Never raises: the instance is already stopped/stopping regardless of
+    whether this succeeds, and a failed sentinel write must not read as the
+    REAPER having failed -- the boot-time updater's next start (or this
+    same call, next time the reaper runs) still gets another chance.
+    """
+    try:
+        route53.change_resource_record_sets(
+            HostedZoneId=ROUTE53_ZONE_ID,
+            ChangeBatch={
+                "Changes": [
+                    {
+                        "Action": "UPSERT",
+                        "ResourceRecordSet": {
+                            "Name": CI_HOSTNAME,
+                            "Type": "A",
+                            "TTL": 60,
+                            "ResourceRecords": [{"Value": DNS_SENTINEL_IP}],
+                        },
+                    }
+                ]
+            },
+        )
+        log.info("UPSERTed %s -> sentinel %s after stopping %s", CI_HOSTNAME, DNS_SENTINEL_IP, INSTANCE_ID)
+    except ClientError:
+        log.exception("could not UPSERT the DNS sentinel for %s after stopping %s (best-effort, not treated as a reaper failure)", CI_HOSTNAME, INSTANCE_ID)
+
+
 def handler(event, context):
     try:
         instance = ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]
@@ -185,4 +231,5 @@ def handler(event, context):
 
     ec2.stop_instances(InstanceIds=[INSTANCE_ID])
     log.info("stopped %s after %d idle minutes", INSTANCE_ID, IDLE_WINDOW_MINUTES)
+    _upsert_dns_sentinel()
     return {"stopped": True, "reason": "idle"}

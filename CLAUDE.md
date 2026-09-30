@@ -25,9 +25,14 @@ python3 -m unittest discover -s lambda -p 'test_*.py'   # T-034: offline unit te
                                                           # on purpose: these Lambdas ship as a bare index.py,
                                                           # no vendored deps), and every urllib call is
                                                           # monkeypatched per test. No AWS/network needed.
+bash scripts/tests/run-ci-dns-updater-tests.sh   # T-034 phase 2: offline harness for scripts/ci-dns-updater.sh
+                                                  # -- stubs `curl` (IMDSv2) and `aws` (route53) via
+                                                  # scripts/tests/stub-bin-dns/, in the same style as the
+                                                  # drone-reseed harness above (a separate stub-bin dir, so
+                                                  # neither harness's fixtures can affect the other)
 ```
 
-`scripts/check-static.sh`, `bootstrap/check-static.sh`, `scripts/tests/run-drone-reseed-tests.sh` and the `lambda/` unit tests are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
+`scripts/check-static.sh`, `bootstrap/check-static.sh`, `scripts/tests/run-drone-reseed-tests.sh`, `scripts/tests/run-ci-dns-updater-tests.sh` and the `lambda/` unit tests are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
 
 Operational procedures live in `docs/runbooks/`: `drone.md` (Drone rebuild, repo secrets, deploy-key rotation, pausing the reaper) and `ci-host-replace.md` (replacing the CI host and verifying the new one).
 
@@ -78,7 +83,7 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
   That last filter is not optional: without it Cost Explorer nets credits out and reports ~$0, which is the same "reads green until it doesn't" trap `budgets.tf` exists to avoid.
 
   One $20 credit-earning activity remains `NOT_STARTED` (**Bedrock playground**; Lambda, EC2, RDS and Budgets are done). It's worth doing: under Paid, every credit dollar is a card dollar saved. The endgame decision is T-012 (A, go Paid, trimmed), the model T-020. Keep resources modest because the money is real now, not because a class is "free".
-  - Still true regardless: **no NAT gateway** (~$32/mo — that single resource would cost more than the entire current bill), CloudFront default cert, and note that **every public IPv4 costs ~$3.60/mo** — the two EIPs are now **~34%** of the bill (they were ~26% when the rate was $28/mo; a fixed cost becomes a bigger share as the variable part shrinks, so this percentage moves without anyone touching an EIP).
+  - Still true regardless: **no NAT gateway** (~$32/mo — that single resource would cost more than the entire current bill), CloudFront default cert, and note that **every public IPv4 costs ~$3.60/mo**. **T-034 phase 2 released the CI host's EIP** (`aws_eip.drone`, `cv-infra/ci.tf`) — replaced by a DNS name the host keeps current on every boot (`scripts/ci-dns-updater.sh`) — so there is now **one** EIP left (`aws_eip.domain_service`), not two; re-read the actual bill rather than trusting the old "~34%, two EIPs" figure, which predates that change.
   - T-019 and T-009 added two Lambdas, an EventBridge schedule, a Function URL and a private S3 bucket. All are **effectively $0** at this volume — a few invocations a month and a 14 KB object — and none changes the table above.
   - `aws_instance.drone` is `t3.small` (T-002) for Maven headroom. `terraform test` asserts instance classes; those assertions now encode a cost-discipline convention rather than a Free Tier boundary.
 - **No RDS — MySQL is self-hosted** on the domain-service EC2 (MySQL 8.4 container, Flyway-migrated at boot, data on a host volume). This was a deliberate move off `db.t3.micro` RDS: it removed the instance cost **and** the MySQL 8.0 Extended Support per-vCPU charge that began Aug 2026. Trade-off: no managed backups/patching/HA — durability rests on the instance's volume, and a `mysqldump→S3` job is the intended backup. A `t3.small` is recommended over `t3.micro` for the DB+app box for RAM headroom.

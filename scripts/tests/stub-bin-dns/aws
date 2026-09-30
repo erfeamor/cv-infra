@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Stub `aws` for scripts/tests/run-ci-dns-updater-tests.sh. Understands the
+# three route53 subcommands scripts/ci-dns-updater.sh calls, each already
+# reduced to plain text output (matching the real CLI's --output text on a
+# scalar --query, which is all this script ever asks for):
+#
+#   list-resource-record-sets  -> prints STUB_AWS_CURRENT_VALUE (default "None")
+#   change-resource-record-sets -> prints STUB_AWS_CHANGE_ID (default a fixture id)
+#   get-change                  -> prints STUB_AWS_CHANGE_STATUS (default "INSYNC")
+#
+# Fixtures:
+#   STUB_AWS_CALLS_LOG        -- append "<subcommand> <region> <zone-or-id>" per call
+#   STUB_AWS_LIST_FAIL        -- list-resource-record-sets exits 1
+#   STUB_AWS_CHANGE_FAIL      -- change-resource-record-sets exits 1
+#   STUB_AWS_GET_CHANGE_FAIL  -- get-change exits 1
+#   STUB_AWS_CURRENT_VALUE    -- value list-resource-record-sets returns
+#   STUB_AWS_CHANGE_ID        -- id change-resource-record-sets returns
+#   STUB_AWS_CHANGE_STATUS    -- status get-change returns
+set -euo pipefail
+
+if [ "${1:-}" != "route53" ]; then
+  echo "stub aws: unsupported invocation: $*" >&2
+  exit 1
+fi
+subcommand="${2:-}"
+shift 2
+
+region="" zone="" change_id="" change_batch=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --region)
+    region="$2"
+    shift 2
+    ;;
+  --hosted-zone-id)
+    zone="$2"
+    shift 2
+    ;;
+  --id)
+    change_id="$2"
+    shift 2
+    ;;
+  --change-batch)
+    change_batch="$2"
+    shift 2
+    ;;
+  *)
+    shift
+    ;;
+  esac
+done
+
+log() {
+  [ -n "${STUB_AWS_CALLS_LOG:-}" ] && echo "$subcommand ${region} ${zone}${change_id}${change_batch}" >>"$STUB_AWS_CALLS_LOG"
+  return 0
+}
+
+case "$subcommand" in
+list-resource-record-sets)
+  log
+  if [ -n "${STUB_AWS_LIST_FAIL:-}" ]; then
+    echo "stub aws: An error occurred (Throttling) when calling the ListResourceRecordSets operation" >&2
+    exit 1
+  fi
+  printf '%s\n' "${STUB_AWS_CURRENT_VALUE:-None}"
+  ;;
+change-resource-record-sets)
+  log
+  if [ -n "${STUB_AWS_CHANGE_FAIL:-}" ]; then
+    echo "stub aws: An error occurred (Throttling) when calling the ChangeResourceRecordSets operation" >&2
+    exit 1
+  fi
+  printf '%s\n' "${STUB_AWS_CHANGE_ID:-/change/FIXTURE123}"
+  ;;
+get-change)
+  log
+  if [ -n "${STUB_AWS_GET_CHANGE_FAIL:-}" ]; then
+    echo "stub aws: An error occurred (Throttling) when calling the GetChange operation" >&2
+    exit 1
+  fi
+  printf '%s\n' "${STUB_AWS_CHANGE_STATUS:-INSYNC}"
+  ;;
+*)
+  echo "stub aws: unsupported subcommand: $subcommand" >&2
+  exit 1
+  ;;
+esac

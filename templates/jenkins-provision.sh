@@ -137,6 +137,43 @@ if ! systemctl enable --now ci-dns-updater.service; then
 fi
 systemctl enable --now ci-dns-updater.timer
 
+# Review round 2, finding 2(a): UPSERT the CI hostname to a sentinel on
+# shutdown, so a stopped host's about-to-be-released public IP is never
+# left resolvable once AWS reassigns it to a different customer. Covers an
+# UNGRACEFUL stop; lambda/ci_reaper/index.py covers a GRACEFUL one
+# separately (neither alone covers both). The standard systemd idiom for
+# "run something on stop, not on start": remaining active after the
+# (no-op) ExecStart below keeps this unit "active" from boot until systemd
+# tears it down
+# (a genuine shutdown/reboot, or an explicit `systemctl stop`), at which
+# point ExecStop fires.
+cat >/usr/local/bin/ci-dns-sentinel.sh <<'DNS_SENTINEL_EOF'
+${dns_sentinel_script}
+DNS_SENTINEL_EOF
+chmod 755 /usr/local/bin/ci-dns-sentinel.sh
+
+cat >/etc/systemd/system/ci-dns-sentinel.service <<'DNS_SENTINEL_UNIT_EOF'
+[Unit]
+Description=UPSERT ${ci_hostname} to a sentinel on shutdown (T-034 phase 2 review round 2, finding 2(a))
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=AWS_REGION=${aws_region}
+Environment=CI_HOSTNAME=${ci_hostname}
+Environment=ROUTE53_ZONE_ID=${route53_zone_id}
+Environment=SENTINEL_IP=${dns_sentinel_ip}
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/ci-dns-sentinel.sh
+
+[Install]
+WantedBy=multi-user.target
+DNS_SENTINEL_UNIT_EOF
+
+systemctl daemon-reload
+systemctl enable --now ci-dns-sentinel.service
+
 docker network inspect drone >/dev/null 2>&1 || docker network create drone
 
 # Jenkins: files/image first, containers last (Drone untouched till the end).
@@ -456,6 +493,23 @@ http://${ci_hostname} {
   redir https://{host}{uri} permanent
 }
 
+# Review round 2, finding 4: the local routing/liveness probe below
+# (templates/jenkins-provision.sh's health check) must not depend on a
+# certificate existing -- `Host: localhost` is never a value ci_hostname's
+# public DNS record could ever cause a real client to send (there is no
+# "localhost" A/AAAA record anywhere), so this path is reachable only from
+# a probe run ON the host itself, deliberately over plain HTTP, and
+# deliberately NOT proxied to either upstream: it proves Caddy itself is up
+# and serving its configured routes, independent of DNS, TLS, or ACME.
+http://localhost {
+  handle /__ci_proxy_health {
+    respond 200
+  }
+  handle {
+    respond 421
+  }
+}
+
 # Review round 1, finding 1: anything that reaches this listener with a
 # Host that ISN'T ${ci_hostname} -- a request straight to the instance's raw
 # public IP (SNI-less or IP-SNI), a stray old bookmark, a scanner -- falls
@@ -526,39 +580,40 @@ recreate_if_needed ci-proxy caddy:2 "$CI_PROXY_CONFIG_HASH" \
 
 # Health check: `docker run -d` only proves creation, not serving. Review
 # round 1, finding 5 split this into two genuinely different questions,
-# checked and treated differently:
+# checked and treated differently; review round 2, finding 4 corrected (a)
+# below, which had STILL depended on a certificate existing (`-k` only
+# skips verifying a presented cert -- if Caddy has not obtained ANY
+# certificate yet, e.g. ACME still pending, the TLS handshake itself may
+# never complete, and `-k` cannot route around a handshake that never
+# finishes):
 #
-#   (a) Is the PROXY ROUTING correct at all -- Caddy is up, its config is
-#       valid, and it forwards /jenkins/login to Jenkins? This is a
-#       configuration/container problem if it fails, has nothing to do with
-#       DNS or ACME, and stays a hard failure: `-k` is used ONLY for this
-#       local liveness probe, to keep it independent of whether a
-#       certificate has been issued yet. --resolve still pins the hostname
-#       to this host's own loopback (this runs ON the CI host, so it can't
-#       rely on the DNS updater having already propagated externally by the
-#       time this line runs) -- `-k` here is about the CERTIFICATE'S
-#       validity, not the hostname routing, which --resolve already gets
-#       right.
+#   (a) Is the PROXY ROUTING correct at all -- Caddy is up and its config
+#       loaded? Probed over PLAIN HTTP against the dedicated, never-proxied
+#       /__ci_proxy_health path (Caddyfile, `http://localhost` block) --
+#       zero dependency on DNS, TLS, or ACME state. A configuration/
+#       container problem if it fails, and stays a hard failure.
 #   (b) Does ci_hostname now present a REAL, browser/GitHub-trusted
-#       certificate? This depends on Let's Encrypt actually having issued
-#       one, which can take a while on a first-ever boot and is NOT this
-#       script's job to force -- Caddy keeps retrying on its own
-#       regardless. A long wait here that only WARNS on timeout (never
-#       fails the apply) reflects that: the box is already usable per (a),
-#       and a still-pending certificate resolves itself without any
-#       operator action.
+#       certificate, AND does /jenkins/* actually reach Jenkins through it?
+#       This depends on Let's Encrypt actually having issued one, which can
+#       take a while on a first-ever boot and is NOT this script's job to
+#       force -- Caddy keeps retrying on its own regardless. A long wait
+#       here that only WARNS on timeout (never fails the apply) reflects
+#       that: the box is already usable per (a), and a still-pending
+#       certificate resolves itself without any operator action. This is
+#       also where actual Jenkins-over-HTTPS reachability gets proven, once
+#       it's ready -- (a) deliberately does not attempt that.
 docker exec ci-proxy caddy validate --config /etc/caddy/Caddyfile
 
 routing_elapsed=0
-routing_timeout_s=120
+routing_timeout_s=60
 routing_poll_s=5
 while :; do
-  if curl -sfk -o /dev/null --resolve "${ci_hostname}:443:127.0.0.1" "https://${ci_hostname}/jenkins/login"; then
-    echo "jenkins-provision: ci-proxy is routing to Jenkins over HTTPS (certificate not yet verified)."
+  if curl -sf -o /dev/null -H "Host: localhost" "http://127.0.0.1/__ci_proxy_health"; then
+    echo "jenkins-provision: ci-proxy (Caddy) is up and serving its configured routes."
     break
   fi
   if [ "$routing_elapsed" -ge "$routing_timeout_s" ]; then
-    echo "jenkins-provision: https://${ci_hostname}/jenkins/login never came up through ci-proxy within $${routing_timeout_s}s -- this is a proxy/container problem, not a DNS/certificate one" >&2
+    echo "jenkins-provision: ci-proxy's local health path never came up within $${routing_timeout_s}s -- this is a proxy/container problem, not a DNS/certificate one" >&2
     exit 1
   fi
   sleep "$routing_poll_s"

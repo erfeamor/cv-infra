@@ -26,12 +26,24 @@ data "aws_route53_zone" "ci" {
 # aws_eip.drone.public_ip for exactly that first-creation case; now that the
 # EIP is gone, there is no real address left to read at plan time, so this
 # is a placeholder by necessity as well as by the ignore_changes contract.
+#
+# Review round 2, finding 5: the placeholder is local.ci_dns_sentinel_ip
+# (192.0.2.1, ci-on-demand.tf), NOT a bare "0.0.0.0" -- `allow_overwrite`
+# above means a RE-CREATE of this resource (state loss, a deliberate
+# `-replace`) applies this literal for real, bypassing ignore_changes
+# entirely (that meta-argument only suppresses drift-correction on an
+# EXISTING resource, same limitation this module already documents for
+# aws_instance.drone). A re-create can therefore only ever set the "host
+# not up" sentinel, which the boot-time updater then corrects to the real
+# address on the next start -- never a bogus "0.0.0.0" that looks like a
+# misconfiguration rather than the deliberate, self-correcting placeholder
+# it is.
 resource "aws_route53_record" "ci" {
   zone_id = data.aws_route53_zone.ci.zone_id
   name    = var.ci_hostname
   type    = "A"
   ttl     = 60
-  records = ["0.0.0.0"] # never applied past creation -- see the comment above
+  records = [local.ci_dns_sentinel_ip] # never applied past creation -- see the comment above
 
   # Review round 1, finding 4: without this, creating the record fails
   # outright if one already exists at this name/type (e.g. left over from

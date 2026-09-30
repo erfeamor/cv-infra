@@ -87,6 +87,10 @@ locals {
     # rendering below, so the deployed copy and the offline-tested copy
     # (scripts/tests/run-ci-dns-updater-tests.sh) are always the same bytes.
     dns_updater_script = file("${path.module}/scripts/ci-dns-updater.sh")
+    # Review round 2, finding 2(a): same reasoning, for the ExecStop
+    # sentinel script (scripts/ci-dns-sentinel.sh / run-ci-dns-sentinel-tests.sh).
+    dns_sentinel_script = file("${path.module}/scripts/ci-dns-sentinel.sh")
+    dns_sentinel_ip     = local.ci_dns_sentinel_ip
   })
 }
 

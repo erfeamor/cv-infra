@@ -409,4 +409,46 @@ else
   fi
 fi
 
+# --- 15. The reaper's DNS-sentinel grant reuses the SAME named locals as
+# drone_dns_update -- nothing wider, nothing duplicated. -------------------
+# T-034 phase 2 review round 2, finding 2(a): aws_iam_role_policy.ci_reaper
+# (ci-on-demand.tf) has several OTHER statements (EC2 stop, describe,
+# cloudwatch, ssm, logs), so unlike check #10 this can't assert the WHOLE
+# body -- it checks that the DNS-specific piece exists, referencing the
+# exact same locals check #10 already verifies the VALUES of (so this check
+# does not re-verify those values -- only that this SECOND policy actually
+# uses them).
+reaper_policy_block=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"ci_reaper"[ \t]*{' <ci-on-demand.tf)
+if [ -z "$reaper_policy_block" ]; then
+  bad 'resource "aws_iam_role_policy" "ci_reaper" { ... } not found in ci-on-demand.tf'
+else
+  reaper_dns_verdict=$(python3 -c '
+import re, sys
+b = sys.stdin.read()
+problems = []
+if not re.search(r"Action\s*=\s*local\.ci_dns_update_actions\b", b):
+    problems.append("no statement with Action = local.ci_dns_update_actions")
+if not re.search(r"Resource\s*=\s*data\.aws_route53_zone\.ci\.arn\b", b):
+    problems.append("no statement with Resource = data.aws_route53_zone.ci.arn")
+if "ForAllValues:StringEquals" not in b:
+    problems.append("condition is not ForAllValues:StringEquals")
+for key, local_name in [
+    ("route53:ChangeResourceRecordSetsNormalizedRecordNames", "local.ci_dns_update_record_names"),
+    ("route53:ChangeResourceRecordSetsRecordTypes", "local.ci_dns_update_record_types"),
+    ("route53:ChangeResourceRecordSetsActions", "local.ci_dns_update_actions_types"),
+]:
+    m = re.search(re.escape(key) + r"\"?\s*=\s*([A-Za-z0-9_.]+)", b)
+    if not m:
+        problems.append("condition key %s not found" % key)
+    elif m.group(1) != local_name:
+        problems.append("condition key %s = %s, expected %s" % (key, m.group(1), local_name))
+print("; ".join(problems) if problems else "OK")
+' <<<"$reaper_policy_block" || echo "parse error")
+  if [ "$reaper_dns_verdict" = "OK" ]; then
+    ok "aws_iam_role_policy.ci_reaper includes the DNS-sentinel statement, reusing iam.tf's drone_dns_update locals exactly"
+  else
+    bad "aws_iam_role_policy.ci_reaper: $reaper_dns_verdict"
+  fi
+fi
+
 exit $fail

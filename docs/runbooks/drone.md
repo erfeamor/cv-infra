@@ -151,12 +151,23 @@ Drone's own hook on `erfeamor/cv-admin-react` (config URL ending in `/hook`, str
 
 ### T-034 phase 2: re-point Drone's own hook, right after apply 1
 
-Drone's own hook on `erfeamor/cv-admin-react` (id `687961843`, config URL `http://13.39.59.12/hook`) still targets the old EIP over plain HTTP. It is **not** re-pointed by Terraform (same reasoning as the doorbell-signed hook above: GitHub hook config is out of Terraform's reach). Do this **immediately after phase 2's first apply** (DNS + Caddy/TLS, EIP still attached -- see `../../ci.tf`'s header for the two-commit shape) and **before** the second apply that releases the EIP:
+Drone's own hook on `erfeamor/cv-admin-react` (id `687961843`, config URL `http://13.39.59.12/hook`) still targets the old EIP over plain HTTP. It is **not** re-pointed by Terraform (same reasoning as the doorbell-signed hook above: GitHub hook config is out of Terraform's reach). Do this **immediately after phase 2's first apply** (DNS + Caddy/TLS, EIP still attached -- see `../../ci.tf`'s header for the two-commit shape) and **before** the second apply that releases the EIP.
+
+**Review round 2, finding 1: use the `/config` sub-resource, not `PATCH /hooks/{id}` directly.** `PATCH /repos/{owner}/{repo}/hooks/{id}` REPLACES the whole `config` object with whatever you send -- any field you don't include (here, `secret`) is DROPPED, and Drone then rejects every delivery's signature (it's still signing/expecting the old secret; GitHub has none to sign with any more). `PATCH .../hooks/{id}/config` is the one GitHub endpoint that MERGES into the existing config instead, so `secret` survives untouched:
 
 ```bash
-gh api -X PATCH "repos/erfeamor/cv-admin-react/hooks/687961843" -f config[url]=https://ci.erfeamor.com/hook -f config[content_type]=json
+gh api -X PATCH "repos/erfeamor/cv-admin-react/hooks/687961843/config" \
+  -f url=https://ci.erfeamor.com/hook -f content_type=json -f insecure_ssl=0
 gh api "repos/erfeamor/cv-admin-react/hooks/687961843" --jq '.config.url, .active'   # confirm: https://ci.erfeamor.com/hook, true
-gh api -X POST "repos/erfeamor/cv-admin-react/hooks/687961843/pings"                 # confirm delivery: 200
+gh api -X POST "repos/erfeamor/cv-admin-react/hooks/687961843/pings"                 # confirm ping delivery: 200
+```
+
+**A ping alone does not prove the secret survived** -- verify with a REAL delivery next. Redeliver the most recent one (any delivery from before the PATCH, or push a trivial commit first to generate a fresh one) and confirm Drone itself returns 200, which only happens if Drone's signature check against the (unchanged) secret passes:
+
+```bash
+last_delivery_id=$(gh api "repos/erfeamor/cv-admin-react/hooks/687961843/deliveries" --jq '.[0].id')
+gh api -X POST "repos/erfeamor/cv-admin-react/hooks/687961843/deliveries/${last_delivery_id}/attempts"
+gh api "repos/erfeamor/cv-admin-react/hooks/687961843/deliveries/${last_delivery_id}" --jq '.status_code'   # confirm: 200
 ```
 
 Doing this **before** the EIP is released matters: while the EIP is still attached, the old target (`http://13.39.59.12/hook`) still answers (just wrong -- plain HTTP, no TLS), so a delivery misrouted between the PATCH and its confirmation fails cleanly rather than hanging against a dead address. After the second apply, `13.39.59.12` answers nothing at all.

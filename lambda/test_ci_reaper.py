@@ -29,6 +29,8 @@ ENV = {
     "IDLE_WINDOW_MINUTES": "20",
     "CPU_BUSY_PERCENT": "10",
     "POST_START_GRACE_MINUTES": "15",
+    "CI_HOSTNAME": "ci.erfeamor.com",
+    "ROUTE53_ZONE_ID": "Z0608270B7WND031GVOW",
 }
 
 
@@ -94,6 +96,50 @@ class TestGraceExpired(ReaperTestCase):
             result = self.module.handler({}, None)
         self.assertFalse(result["stopped"])
         self.module.ec2.stop_instances.assert_not_called()
+
+
+# --- Review round 2, finding 2(a) (RED): the reaper UPSERTs a DNS sentinel
+# right after stopping the instance, best-effort -----------------------------
+
+
+class TestDnsSentinelOnStop(ReaperTestCase):
+    def _make_idle(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.set_instance(instance(launch_time=now - datetime.timedelta(minutes=21)))
+        return mock.patch.object(self.module, "cpu_quiet_over_window", return_value=True), mock.patch.object(
+            self.module, "jenkins_is_idle", return_value=True
+        )
+
+    def test_upserts_sentinel_after_stopping(self):
+        p1, p2 = self._make_idle()
+        with p1, p2:
+            result = self.module.handler({}, None)
+        self.assertEqual(result, {"stopped": True, "reason": "idle"})
+        self.module.route53.change_resource_record_sets.assert_called_once()
+        _, kwargs = self.module.route53.change_resource_record_sets.call_args
+        self.assertEqual(kwargs["HostedZoneId"], ENV["ROUTE53_ZONE_ID"])
+        change = kwargs["ChangeBatch"]["Changes"][0]
+        self.assertEqual(change["Action"], "UPSERT")
+        rrset = change["ResourceRecordSet"]
+        self.assertEqual(rrset["Name"], ENV["CI_HOSTNAME"])
+        self.assertEqual(rrset["Type"], "A")
+        self.assertEqual(rrset["ResourceRecords"], [{"Value": "192.0.2.1"}])
+
+    def test_sentinel_upsert_is_best_effort_does_not_fail_the_stop(self):
+        p1, p2 = self._make_idle()
+        self.module.route53.change_resource_record_sets.side_effect = self.module.ClientError(
+            {"Error": {"Code": "Throttling", "Message": "x"}}, "ChangeResourceRecordSets"
+        )
+        with p1, p2, self.assertLogs(self.module.log, level="ERROR"):
+            result = self.module.handler({}, None)
+        self.assertEqual(result, {"stopped": True, "reason": "idle"})
+
+    def test_no_sentinel_upsert_when_the_instance_does_not_stop(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.set_instance(instance(launch_time=now - datetime.timedelta(minutes=21)))
+        with mock.patch.object(self.module, "cpu_quiet_over_window", return_value=False):
+            self.module.handler({}, None)
+        self.module.route53.change_resource_record_sets.assert_not_called()
 
 
 if __name__ == "__main__":

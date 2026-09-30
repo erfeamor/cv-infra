@@ -8,8 +8,16 @@
 #
 # Best-effort and FAST by design: this runs as systemd tears the host down,
 # so a slow or failing call here must never hold up the rest of shutdown.
-# No retry loop (unlike scripts/ci-dns-updater.sh) -- one attempt, a short
+# No retry loop (unlike scripts/ci-dns-updater.sh) -- one attempt, a bounded
 # `timeout`, and unconditional success either way.
+#
+# T-041: timeout raised 10 -> 20 now that ci-dns-sentinel.service orders
+# itself after network-online.target (templates/jenkins-provision.sh) --
+# networking no longer disappears mid-call, so a slow-but-real Route 53
+# response has room to complete instead of being cut off by an
+# artificially short budget. On failure, the AWS CLI's own stderr is now
+# captured and printed (still to stderr, still after the fact) so the
+# journal shows WHY the UPSERT failed, not just that it did.
 #
 # Reads its configuration from the environment (AWS_REGION, CI_HOSTNAME,
 # ROUTE53_ZONE_ID, SENTINEL_IP), same convention as scripts/ci-dns-updater.sh,
@@ -27,11 +35,12 @@ change_batch=$(cat <<JSON
 JSON
 )
 
-if timeout 10 aws route53 change-resource-record-sets --region "$AWS_REGION" \
-  --hosted-zone-id "$ROUTE53_ZONE_ID" --change-batch "$change_batch" >/dev/null 2>&1; then
+aws_err=""
+if aws_err=$(timeout 20 aws route53 change-resource-record-sets --region "$AWS_REGION" \
+  --hosted-zone-id "$ROUTE53_ZONE_ID" --change-batch "$change_batch" 2>&1 >/dev/null); then
   echo "ci-dns-sentinel: UPSERTed $CI_HOSTNAME -> $SENTINEL_IP"
 else
-  echo "ci-dns-sentinel: UPSERT to the sentinel failed or timed out (best-effort, continuing shutdown)" >&2
+  echo "ci-dns-sentinel: UPSERT to the sentinel failed or timed out (best-effort, continuing shutdown): $aws_err" >&2
 fi
 
 exit 0

@@ -24,6 +24,25 @@ aws ec2 delete-tags --resources "$I" --tags Key=CIKeepAlive      # always, or th
 aws ec2 stop-instances --instance-ids "$I"
 ```
 
+After a manual `stop-instances`, `ci-dns-sentinel.service`'s `ExecStop` (T-041) should UPSERT `ci.erfeamor.com` to the sentinel (`192.0.2.1`) within the stop. Confirm it landed -- read the record, don't assume:
+
+```bash
+aws route53 list-resource-record-sets --hosted-zone-id Z0608270B7WND031GVOW \
+  --start-record-name ci.erfeamor.com --start-record-type A --max-items 1
+```
+
+If it isn't `192.0.2.1` within a minute, UPSERT it by hand:
+
+```bash
+cat >/tmp/sentinel-change.json <<'JSON'
+{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"ci.erfeamor.com","Type":"A","TTL":60,"ResourceRecords":[{"Value":"192.0.2.1"}]}}]}
+JSON
+aws route53 change-resource-record-sets --hosted-zone-id Z0608270B7WND031GVOW \
+  --change-batch file:///tmp/sentinel-change.json
+```
+
+Route 53 CloudTrail events live in **us-east-1**, not the account's usual region, if you need to dig into why a change didn't land.
+
 ## The SSM tunnel to Drone's API
 
 Needs `session-manager-plugin` on PATH. It keeps API traffic off the public address entirely -- forward to **443**, not 80: since T-034 phase 2 / T-033, `ci-proxy` (Caddy) redirects everything on :80 to https, so a plain `curl http://127.0.0.1:8080/healthz` now gets a 301, not Drone's answer.

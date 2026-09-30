@@ -501,4 +501,32 @@ print("; ".join(problems) if problems else "OK")
   fi
 fi
 
+# --- 17. ci-dns-sentinel.service orders itself after network-online -------
+# T-041: on a live host, ExecStop (scripts/ci-dns-sentinel.sh) raced
+# systemd-networkd/-resolved going down first -- the unit had no ordering
+# relationship to networking at all, only Before=docker.service (which
+# governs start order, not stop order). systemd stops units in the REVERSE
+# of their start order, so Wants=/After=network-online.target (matching
+# ci-dns-updater.service's own pair, same heredoc file) keeps
+# networkd/resolved up until ExecStop returns. `terraform test` can't see
+# this: it's plain text inside a bash heredoc embedded via templatefile(),
+# not a resource attribute.
+sentinel_unit_block=$(awk '
+  /cat >\/etc\/systemd\/system\/ci-dns-sentinel\.service <<.DNS_SENTINEL_UNIT_EOF./ { c = 1; next }
+  c && /^DNS_SENTINEL_UNIT_EOF$/ { c = 0 }
+  c { print }
+' templates/jenkins-provision.sh)
+if [ -z "$sentinel_unit_block" ]; then
+  bad "ci-dns-sentinel.service heredoc not found in templates/jenkins-provision.sh"
+else
+  missing=""
+  printf '%s\n' "$sentinel_unit_block" | grep -qE '^Wants=network-online\.target$' || missing="$missing Wants=network-online.target"
+  printf '%s\n' "$sentinel_unit_block" | grep -qE '^After=network-online\.target$' || missing="$missing After=network-online.target"
+  if [ -n "$missing" ]; then
+    bad "ci-dns-sentinel.service is missing:$missing -- ExecStop can race network teardown on shutdown (T-041)"
+  else
+    ok "ci-dns-sentinel.service orders itself Wants=/After=network-online.target, so ExecStop runs before networking is torn down (T-041)"
+  fi
+fi
+
 exit $fail

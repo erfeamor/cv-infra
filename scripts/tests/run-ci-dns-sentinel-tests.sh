@@ -85,6 +85,31 @@ else
   ok "exited non-zero with CI_HOSTNAME unset"
 fi
 
+echo "case 5 (RED, T-041): on failure, the AWS CLI's own stderr reaches the journal (stderr), stdout stays clean"
+reset_fixtures
+STUB_AWS_CHANGE_FAIL=1
+run_sentinel >"$workdir/out.log" 2>"$workdir/err.log" || true
+if grep -q "ChangeResourceRecordSets" "$workdir/err.log"; then
+  ok "the stub aws error (naming the ChangeResourceRecordSets call) was printed to stderr"
+else
+  bad "the AWS CLI's error text did not reach stderr: $(cat "$workdir/err.log")"
+fi
+if [ -s "$workdir/out.log" ]; then
+  bad "stdout was not empty on failure: $(cat "$workdir/out.log")"
+else
+  ok "stdout stayed clean (suppressed) even on failure"
+fi
+
+echo "case 6: on success, no AWS CLI output leaks to either stream beyond the one summary line"
+reset_fixtures
+run_sentinel >"$workdir/out.log" 2>"$workdir/err.log"
+if [ -s "$workdir/err.log" ]; then
+  bad "stderr was not empty on the happy path: $(cat "$workdir/err.log")"
+else
+  ok "stderr stayed clean on the happy path"
+fi
+grep -q "UPSERTed" "$workdir/out.log" && ok "stdout carries exactly the success summary line" || bad "missing the success summary on stdout: $(cat "$workdir/out.log")"
+
 echo
 echo "ci-dns-sentinel tests: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -152,9 +152,23 @@ ${dns_sentinel_script}
 DNS_SENTINEL_EOF
 chmod 755 /usr/local/bin/ci-dns-sentinel.sh
 
+# T-041: this unit was firing ExecStop with the network already torn down.
+# systemd stops units in the REVERSE of their start order, so `After=X` on
+# start means "stopped before X" on shutdown -- with no dependency on
+# networking at all, this unit had no guaranteed relationship to
+# systemd-networkd/-resolved and could be stopped concurrently with (or
+# after) them. Live host journal (T-041): ExecStop started 22:32:25.18,
+# systemd-networkd stopped 22:32:26.08 ("DHCP lease lost"), and the
+# `timeout 10` (see scripts/ci-dns-sentinel.sh) expired at 22:32:35.19 --
+# failed 2 of 5 stops observed. `Wants=`/`After=network-online.target`
+# below (matching ci-dns-updater.service's own pair above) keeps
+# networkd/resolved up until ExecStop returns, without changing
+# `Before=docker.service` (still the ordering that matters on start).
 cat >/etc/systemd/system/ci-dns-sentinel.service <<'DNS_SENTINEL_UNIT_EOF'
 [Unit]
 Description=UPSERT ${ci_hostname} to a sentinel on shutdown (T-034 phase 2 review round 2, finding 2(a))
+Wants=network-online.target
+After=network-online.target
 Before=docker.service
 
 [Service]

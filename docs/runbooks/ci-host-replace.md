@@ -82,6 +82,25 @@ aws ec2 stop-instances --instance-ids "$I"
 terraform plan        # must show "No changes."
 ```
 
+After that manual `stop-instances`, confirm `ci-dns-sentinel.service`'s `ExecStop` (T-041) actually UPSERTed `ci.erfeamor.com` to the sentinel -- read the record, don't assume:
+
+```bash
+aws route53 list-resource-record-sets --hosted-zone-id Z0608270B7WND031GVOW \
+  --start-record-name ci.erfeamor.com --start-record-type A --max-items 1
+```
+
+Not `192.0.2.1` within a minute? UPSERT it by hand (change-batch file, same as `docs/runbooks/drone.md`):
+
+```bash
+cat >/tmp/sentinel-change.json <<'JSON'
+{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"ci.erfeamor.com","Type":"A","TTL":60,"ResourceRecords":[{"Value":"192.0.2.1"}]}}]}
+JSON
+aws route53 change-resource-record-sets --hosted-zone-id Z0608270B7WND031GVOW \
+  --change-batch file:///tmp/sentinel-change.json
+```
+
+Route 53 CloudTrail events live in **us-east-1**, not the account's usual region.
+
 Then merge the change's PR, if it was applied from a branch.
 
 ## Rollback

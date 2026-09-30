@@ -906,6 +906,29 @@ run "ci_on_demand" {
     error_message = "ci-dns-sentinel.service must set RemainAfterExit=yes -- otherwise it's never 'active' for ExecStop to fire against"
   }
 
+  # --- T-041: ExecStop must not race networking down. systemd stops units in
+  # the REVERSE of their start order, so After=network-online.target on this
+  # unit keeps networkd/resolved up until ExecStop (scripts/ci-dns-sentinel.sh)
+  # returns -- Before=docker.service alone only governed START order. Scoped
+  # to the ci-dns-sentinel.service block specifically (not just "somewhere in
+  # the file"): ci-dns-updater.service already carries the same two lines, so
+  # an unscoped count would pass even if this unit never got them.
+  assert {
+    condition = length(regexall("Description=UPSERT ci\\.example\\.test to a sentinel on shutdown[^\\n]*\\nWants=network-online\\.target\\nAfter=network-online\\.target\\nBefore=docker\\.service", templatefile("${path.module}/templates/jenkins-provision.sh", {
+      aws_region             = var.aws_region
+      project_name           = var.project_name
+      environment            = var.environment
+      ci_hostname            = "ci.example.test"
+      route53_zone_id        = "Z00000000000000000000"
+      admin_username         = var.drone_admin_username
+      jenkins_admin_username = var.jenkins_admin_username
+      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
+      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
+      dns_sentinel_ip        = "192.0.2.1"
+    }))) == 1
+    error_message = "ci-dns-sentinel.service must set Wants=network-online.target and After=network-online.target (in that order, ahead of Before=docker.service) so ExecStop runs before networking is torn down (T-041)"
+  }
+
   # --- Review round 2, finding 4: the local, never-proxied health path -----
   assert {
     condition = length(regexall("http://localhost \\{[^}]*__ci_proxy_health", templatefile("${path.module}/templates/jenkins-provision.sh", {

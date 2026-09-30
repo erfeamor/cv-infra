@@ -426,4 +426,29 @@ print("; ".join(problems) if problems else "OK")
   fi
 fi
 
+# --- 15. No LIVE reference to the released EIP survives anywhere -----------
+# T-034 phase 2, COMMIT 2 of 2, case 7: aws_eip.drone and
+# aws_eip_association.drone are gone from this config -- a stray reference
+# in actual CODE (a rename that missed a spot) would fail `terraform
+# validate` outright anyway, so this exists to catch it a layer earlier,
+# with a clearer message than validate's generic "reference to undeclared
+# resource". `#` comments are stripped before matching (same convention as
+# every other check in this file) -- prose that deliberately DISCUSSES the
+# removed resources for historical context (this file's own commits, ci.tf's
+# and dns.tf's headers) is expected and fine; only a reference outside a
+# comment is a real regression.
+eip_ref_violations=""
+for tf_file in *.tf; do
+  v=$(awk '
+    function strip(l,  h) { h = index(l, "#"); if (h > 0) l = substr(l, 1, h - 1); return l }
+    { line = strip($0); if (line ~ /aws_eip(_association)?\.drone\y/) print line }
+  ' "$tf_file")
+  [ -n "$v" ] && eip_ref_violations="$eip_ref_violations $tf_file"
+done
+if [ -n "$eip_ref_violations" ]; then
+  bad "a live (non-comment) reference to the released aws_eip.drone / aws_eip_association.drone survives in:$eip_ref_violations"
+else
+  ok "no reference to aws_eip.drone or aws_eip_association.drone survives anywhere"
+fi
+
 exit $fail

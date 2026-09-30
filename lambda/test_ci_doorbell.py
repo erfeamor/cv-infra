@@ -63,6 +63,24 @@ def push_event(repo, secret=WEBHOOK_SECRET, event_type="push"):
     }
 
 
+def event_with_body(repo, body_extra=None, secret=WEBHOOK_SECRET, event_type="push"):
+    """Like push_event, but lets a test add fields to the payload alongside
+    `repository` (T-042: `deleted`, `action`, ...)."""
+    body_dict = {"repository": {"full_name": repo}}
+    if body_extra:
+        body_dict.update(body_extra)
+    body = json.dumps(body_dict).encode("utf-8")
+    return {
+        "requestContext": {"http": {"method": "POST"}},
+        "headers": {
+            "x-hub-signature-256": sign(secret, body),
+            "x-github-event": event_type,
+        },
+        "body": body.decode("utf-8"),
+        "isBase64Encoded": False,
+    }
+
+
 class DoorbellTestCase(unittest.TestCase):
     # Review round 2, finding 2(b): _handle_async_task now waits for DNS to
     # converge before probing healthz. Every class EXCEPT
@@ -658,8 +676,11 @@ class TestRoute53RecordLookup(DoorbellTestCase):
 
 class TestOnlyPushSchedulesAsyncTask(DoorbellTestCase):
     def test_pull_request_event_does_not_self_invoke(self):
+        # T-042: action must be a build action, or this hits the new skip
+        # (TestSkipsDeletedRefsAndNonBuildPrActions) before ever reaching the
+        # self-invoke-vs-synchronous-start fork this test exercises.
         self.set_instance_state("stopped")
-        event = push_event("erfeamor/cv-admin-react", event_type="pull_request")
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"action": "synchronize"}, event_type="pull_request")
         response = self.module.handler(event, None)
         self.assertEqual(response["statusCode"], 200)
         self.module.lambda_client.invoke.assert_not_called()
@@ -670,6 +691,75 @@ class TestOnlyPushSchedulesAsyncTask(DoorbellTestCase):
         response = self.module.handler(event, None)
         self.assertEqual(response["statusCode"], 202)
         self.module.lambda_client.invoke.assert_called_once()
+
+
+# --- T-042 (RED): a deleted ref, or a pull_request action Drone/Jenkins ----
+# never build, is fully authenticated (valid HMAC, allowlisted repo) but has
+# nothing to build. Neither must reach a wake path -- no self-invoke for a
+# REDELIVER_REPOS repo, no EC2 call for a Jenkins repo.
+
+
+class TestSkipsDeletedRefsAndNonBuildPrActions(DoorbellTestCase):
+    def test_deleted_ref_push_for_redeliver_repo_is_ignored(self):
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"deleted": True})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.assertIn("ignored", response["body"])
+        self.module.lambda_client.invoke.assert_not_called()
+        self.module.ec2.describe_instances.assert_not_called()
+        self.module.ec2.start_instances.assert_not_called()
+
+    def test_deleted_ref_push_for_jenkins_repo_is_ignored(self):
+        event = event_with_body("erfeamor/cv-domain-service", body_extra={"deleted": True})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.assertIn("ignored", response["body"])
+        self.module.ec2.describe_instances.assert_not_called()
+        self.module.ec2.start_instances.assert_not_called()
+
+    def test_pull_request_closed_is_ignored(self):
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"action": "closed"}, event_type="pull_request")
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.assertIn("ignored", response["body"])
+        self.module.lambda_client.invoke.assert_not_called()
+        self.module.ec2.start_instances.assert_not_called()
+
+    def test_pull_request_labeled_is_ignored(self):
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"action": "labeled"}, event_type="pull_request")
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.assertIn("ignored", response["body"])
+        self.module.ec2.start_instances.assert_not_called()
+
+    # --- Controls: everything that must stay green -------------------------
+
+    def test_normal_push_control_still_self_invokes(self):
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"deleted": False})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.module.lambda_client.invoke.assert_called_once()
+
+    def test_pull_request_opened_control_still_starts(self):
+        self.set_instance_state("stopped")
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"action": "opened"}, event_type="pull_request")
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 200)
+        self.module.ec2.start_instances.assert_called_once_with(InstanceIds=[ENV["INSTANCE_ID"]])
+
+    def test_bad_signature_still_401_even_with_deleted_true(self):
+        # The skip must not come before auth: a forged/mis-signed payload
+        # claiming a deleted ref is still just a bad signature.
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"deleted": True}, secret="wrong-secret")
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 401)
+        self.module.ec2.describe_instances.assert_not_called()
+        self.module.lambda_client.invoke.assert_not_called()
+
+    def test_unlisted_repo_with_deleted_true_still_403(self):
+        event = event_with_body("erfeamor/some-other-repo", body_extra={"deleted": True})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 403)
 
 
 # --- Case 5: Drone hook discovered by config.url ending in /hook -----------

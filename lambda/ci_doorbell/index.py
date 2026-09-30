@@ -97,6 +97,19 @@ redelivery pass of its own), and its own Drone delivery, if it fails, is
 still swept up by a LATER push's redelivery window -- that window has no
 upper bound on how recent a failure must be, only a lower one
 (REDELIVERY_BACKWARD_SLACK_SECONDS before THAT push's own wake).
+
+--- T-042: not every allowlisted push/pull_request event means "build" ------
+
+A `push` with `"deleted": true` (a branch or tag deletion) and a
+`pull_request` whose `action` isn't in BUILD_PR_ACTIONS both pass HMAC
+verification and the repo allowlist -- fully authenticated -- but neither has
+anything to build: a deleted ref carries no commits, and Drone/Jenkins only
+build a pull_request on opened/synchronize/reopened/ready_for_review (a PR's
+merge-close is already covered by the merge commit's own push to master).
+`_handle_webhook` skips both right after the allowlist check and before
+either wake path (the REDELIVER_REPOS async schedule, and the synchronous
+start), answering 202 without ever calling `_self_invoke`, EC2, or the
+Jenkins-repo start path. Every other event type is unchanged.
 """
 
 import base64
@@ -134,6 +147,13 @@ ALLOWED_REPOS = {r.strip() for r in os.environ.get("ALLOWED_REPOS", "").split(",
 # thread past. Also the async task's re-validated allowlist (see module
 # docstring, review round 1 finding 1) -- not just the webhook entry point's.
 REDELIVER_REPOS = {r.strip() for r in os.environ.get("REDELIVER_REPOS", "").split(",") if r.strip()}
+
+# T-042: Drone and Jenkins only ever build a pull_request on these actions --
+# every other action (closed, labeled, edited, assigned, review_requested,
+# ...) is fully authenticated (valid HMAC, allowlisted repo) but has nothing
+# to build. A PR's merge-close is already covered by the merge commit's own
+# push to master, so it needs no special case here.
+BUILD_PR_ACTIONS = frozenset({"opened", "synchronize", "reopened", "ready_for_review"})
 
 GITHUB_HOOKS_TOKEN_PARAM = os.environ["GITHUB_HOOKS_TOKEN_PARAM"]
 DRONE_HEALTHZ_URL = os.environ["DRONE_HEALTHZ_URL"]
@@ -840,6 +860,24 @@ def _handle_webhook(event):
         # repo is one we run CI for. Both checks, not either.
         log.warning("rejected: repository %s not in allowlist", repo)
         return _response(403, "repository not allowed")
+
+    # T-042: neither of these has anything to build. A `push` with
+    # "deleted": true is a branch/tag deletion -- no commits to run CI
+    # against. A `pull_request` whose action isn't in BUILD_PR_ACTIONS is one
+    # Drone/Jenkins never build on anyway (a merge-close is covered by the
+    # merge's own push to master). Both are fully authenticated at this point
+    # (signature verified, repo allowlisted) but must never reach either wake
+    # path below -- the REDELIVER_REPOS async schedule or the synchronous
+    # start -- so this runs before both.
+    skip_reason = None
+    if event_type == "push" and payload.get("deleted") is True:
+        skip_reason = "deleted ref"
+    elif event_type == "pull_request" and payload.get("action") not in BUILD_PR_ACTIONS:
+        skip_reason = f"pull_request action {payload.get('action')!r}"
+
+    if skip_reason is not None:
+        log.info("ignored: repo=%s event=%s reason=%s", repo, event_type, skip_reason)
+        return _response(202, "ignored: " + skip_reason)
 
     if repo in REDELIVER_REPOS and event_type == "push":
         # T-034: answer at once (GitHub's 10s budget), do nothing else here.

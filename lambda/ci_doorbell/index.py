@@ -107,7 +107,6 @@ import http.client
 import json
 import logging
 import os
-import socket
 import time
 import urllib.error
 import urllib.parse
@@ -122,6 +121,7 @@ log.setLevel(logging.INFO)
 ec2 = boto3.client("ec2")
 ssm = boto3.client("ssm")
 lambda_client = boto3.client("lambda")
+route53 = boto3.client("route53")
 
 INSTANCE_ID = os.environ["INSTANCE_ID"]
 SECRET_PARAM = os.environ["WEBHOOK_SECRET_PARAM"]
@@ -143,10 +143,15 @@ SELF_FUNCTION_NAME = os.environ["SELF_FUNCTION_NAME"]
 
 # Review round 2, finding 2(b): the hostname alone (DRONE_HEALTHZ_URL already
 # carries it embedded in a URL, but the DNS-convergence wait below needs it
-# bare, to resolve directly).
+# bare, to read its record directly).
 CI_HOSTNAME = os.environ["CI_HOSTNAME"]
-DNS_WAIT_TIMEOUT_SECONDS = int(os.environ.get("DNS_WAIT_TIMEOUT_SECONDS", "60"))
+DNS_WAIT_TIMEOUT_SECONDS = int(os.environ.get("DNS_WAIT_TIMEOUT_SECONDS", "120"))
 DNS_WAIT_POLL_INTERVAL_SECONDS = int(os.environ.get("DNS_WAIT_POLL_INTERVAL_SECONDS", "5"))
+
+# Live failure, 2026-09-30: the zone the authoritative Route 53 read
+# (_route53_record_ip) queries -- see that function's docstring for why this
+# replaced the local-resolver check that used to live here.
+ROUTE53_ZONE_ID = os.environ["ROUTE53_ZONE_ID"]
 
 GITHUB_API = "https://api.github.com"
 HTTP_TIMEOUT_SECONDS = 5
@@ -289,6 +294,17 @@ def _drone_healthz_ok(url):
         # response from a half-started Drone. Both must read as "not ready
         # yet", exactly like every other failure mode here -- never as a
         # crash that aborts the whole wait.
+        #
+        # This also already covers the live-failure follow-on case (2026-09-30):
+        # wait_for_dns_to_match_instance now only proceeds to THIS function
+        # once the AUTHORITATIVE Route 53 value has matched, but any residual
+        # resolver cache elsewhere (this urlopen call still goes through the
+        # normal resolver, unlike the DNS-convergence wait) means a probe
+        # could still land on the sentinel briefly. A connection to
+        # 192.0.2.1 (TEST-NET-1, unroutable) fails fast as ConnectionError/
+        # OSError well within HTTP_TIMEOUT_SECONDS, is caught right here, and
+        # reads as "not ready yet" like every other case -- never fatal, and
+        # the next poll simply tries again.
         return False
 
 
@@ -544,30 +560,73 @@ def _current_public_ip():
         return None
 
 
-def _resolve_hostname(hostname):
+def _route53_record_ip(hostname):
+    """The AUTHORITATIVE current value of hostname's A record, read straight
+    from Route 53 (route53:ListResourceRecordSets) -- never through this
+    Lambda's own local resolver.
+
+    Live failure, 2026-09-30: this replaced a `socket.gethostbyname(hostname)`
+    check. On a cold Lambda execution environment, that resolver can hold an
+    answer (here, the DNS sentinel, ci-on-demand.tf's local.ci_dns_sentinel_ip)
+    cached for up to its TTL (60s) -- a cache that has nothing to do with
+    whether Route 53's record has since been updated. The boot-time updater
+    (scripts/ci-dns-updater.sh) UPSERTs the real address roughly 30-60s after
+    boot; that update landed on Route 53 fine, but the stale cached resolver
+    answer kept failing the match for the entire DNS_WAIT_TIMEOUT_SECONDS
+    window, and the task gave up with "did not resolve ... skipping
+    healthz/redelivery" despite the record being correct the whole time. A
+    direct API read is not subject to any resolver cache, local or upstream.
+
+    ListResourceRecordSets with StartRecordName/StartRecordType/MaxItems=1
+    does not fail on "no exact match" the way a GetHostedZone-style lookup
+    would -- it returns the record that sorts immediately AFTER the given
+    start point when there's no exact hit, so callers must confirm the
+    returned Name/Type actually match `hostname` before trusting its value.
+    """
     try:
-        return socket.gethostbyname(hostname)
-    except OSError:
+        response = route53.list_resource_record_sets(
+            HostedZoneId=ROUTE53_ZONE_ID,
+            StartRecordName=hostname,
+            StartRecordType="A",
+            MaxItems="1",
+        )
+    except ClientError:
+        log.exception("could not read %s's A record from Route 53", hostname)
         return None
+
+    record_sets = response.get("ResourceRecordSets") or []
+    if not record_sets:
+        return None
+    record = record_sets[0]
+    # Route 53 record names carry a trailing dot; hostname (CI_HOSTNAME) does
+    # not -- strip it before comparing, not before passing it to the API call
+    # above (which accepts either form).
+    if record.get("Name", "").rstrip(".") != hostname.rstrip(".") or record.get("Type") != "A":
+        return None
+    resource_records = record.get("ResourceRecords") or []
+    if not resource_records:
+        return None
+    return resource_records[0].get("Value")
 
 
 def wait_for_dns_to_match_instance(
     timeout_seconds, poll_interval_seconds, resolve_fn=None, public_ip_fn=None, sleep_fn=None, clock_fn=None
 ):
-    """Review round 2, finding 2(b): bounded wait until CI_HOSTNAME resolves
-    to the instance's OWN current public IP (from ec2:DescribeInstances, not
-    assumed), before this task ever probes healthz. Without this, a probe
-    right after a cold start could hit whatever CI_HOSTNAME still pointed at
-    -- a previous boot's address, or the reaper's own DNS sentinel (finding
-    2(a)) if this is a very fast restart after a stop -- neither of which is
-    THIS boot's Drone.
+    """Review round 2, finding 2(b): bounded wait until CI_HOSTNAME's
+    AUTHORITATIVE Route 53 record value (never a resolver's cached answer --
+    see _route53_record_ip) matches the instance's OWN current public IP
+    (from ec2:DescribeInstances, not assumed), before this task ever probes
+    healthz. Without this, a probe right after a cold start could hit
+    whatever CI_HOSTNAME still resolved to -- a previous boot's address, or
+    the reaper's own DNS sentinel (finding 2(a)) if this is a very fast
+    restart after a stop -- neither of which is THIS boot's Drone.
 
     resolve_fn/public_ip_fn/sleep_fn/clock_fn resolved as call-time defaults,
     not signature defaults -- see wait_for_drone_healthz's docstring for why
     that distinction matters (the real functions must never be captured at
     import time).
     """
-    resolve_fn = resolve_fn or _resolve_hostname
+    resolve_fn = resolve_fn or _route53_record_ip
     public_ip_fn = public_ip_fn or _current_public_ip
     sleep_fn = sleep_fn or time.sleep
     clock_fn = clock_fn or time.monotonic

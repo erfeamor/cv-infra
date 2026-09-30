@@ -149,9 +149,11 @@ locals {
   # comment and the env vars actually passed below):
   #   - stopping_wait  <-> INSTANCE_STOPPING_WAIT_TIMEOUT_SECONDS
   #   - dns_wait       <-> DNS_WAIT_TIMEOUT_SECONDS (review round 2, finding
-  #     2(b) -- waits for CI_HOSTNAME to resolve to the instance's OWN
-  #     current public IP before ever probing healthz, so a probe can never
-  #     hit a stale address or the reaper's own DNS sentinel, finding 2(a))
+  #     2(b) -- waits for the AUTHORITATIVE Route 53 record value (read via
+  #     route53:ListResourceRecordSets, lambda/ci_doorbell/index.py's
+  #     _route53_record_ip) to match the instance's OWN current public IP
+  #     before ever probing healthz, so a probe can never hit a stale
+  #     address or the reaper's own DNS sentinel, finding 2(a))
   #   - healthz        <-> HEALTHZ_TIMEOUT_SECONDS (PO-settled ceiling, t034p1-plan.md)
   #   - probe_timeout  <-> HTTP_TIMEOUT_SECONDS (the one extra overshoot noted above)
   #   - github_work    <-> the budget for bounded hooks/deliveries pagination
@@ -162,11 +164,24 @@ locals {
   # github_work_budget dropped from 290 to 230 to make room for dns_wait
   # (60s) at the same 895s total -- nothing about the GitHub work itself
   # changed, only how the same ceiling is divided.
+  #
+  # Live failure, 2026-09-30: dns_wait doubled from 60 to 120 because 60s was
+  # observed live to be too tight against a genuinely cold Lambda execution
+  # environment -- the boot-time updater's UPSERT converges the AUTHORITATIVE
+  # Route 53 value within its own run (about 30-60s after boot), but the
+  # OLD code compared against the Lambda's local resolver instead, which held
+  # the DNS sentinel (192.0.2.1, TTL 60) cached from before the record was
+  # updated. The fix (this commit) reads the Route 53 API directly, which is
+  # never subject to that cache, but 120s is kept as the wait's ceiling
+  # anyway to give the updater's own convergence window comfortable room
+  # without eating further into github_work_budget than necessary.
+  # github_work_budget dropped a further 60s (230 -> 170) to pay for it,
+  # keeping the total at the same 895s.
   ci_doorbell_stopping_wait_seconds         = 120
-  ci_doorbell_dns_wait_seconds              = 60
+  ci_doorbell_dns_wait_seconds              = 120
   ci_doorbell_healthz_timeout_seconds       = 480
   ci_doorbell_healthz_probe_timeout_seconds = 5
-  ci_doorbell_github_work_budget_seconds    = 230
+  ci_doorbell_github_work_budget_seconds    = 170
   ci_doorbell_timeout_seconds = (
     local.ci_doorbell_stopping_wait_seconds +
     local.ci_doorbell_dns_wait_seconds +
@@ -253,6 +268,22 @@ resource "aws_iam_role_policy" "ci_doorbell" {
         Resource = aws_lambda_function.ci_doorbell.arn
       },
       {
+        # Live failure, 2026-09-30: the DNS-convergence wait
+        # (wait_for_dns_to_match_instance, lambda/ci_doorbell/index.py) can no
+        # longer trust the Lambda's own local resolver -- a cold execution
+        # environment can hold the DNS sentinel cached past the point Route
+        # 53's record was actually updated. This grant lets it read the
+        # AUTHORITATIVE record value straight from the API instead, which is
+        # never subject to that cache. Read-only, reusing iam.tf's
+        # ci_dns_read_actions local (the same action already granted to the
+        # boot-time updater's own idempotency check), scoped to this zone's
+        # ARN only -- Route 53 has no record-level ARNs, so the zone is the
+        # narrowest Resource this action can ever take.
+        Effect   = "Allow"
+        Action   = local.ci_dns_read_actions
+        Resource = data.aws_route53_zone.ci.arn
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.ci_doorbell.arn}:*"
@@ -285,6 +316,7 @@ resource "aws_lambda_function" "ci_doorbell" {
       REDELIVER_REPOS               = join(",", local.ci_redeliver_repos)
       GITHUB_HOOKS_TOKEN_PARAM      = aws_ssm_parameter.github_hooks_token.name
       CI_HOSTNAME                   = local.ci_public_host
+      ROUTE53_ZONE_ID               = data.aws_route53_zone.ci.zone_id
       DRONE_HEALTHZ_URL             = "https://${local.ci_public_host}/healthz"
       DNS_WAIT_TIMEOUT_SECONDS      = tostring(local.ci_doorbell_dns_wait_seconds)
       HEALTHZ_TIMEOUT_SECONDS       = tostring(local.ci_doorbell_healthz_timeout_seconds)

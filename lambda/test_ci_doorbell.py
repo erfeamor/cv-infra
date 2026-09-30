@@ -36,10 +36,11 @@ ENV = {
     "REDELIVER_REPOS": "erfeamor/cv-admin-react",
     "GITHUB_HOOKS_TOKEN_PARAM": "/cv-project/dev/doorbell/github-hooks-token",
     "CI_HOSTNAME": "ci.erfeamor.com",
+    "ROUTE53_ZONE_ID": "Z0608270B7WND031GVOW",
     "DRONE_HEALTHZ_URL": "http://203.0.113.10/healthz",
     "HEALTHZ_TIMEOUT_SECONDS": "480",
     "HEALTHZ_POLL_INTERVAL_SECONDS": "15",
-    "DNS_WAIT_TIMEOUT_SECONDS": "60",
+    "DNS_WAIT_TIMEOUT_SECONDS": "120",
     "DNS_WAIT_POLL_INTERVAL_SECONDS": "5",
     "SELF_FUNCTION_NAME": "cv-project-ci-doorbell",
 }
@@ -538,6 +539,113 @@ class TestDnsConvergenceWait(DoorbellTestCase):
             result = self.module.handler(event, None)
         self.assertTrue(result["ok"])
         healthz_mock.assert_called_once()
+
+
+# --- Live failure, 2026-09-30 (RED before the fix, GREEN after): a cold ----
+# Lambda execution environment's own resolver held the DNS sentinel cached
+# (TTL 60) past the point Route 53's record was actually updated by the
+# boot-time updater, so the old socket.gethostbyname-based check never
+# converged and the 60s wait timed out -- "did not resolve ... within 60s;
+# skipping healthz/redelivery", and Drone's missed pushes were never
+# redelivered. The fix reads the record's AUTHORITATIVE value via
+# route53:ListResourceRecordSets (_route53_record_ip) instead of trusting any
+# resolver, local or otherwise.
+
+
+class TestAuthoritativeDnsWait(DoorbellTestCase):
+    AUTO_STUB_DNS_WAIT = False
+
+    def test_stale_local_resolver_does_not_block_convergence_via_route53_api(self):
+        real_ip = "203.0.113.77"
+        sentinel = "192.0.2.1"  # ci-on-demand.tf's local.ci_dns_sentinel_ip
+        # Patches the REAL socket module, not anything index.py owns --
+        # exercises the live scenario (the Lambda's own resolver stuck on the
+        # sentinel) regardless of whether the code under test still touches
+        # socket.gethostbyname at all after the fix. On bdfb176 (pre-fix),
+        # wait_for_dns_to_match_instance's default resolve_fn calls exactly
+        # this, and never converges.
+        with mock.patch("socket.gethostbyname", return_value=sentinel):
+            # Route 53 itself already has the real, current value -- this is
+            # the authoritative source the fix must consult instead.
+            self.module.route53.list_resource_record_sets.return_value = {
+                "ResourceRecordSets": [
+                    {
+                        "Name": "ci.erfeamor.com.",
+                        "Type": "A",
+                        "TTL": 60,
+                        "ResourceRecords": [{"Value": real_ip}],
+                    }
+                ]
+            }
+            clock = {"t": 0}
+            result = self.module.wait_for_dns_to_match_instance(
+                120,
+                5,
+                public_ip_fn=lambda: real_ip,
+                sleep_fn=lambda s: clock.update(t=clock["t"] + s),
+                clock_fn=lambda: clock["t"],
+            )
+        self.assertTrue(
+            result,
+            "must converge on Route 53's authoritative value, not a cached local-resolver answer stuck on the sentinel",
+        )
+        self.assertEqual(clock["t"], 0, "Route 53 already has the real value -- must match on the first poll, no wait needed")
+
+    def test_route53_api_stale_value_still_gives_up_at_timeout(self):
+        # The Route 53-side timeout case: even the authoritative source can
+        # legitimately still show a stale value (the updater hasn't run yet)
+        # -- the bounded wait must still give up, not hang.
+        clock = {"t": 0}
+        result = self.module.wait_for_dns_to_match_instance(
+            120,
+            5,
+            resolve_fn=lambda host: "198.51.100.1",  # always stale, even authoritatively
+            public_ip_fn=lambda: "203.0.113.50",
+            sleep_fn=lambda s: clock.update(t=clock["t"] + s),
+            clock_fn=lambda: clock["t"],
+        )
+        self.assertFalse(result)
+        self.assertGreaterEqual(clock["t"], 120)
+
+
+class TestRoute53RecordLookup(DoorbellTestCase):
+    AUTO_STUB_DNS_WAIT = False
+
+    def test_matching_record_returns_its_value(self):
+        self.module.route53.list_resource_record_sets.return_value = {
+            "ResourceRecordSets": [
+                {"Name": "ci.erfeamor.com.", "Type": "A", "ResourceRecords": [{"Value": "203.0.113.9"}]}
+            ]
+        }
+        self.assertEqual(self.module._route53_record_ip("ci.erfeamor.com"), "203.0.113.9")
+        self.module.route53.list_resource_record_sets.assert_called_once_with(
+            HostedZoneId=ENV["ROUTE53_ZONE_ID"],
+            StartRecordName="ci.erfeamor.com",
+            StartRecordType="A",
+            MaxItems="1",
+        )
+
+    def test_no_exact_match_returns_none(self):
+        # ListResourceRecordSets returns the NEXT record alphabetically when
+        # there is no exact match at StartRecordName/StartRecordType -- that
+        # must never be mistaken for this hostname's own value.
+        self.module.route53.list_resource_record_sets.return_value = {
+            "ResourceRecordSets": [
+                {"Name": "zzz.erfeamor.com.", "Type": "A", "ResourceRecords": [{"Value": "203.0.113.9"}]}
+            ]
+        }
+        self.assertIsNone(self.module._route53_record_ip("ci.erfeamor.com"))
+
+    def test_empty_result_returns_none(self):
+        self.module.route53.list_resource_record_sets.return_value = {"ResourceRecordSets": []}
+        self.assertIsNone(self.module._route53_record_ip("ci.erfeamor.com"))
+
+    def test_client_error_returns_none(self):
+        self.module.route53.list_resource_record_sets.side_effect = self.module.ClientError(
+            {"Error": {"Code": "Throttling"}}, "ListResourceRecordSets"
+        )
+        with self.assertLogs(self.module.log, level="ERROR"):
+            self.assertIsNone(self.module._route53_record_ip("ci.erfeamor.com"))
 
 
 # --- Review round 3, finding 5: concurrency -- only `push` schedules the ---

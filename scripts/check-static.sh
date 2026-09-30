@@ -451,4 +451,54 @@ else
   ok "no reference to aws_eip.drone or aws_eip_association.drone survives anywhere"
 fi
 
+# --- 16. The doorbell's Route 53 grant is read-only and this zone only -----
+# Live failure, 2026-09-30: wait_for_dns_to_match_instance now reads the
+# AUTHORITATIVE record value via route53:ListResourceRecordSets instead of
+# trusting the Lambda's own (cacheable) local resolver. That grant must never
+# widen into a write -- a compromised doorbell (module docstring:
+# lambda:InvokeFunction is unconditioned, Principal = "*") gaining
+# route53:ChangeResourceRecordSets would let it repoint ci.erfeamor.com
+# itself. Checked here, not tests/plan.tftest.hcl, for the same reason as
+# check #10/#14: the doorbell's policy body has several OTHER statements
+# (EC2 start, describe, ssm, self-invoke, logs), so this greps the WHOLE
+# aws_iam_role_policy.ci_doorbell block for any route53 action wider than
+# reads, and separately confirms the read grant itself is present and scoped
+# to the one zone ARN.
+doorbell_policy_block=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"ci_doorbell"[ \t]*{' <ci-on-demand.tf)
+if [ -z "$doorbell_policy_block" ]; then
+  bad 'resource "aws_iam_role_policy" "ci_doorbell" { ... } not found in ci-on-demand.tf'
+else
+  doorbell_dns_verdict=$(python3 -c '
+import re, sys
+b = sys.stdin.read()
+problems = []
+route53_actions = set()
+for v in re.findall(r"\bAction\s*=\s*(\[[^\]]*\]|local\.[A-Za-z0-9_]+|\"[^\"]*\")", b):
+    if v.startswith("["):
+        items = re.findall(r"\"[^\"]*\"", v)
+        route53_actions.update(i.strip("\"") for i in items if i.strip("\"").startswith("route53:"))
+    elif v.startswith("local."):
+        if v == "local.ci_dns_read_actions":
+            route53_actions.add("route53:ListResourceRecordSets")
+        elif "dns" in v or "route53" in v:
+            route53_actions.add(v)  # an unrecognized route53-shaped local -- flagged as unexpected below
+    elif v.strip("\"").startswith("route53:"):
+        route53_actions.add(v.strip("\""))
+if not route53_actions:
+    problems.append("no route53 action found (expected exactly route53:ListResourceRecordSets)")
+elif route53_actions != {"route53:ListResourceRecordSets"}:
+    problems.append("route53 actions [%s], expected exactly [route53:ListResourceRecordSets] -- read-only, nothing wider" % " ".join(sorted(route53_actions)))
+if not re.search(r"Action\s*=\s*local\.ci_dns_read_actions\b", b):
+    problems.append("no statement with Action = local.ci_dns_read_actions")
+if not re.search(r"Resource\s*=\s*data\.aws_route53_zone\.ci\.arn\b", b):
+    problems.append("no statement with Resource = data.aws_route53_zone.ci.arn")
+print("; ".join(problems) if problems else "OK")
+' <<<"$doorbell_policy_block" || echo "parse error")
+  if [ "$doorbell_dns_verdict" = "OK" ]; then
+    ok "aws_iam_role_policy.ci_doorbell's only route53 action is the read-only local.ci_dns_read_actions, scoped to data.aws_route53_zone.ci.arn"
+  else
+    bad "aws_iam_role_policy.ci_doorbell: $doorbell_dns_verdict"
+  fi
+fi
+
 exit $fail

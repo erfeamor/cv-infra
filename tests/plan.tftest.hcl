@@ -1203,8 +1203,8 @@ run "t034_review_round1" {
   }
 
   assert {
-    condition     = local.ci_doorbell_dns_wait_seconds == 60
-    error_message = "The DNS-convergence wait budget drifted from the documented 60s"
+    condition     = local.ci_doorbell_dns_wait_seconds == 120
+    error_message = "The DNS-convergence wait budget drifted from the documented 120s (doubled from 60s, live failure 2026-09-30: a cold Lambda's resolver cache outlasted the old 60s ceiling)"
   }
 
   assert {
@@ -1376,6 +1376,19 @@ run "t034_phase2_dns_sentinel" {
   # asserts exactly elsewhere in this file; what matters here is only that
   # ci_reaper's policy resource references them at all, which check-static
   # (check 15) verifies textually.
+
+  # --- Live failure, 2026-09-30: the doorbell's own authoritative-DNS read -
+  # (wait_for_dns_to_match_instance now reads Route 53 directly instead of
+  # trusting the Lambda's own, cacheable, local resolver). The grant's exact
+  # shape (one read-only action, the zone ARN only, no wildcard) is
+  # scripts/check-static.sh's job (same "unknown until apply" limitation the
+  # comment above already explains for the reaper's own grant) -- what's
+  # asserted here is only that the doorbell actually has ROUTE53_ZONE_ID
+  # wired from the zone data source, never a literal.
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["ROUTE53_ZONE_ID"] == data.aws_route53_zone.ci.zone_id
+    error_message = "The doorbell must read ROUTE53_ZONE_ID from the zone data source, never a literal -- it needs this for its own authoritative-DNS read (live failure, 2026-09-30)"
+  }
 }
 
 # ---------------------------------------------------------------------------

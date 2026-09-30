@@ -65,9 +65,9 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
   | Measured 2026-09-29 | |
   |---|---|
   | Plan | **PAID**, ACTIVE (upgraded 2026-09-29) |
-  | Credits remaining | **$102.13** (grant ~$180: signup plus four $20 activities; Bedrock's +$20 is still open) |
+  | Credits remaining | **$102.13** on 2026-09-29; **$120.75 on 2026-10-01**, after the last $20 activity (Bedrock) — the grant is now **$200** (signup plus all five $20 activities) |
   | Run rate | **~$0.69/day ≈ $21/month** (09-20 to 09-28: $0.67–0.80/day, the higher days being CI host sessions) |
-  | Binding constraint | **the credits**: about 4½ months at this rate, then the bill is real money. Check the Billing console's Credits page for any expiry date (the API doesn't expose one). |
+  | Binding constraint | **the credits**: about 5½ months from 2026-10-01 at this rate (longer since T-034 released the CI host's EIP), then the bill is real money. Check the Billing console's Credits page for any expiry date (the API doesn't expose one). |
 
   **The rate assumes a specific instance state, and that is the whole point of writing it down**: `cv-project-domain-service` (`t3.micro`) running 24/7, and the `cv-project-drone` CI host (`t3.small`) **stopped except during builds**, which the reaper enforces. Leave that CI host running continuously and the rate goes to **~$1.23/day ≈ $37/month**, burning the credits roughly twice as fast and then billing the card at that rate. So "is the CI host up?" is a money question, not a convenience one.
 
@@ -82,7 +82,7 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 
   That last filter is not optional: without it Cost Explorer nets credits out and reports ~$0, which is the same "reads green until it doesn't" trap `budgets.tf` exists to avoid.
 
-  One $20 credit-earning activity remains `NOT_STARTED` (**Bedrock playground**; Lambda, EC2, RDS and Budgets are done). It's worth doing: under Paid, every credit dollar is a card dollar saved. The endgame decision is T-012 (A, go Paid, trimmed), the model T-020. Keep resources modest because the money is real now, not because a class is "free".
+  **All five $20 credit-earning activities are `COMPLETED`** (Bedrock, the last, on 2026-10-01), so the grant is $200. The `credit-runway` budget stays at $160 on purpose: it alerts ~$40 early, the safe side (T-012's rule: never raise it past the real grant). The endgame decision is T-012 (A, go Paid, trimmed; closed 2026-10-01), the model T-020. Keep resources modest because the money is real now, not because a class is "free".
   - Still true regardless: **no NAT gateway** (~$32/mo — that single resource would cost more than the entire current bill), CloudFront default cert, and note that **every public IPv4 costs ~$3.60/mo**. **T-034 phase 2 released the CI host's EIP** (`aws_eip.drone`, `cv-infra/ci.tf`) — replaced by a DNS name the host keeps current on every boot (`scripts/ci-dns-updater.sh`) — so there is now **one** EIP left (`aws_eip.domain_service`), not two; re-read the actual bill rather than trusting the old "~34%, two EIPs" figure, which predates that change.
   - T-019 and T-009 added two Lambdas, an EventBridge schedule, a Function URL and a private S3 bucket. All are **effectively $0** at this volume — a few invocations a month and a 14 KB object — and none changes the table above.
   - `aws_instance.drone` is `t3.small` (T-002) for Maven headroom. `terraform test` asserts instance classes; those assertions now encode a cost-discipline convention rather than a Free Tier boundary.

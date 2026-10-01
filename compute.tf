@@ -71,6 +71,10 @@ resource "aws_instance" "domain_service" {
   depends_on = [
     aws_ssm_parameter.db_password,
     aws_ssm_parameter.cognito_issuer_uri,
+    aws_ssm_parameter.bff_service_client_id,
+    aws_ssm_parameter.bff_service_client_secret,
+    aws_ssm_parameter.bff_token_url,
+    aws_ssm_parameter.bff_token_scope,
   ]
 
   # Amazon publishes new AL2023 AMIs continually; without this every apply

@@ -2167,6 +2167,64 @@ run "app_host_user_data" {
     }))) == 1
     error_message = "The BFF image pull must retry until the image exists, same pattern as the domain service's own pull loop"
   }
+
+  # Review round 1 (T-014): the BFF block must run AFTER the MySQL backup
+  # service/timer are installed and enabled, not before -- otherwise an
+  # absent BFF image blocks forever in the `until docker pull` loop and the
+  # nightly backup (T-001) is silently never installed. Split the rendered
+  # script on the backup timer's `systemctl enable --now` line (present
+  # exactly once) and assert the BFF's `docker run` line exists only in the
+  # half AFTER that split, never in the half before it.
+  assert {
+    condition = length(split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 2
+    error_message = "systemctl enable --now mysql-backup.timer must appear exactly once in the rendered script"
+  }
+
+  assert {
+    condition = length(regexall("docker run -d --name bff-node", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))[0])) == 0
+    error_message = "The BFF's docker run must NOT appear before the MySQL backup timer is enabled -- a missing BFF image must never block the nightly backup from being installed (T-014 review round 1)"
+  }
+
+  assert {
+    condition = length(regexall("docker run -d --name bff-node", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))[1])) == 1
+    error_message = "The BFF's docker run must appear AFTER the MySQL backup timer is enabled (T-014 review round 1)"
+  }
 }
 
 # ---------------------------------------------------------------------------

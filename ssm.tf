@@ -183,3 +183,46 @@ resource "aws_ssm_parameter" "github_hooks_token" {
     Project = var.project_name
   }
 }
+
+# T-043: the BFF's client-credentials identity, read at boot by
+# templates/domain-service-user-data.sh. The secret is also in Terraform
+# state (like the other generated secrets here); it is never an output.
+resource "aws_ssm_parameter" "bff_service_client_id" {
+  name  = "/${var.project_name}/${var.environment}/bff/service-client-id"
+  type  = "String"
+  value = aws_cognito_user_pool_client.bff_service.id
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+resource "aws_ssm_parameter" "bff_service_client_secret" {
+  name  = "/${var.project_name}/${var.environment}/bff/service-client-secret"
+  type  = "SecureString"
+  value = aws_cognito_user_pool_client.bff_service.client_secret
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+resource "aws_ssm_parameter" "bff_token_url" {
+  name  = "/${var.project_name}/${var.environment}/bff/token-url"
+  type  = "String"
+  value = "https://${aws_cognito_user_pool_domain.cv.domain}.auth.${var.aws_region}.amazoncognito.com/oauth2/token"
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+resource "aws_ssm_parameter" "bff_token_scope" {
+  name  = "/${var.project_name}/${var.environment}/bff/token-scope"
+  type  = "String"
+  value = "${aws_cognito_resource_server.cv_domain.identifier}/${one(aws_cognito_resource_server.cv_domain.scope).scope_name}"
+
+  tags = {
+    Project = var.project_name
+  }
+}

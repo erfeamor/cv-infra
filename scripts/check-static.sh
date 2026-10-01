@@ -55,6 +55,13 @@ else
   ok "no output exposes aws_iam_access_key.drone_deploy (or every such output is sensitive = true)"
 fi
 
+# --- 1b. No output exposes the BFF service client's secret (T-043) ---------
+if grep -n 'client_secret' outputs.tf | grep -v '^[0-9]*:[ \t]*#' >/dev/null; then
+  bad "outputs.tf references a Cognito client_secret (the BFF service secret must only reach SSM)"
+else
+  ok "outputs.tf never references a Cognito client_secret"
+fi
+
 # --- 2. The drone-deploy user's policy stays least-privilege ---------------
 # The deploy key is a long-lived static credential stored in Drone, so its
 # policy must never widen silently. The whole resource block is parsed (not

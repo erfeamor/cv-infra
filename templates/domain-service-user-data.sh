@@ -293,6 +293,12 @@ systemctl enable --now mysql-backup.timer
 # installing the nightly mysqldump->S3 timer (T-001). A BFF outage must
 # never cost the database its backups, so every other boot step now
 # completes first regardless of whether the BFF image exists yet.
+# T-043: client-credentials identity for the domain service (Cognito).
+BFF_CLIENT_ID=$(param bff/service-client-id)
+BFF_CLIENT_SECRET=$(param bff/service-client-secret)
+BFF_TOKEN_URL=$(param bff/token-url)
+BFF_TOKEN_SCOPE=$(param bff/token-scope)
+
 until docker pull "${bff_image}"; do
   echo "bff image not available yet, retrying in 60s"
   sleep 60
@@ -304,4 +310,8 @@ docker run -d --name bff-node --restart unless-stopped --network cv \
   -e AUTH_ENABLED=true \
   -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
   -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
+  -e COGNITO_TOKEN_URL="$BFF_TOKEN_URL" \
+  -e SERVICE_CLIENT_ID="$BFF_CLIENT_ID" \
+  -e SERVICE_CLIENT_SECRET="$BFF_CLIENT_SECRET" \
+  -e SERVICE_TOKEN_SCOPE="$BFF_TOKEN_SCOPE" \
   "${bff_image}"

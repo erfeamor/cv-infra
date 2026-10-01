@@ -2250,3 +2250,119 @@ run "spa_router_excludes_metrics_and_health" {
     error_message = "The /metrics /health exclusion must return the request unrewritten, ahead of the SPA rewrite branches"
   }
 }
+
+# ---------------------------------------------------------------------------
+# T-043 -- the BFF's Cognito service token (client credentials): resource
+# server + read scope, a secret-bearing client with only that flow, the SSM
+# parameters, and the BFF container's env.
+# ---------------------------------------------------------------------------
+run "bff_service_token" {
+  command = plan
+
+  assert {
+    condition = (
+      aws_cognito_resource_server.cv_domain.identifier == "cv-domain" &&
+      length(aws_cognito_resource_server.cv_domain.scope) == 1 &&
+      one(aws_cognito_resource_server.cv_domain.scope).scope_name == "read"
+    )
+    error_message = "the cv-domain resource server must define exactly one scope, \"read\" (T-043)"
+  }
+
+  assert {
+    condition     = aws_cognito_user_pool_client.bff_service.generate_secret == true
+    error_message = "the BFF service client must have a secret (client credentials needs one)"
+  }
+
+  assert {
+    condition = (
+      aws_cognito_user_pool_client.bff_service.allowed_oauth_flows_user_pool_client == true &&
+      toset(aws_cognito_user_pool_client.bff_service.allowed_oauth_flows) == toset(["client_credentials"]) &&
+      length(aws_cognito_user_pool_client.bff_service.allowed_oauth_flows) == 1
+    )
+    error_message = "the BFF service client must allow ONLY the client_credentials flow"
+  }
+
+  assert {
+    condition = (
+      length(aws_cognito_user_pool_client.bff_service.allowed_oauth_scopes) == 1 &&
+      one(aws_cognito_user_pool_client.bff_service.allowed_oauth_scopes) == "cv-domain/read"
+    )
+    error_message = "the BFF service client must have exactly the one scope cv-domain/read"
+  }
+
+  assert {
+    condition = (
+      aws_cognito_user_pool_client.bff_service.access_token_validity == 24 &&
+      one(aws_cognito_user_pool_client.bff_service.token_validity_units).access_token == "hours"
+    )
+    error_message = "the BFF service client access token must be valid 24 hours (H1: ~$0.07/month)"
+  }
+
+  assert {
+    condition = (
+      aws_ssm_parameter.bff_service_client_secret.type == "SecureString" &&
+      aws_ssm_parameter.bff_service_client_id.type == "String" &&
+      aws_ssm_parameter.bff_token_url.type == "String" &&
+      aws_ssm_parameter.bff_token_scope.type == "String"
+    )
+    error_message = "the BFF client secret must be a SecureString; id, token URL and scope are plain Strings"
+  }
+
+  assert {
+    condition = (
+      aws_ssm_parameter.bff_service_client_id.name == "/${var.project_name}/${var.environment}/bff/service-client-id" &&
+      aws_ssm_parameter.bff_service_client_secret.name == "/${var.project_name}/${var.environment}/bff/service-client-secret" &&
+      aws_ssm_parameter.bff_token_url.name == "/${var.project_name}/${var.environment}/bff/token-url" &&
+      aws_ssm_parameter.bff_token_scope.name == "/${var.project_name}/${var.environment}/bff/token-scope" &&
+      aws_ssm_parameter.bff_token_scope.value == "cv-domain/read" &&
+      aws_ssm_parameter.bff_token_url.value == "https://${var.project_name}-${var.environment}.auth.${var.aws_region}.amazoncognito.com/oauth2/token"
+    )
+    error_message = "BFF SSM parameter names/values under /<project>/<env>/bff/ are wrong"
+  }
+
+  # The BFF docker run passes all four env vars, the secret from a shell
+  # variable (never inlined), and still comes after the backup timer.
+  assert {
+    condition = alltrue([
+      for pat in [
+        "-e COGNITO_TOKEN_URL=\"\\$BFF_TOKEN_URL\"",
+        "-e SERVICE_CLIENT_ID=\"\\$BFF_CLIENT_ID\"",
+        "-e SERVICE_CLIENT_SECRET=\"\\$BFF_CLIENT_SECRET\"",
+        "-e SERVICE_TOKEN_SCOPE=\"\\$BFF_TOKEN_SCOPE\"",
+        ] : length(regexall(pat, split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+          aws_region        = var.aws_region
+          project_name      = var.project_name
+          environment       = var.environment
+          image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+          bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+          db_name           = var.db_name
+          db_username       = var.db_username
+          cloudfront_domain = "d1234567890abc.cloudfront.net"
+          backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+          backup_prefix     = "mysql-dumps"
+          mysql_volume_id   = "vol-0123456789abcdef0"
+      }))[1])) == 1
+    ])
+    error_message = "the BFF docker run (after the backup timer) must pass COGNITO_TOKEN_URL, SERVICE_CLIENT_ID, SERVICE_CLIENT_SECRET, SERVICE_TOKEN_SCOPE from shell variables (T-043)"
+  }
+
+  assert {
+    condition = alltrue([
+      for p in ["bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope"] :
+      length(regexall("\\(param ${p}\\)", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1
+    ])
+    error_message = "user_data must read each of the four bff/* parameters once via param()"
+  }
+}

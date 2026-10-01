@@ -178,7 +178,7 @@ docker run --rm --network cv \
   -e FLYWAY_PASSWORD="$DB_PASSWORD" \
   -e FLYWAY_LOCATIONS="filesystem:/flyway/sql/migrations" \
   -e FLYWAY_CONNECT_RETRIES=60 \
-  flyway/flyway:10 migrate
+  flyway/flyway:13.7.0 migrate
 
 # --- Domain service (Hibernate ddl-auto=validate against the migrated schema) ---
 REGISTRY=$(echo "${image}" | cut -d/ -f1)
@@ -201,6 +201,25 @@ docker run -d --name domain-service --restart unless-stopped --network cv \
   -e AUTH_ENABLED=true \
   -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
   "${image}"
+
+# --- cv-bff-node (T-014): same box, same `cv` network ---
+# DOMAIN_SERVICE_URL is container-to-container, never the public EIP. Auth is
+# ON (meta CLAUDE.md defaults it off for local dev only; ruling 5): every
+# route under /bff/api/v1 is gated except the contract's own PUBLIC_ROUTES
+# allowlist. No second `docker login` -- both repos share one ECR
+# registry/account/region, already logged in above.
+until docker pull "${bff_image}"; do
+  echo "bff image not available yet, retrying in 60s"
+  sleep 60
+done
+
+docker run -d --name bff-node --restart unless-stopped --network cv \
+  -p 3000:3000 \
+  -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
+  -e AUTH_ENABLED=true \
+  -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+  -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
+  "${bff_image}"
 
 # --- Nightly MySQL backup: mysqldump -> S3 (T-001) ---
 # RDS's managed backups went away when MySQL moved onto this instance (see

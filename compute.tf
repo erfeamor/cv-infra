@@ -1,5 +1,6 @@
-# Runs cv-domain-service and cv-bff-node. Kept to a single Free Tier
-# t2/t3.micro instance for the demo rather than one EC2 per service.
+# Runs cv-domain-service and cv-bff-node (T-014) as containers on the same
+# box, plus a self-hosted MySQL 8.4 container -- one t2/t3.micro instance for
+# the demo rather than one EC2 per service.
 
 # The name pattern must pin the *standard* AL2023 image: a looser
 # "al2023-ami-*" also matches the ECS-optimized variant
@@ -35,8 +36,11 @@ resource "aws_instance" "domain_service" {
   # keeps the pick deterministic even if the default VPC ever has more than
   # one subnet in that AZ (list position off an unordered API result is
   # exactly what this ruling exists to avoid).
-  subnet_id              = sort(data.aws_subnets.domain_service.ids)[0]
-  vpc_security_group_ids = [aws_security_group.domain_service.id]
+  subnet_id = sort(data.aws_subnets.domain_service.ids)[0]
+  # T-014 ruling 1: the BFF's port 3000 needs its own security group (quota --
+  # see network.tf) rather than a second rule on the existing one, so both
+  # groups attach here.
+  vpc_security_group_ids = [aws_security_group.domain_service.id, aws_security_group.bff_node.id]
   iam_instance_profile   = aws_iam_instance_profile.domain_service.name
 
   user_data = templatefile("${path.module}/templates/domain-service-user-data.sh", {
@@ -44,6 +48,7 @@ resource "aws_instance" "domain_service" {
     project_name      = var.project_name
     environment       = var.environment
     image             = "${aws_ecr_repository.domain_service.repository_url}:latest"
+    bff_image         = "${aws_ecr_repository.bff_node.repository_url}:latest"
     db_name           = var.db_name
     db_username       = var.db_username
     cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name

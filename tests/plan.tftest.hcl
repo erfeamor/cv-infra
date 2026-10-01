@@ -1834,3 +1834,361 @@ run "domain_service_ingress_scoped_to_cloudfront" {
     error_message = "No port-22 ingress: shell access is SSM Session Manager"
   }
 }
+
+# ---------------------------------------------------------------------------
+# T-014 -- deploy cv-bff-node: registry, container, edge route. See the task
+# file's seven DoR rulings + the 2026-10-01 H1 refresh for the reasoning
+# behind each assertion below. No new mock_data needed: every data source
+# this task reads (aws_vpc, aws_ec2_managed_prefix_list) is already mocked
+# above, reused rather than duplicated.
+# ---------------------------------------------------------------------------
+run "bff_node_registry_and_edge" {
+  command = plan
+
+  # Scope 1: the registry mirrors domain_service.
+  assert {
+    condition     = aws_ecr_repository.bff_node.name == "${var.project_name}-bff-node"
+    error_message = "ECR repository name for the BFF must follow the project prefix convention"
+  }
+
+  assert {
+    condition     = aws_ecr_repository.bff_node.force_delete == true
+    error_message = "aws_ecr_repository.bff_node must keep force_delete = true, mirroring domain_service (demo project, parity)"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countType == "imageCountMoreThan" &&
+      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countNumber == 2 &&
+      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].action.type == "expire"
+    )
+    error_message = "aws_ecr_lifecycle_policy.bff_node must keep only the two most recent images, mirroring domain_service"
+  }
+
+  # Ruling 1, the crux: port 3000 gets its OWN security group -- never a
+  # second rule on aws_security_group.domain_service (prefix-list quota, see
+  # network.tf). Scoped to the CloudFront origin-facing prefix list, not a
+  # CIDR, and definitely not 0.0.0.0/0.
+  assert {
+    condition = alltrue([
+      for rule in aws_security_group.bff_node.ingress :
+      contains(coalesce(rule.prefix_list_ids, []), data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id)
+      if rule.from_port == 3000
+    ])
+    error_message = "The BFF's 3000 ingress must be scoped to the CloudFront origin-facing prefix list, not a CIDR"
+  }
+
+  assert {
+    condition = alltrue([
+      for rule in aws_security_group.bff_node.ingress :
+      !contains(coalesce(rule.cidr_blocks, []), "0.0.0.0/0")
+    ])
+    error_message = "No ingress rule on the BFF security group may be open to 0.0.0.0/0"
+  }
+
+  assert {
+    condition = alltrue([
+      for rule in aws_security_group.bff_node.ingress :
+      rule.from_port != 22 && rule.to_port != 22
+    ])
+    error_message = "No port-22 ingress on the BFF security group: shell access is SSM Session Manager"
+  }
+
+  assert {
+    condition     = length(aws_security_group.bff_node.ingress) == 1
+    error_message = "The BFF security group should expose exactly one ingress rule (port 3000) -- anything more is unreviewed scope creep"
+  }
+
+  # The quota reason ruling 1 exists for: the pre-existing group must NOT
+  # gain a second prefix-list rule (46 + 46 entries would exceed the
+  # 60-rule-per-SG quota and fail the apply).
+  assert {
+    condition     = length(aws_security_group.domain_service.ingress) == 1
+    error_message = "aws_security_group.domain_service must NOT gain a second ingress rule for port 3000 -- the BFF needs its own security group (prefix-list quota, T-014 ruling 1)"
+  }
+
+  # Not asserted here, deliberately: that aws_instance.domain_service's
+  # vpc_security_group_ids carries BOTH groups. Both referenced security
+  # groups are new resources in this plan, so their .id (and therefore the
+  # instance's set attribute built from them) is unknown-until-apply --
+  # same documented class of limitation as aws_eip.drone.public_ip and
+  # aws_s3_bucket.backup.arn elsewhere in this file (confirmed empirically:
+  # `terraform test` errors "Condition expression could not be evaluated").
+  # Covered by `terraform validate` + code review (compute.tf's
+  # vpc_security_group_ids literal) instead.
+
+  # Ruling 3: same EIP, new port, http-only -- no new EIP, no new instance.
+  # The `if` clause (not an && inside the expression body) is what keeps this
+  # safe to index: variables.tf's own review notes document that `&&` does
+  # NOT short-circuit in Terraform, so an && guard ahead of
+  # custom_origin_config[0] would still evaluate that index for the
+  # frontend-s3 origin (which has no custom_origin_config at all) and error.
+  # Filtering via `if` excludes that origin from the expression entirely.
+  assert {
+    condition = length([
+      for o in aws_cloudfront_distribution.frontend.origin : o
+      if o.origin_id == "bff-node"
+    ]) == 1
+    error_message = "Exactly one CloudFront origin with origin_id = \"bff-node\" is expected"
+  }
+
+  # domain_name is NOT compared to aws_eip.domain_service.public_dns here --
+  # that attribute is itself unknown-until-apply (same documented limitation
+  # as aws_eip.drone.public_ip elsewhere in this file), confirmed
+  # empirically. Code review covers that the origin block literally reuses
+  # aws_eip.domain_service.public_dns (frontend.tf), exactly like the
+  # pre-existing domain-service-api origin does -- no new EIP is created,
+  # which IS checkable (there is no second aws_eip resource anywhere in this
+  # module).
+  assert {
+    condition = alltrue([
+      for o in aws_cloudfront_distribution.frontend.origin :
+      o.custom_origin_config[0].http_port == 3000 &&
+      o.custom_origin_config[0].origin_protocol_policy == "http-only"
+      if o.origin_id == "bff-node"
+    ])
+    error_message = "The bff-node CloudFront origin must be port 3000, http-only"
+  }
+
+
+  # The /bff/* behavior: routes to the new origin, no-cache (mirrors /api/*'s
+  # TTLs-0 posture -- the aggregate is revalidated by ISR upstream), and
+  # forwards Authorization (the BFF's non-public routes need it, ruling 5/6).
+  assert {
+    condition = anytrue([
+      for b in aws_cloudfront_distribution.frontend.ordered_cache_behavior :
+      b.path_pattern == "/bff/*" &&
+      b.target_origin_id == "bff-node" &&
+      b.min_ttl == 0 && b.default_ttl == 0 && b.max_ttl == 0 &&
+      length(b.forwarded_values) > 0 &&
+      contains(b.forwarded_values[0].headers, "Authorization")
+    ])
+    error_message = "CloudFront must have a no-cache /bff/* behavior targeting bff-node, forwarding Authorization"
+  }
+
+  # Ruling 2: /bff/* and /api/* are disjoint path prefixes (no shadowing), so
+  # there's no ordering constraint between them -- just confirm exactly the
+  # two expected behaviors exist (both still precede the default behavior
+  # structurally).
+  assert {
+    condition     = length([for b in aws_cloudfront_distribution.frontend.ordered_cache_behavior : b.path_pattern]) == 2
+    error_message = "Exactly two ordered_cache_behavior blocks are expected: /api/* and /bff/*"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-014 -- the rendered app-host user_data: the BFF container block, the
+# Flyway pin, and the 16,384-byte EC2 limit. Rendered directly via
+# templatefile() with fixture values (same pattern the drone/jenkins size
+# checks above use) because aws_instance.domain_service's OWN user_data
+# embeds cloudfront_domain (aws_cloudfront_distribution.frontend.domain_name),
+# unknown-until-apply under `command = plan` -- same documented limitation as
+# aws_eip.drone.public_ip elsewhere in this file.
+# ---------------------------------------------------------------------------
+run "app_host_user_data" {
+  command = plan
+
+  # H1 refresh item 4 / N2, RED FIRST: EC2's hard user_data limit is 16,384
+  # bytes, with no prior size guard. Margin set at 15,500 (T-014 task spec).
+  assert {
+    condition = length(templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    })) <= 15500
+    error_message = "Rendered domain-service-user-data.sh exceeds the 16,384-byte EC2 user_data hard limit's safety margin (15,500) -- trim the BFF block or move something out of user_data (T-014 H1 refresh item 4, N2)"
+  }
+
+  # AC: production pins Flyway 13.7.0 (T-155/T-156), riding this apply's
+  # instance replacement -- was flyway/flyway:10.
+  assert {
+    condition = length(regexall("flyway/flyway:13\\.7\\.0 migrate", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 1
+    error_message = "templates/domain-service-user-data.sh must pin flyway/flyway:13.7.0 at the migrate step, not :10"
+  }
+
+  # Scope 2: the BFF container -- same cv network, --restart unless-stopped,
+  # --name bff-node.
+  assert {
+    condition = length(regexall("docker run -d --name bff-node --restart unless-stopped --network cv", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 1
+    error_message = "The BFF docker run must be --name bff-node --restart unless-stopped --network cv"
+  }
+
+  # Scope 2: the BFF publishes 3000 (unique to the BFF -- the domain service
+  # publishes 8080).
+  assert {
+    condition = length(regexall("-p 3000:3000", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 1
+    error_message = "The BFF container must publish port 3000"
+  }
+
+  # Ruling 5/scope 2: DOMAIN_SERVICE_URL is container-to-container, NEVER the
+  # public EIP -- BFF->domain traffic must not round-trip the internet.
+  assert {
+    condition = length(regexall("-e DOMAIN_SERVICE_URL=http://domain-service:8080", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 1
+    error_message = "The BFF must reach the domain service via http://domain-service:8080 on the cv network, never the public EIP"
+  }
+
+  # Ruling 5: AUTH_ENABLED=true on BOTH containers -- the BFF defaults it off
+  # (meta CLAUDE.md, local dev only), which would be wrong deployed (every
+  # /bff/api/v1 route would be anonymous, not just the contract's allowlist).
+  assert {
+    condition = length(regexall("-e AUTH_ENABLED=true", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 2
+    error_message = "AUTH_ENABLED=true must be set on both the domain service and the BFF containers"
+  }
+
+  # Ruling 5: the BFF reads its issuer from SSM exactly as the domain service
+  # does (COGNITO_ISSUER_URI is read once at boot into $COGNITO_ISSUER_URI,
+  # then passed to both containers -- never a literal baked into either).
+  assert {
+    condition = length(regexall("-e COGNITO_ISSUER_URI=\"\\$COGNITO_ISSUER_URI\"", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 2
+    error_message = "Both the domain service and the BFF must read COGNITO_ISSUER_URI from the same SSM-sourced shell variable, never a literal"
+  }
+
+  # Ruling 6: CORS_ALLOWED_ORIGINS on the BFF is EXACTLY https://<cloudfront
+  # domain> -- closing quote right after the domain discriminates this from
+  # the domain service's own (longer, comma-separated) CORS value, so this
+  # also proves the BFF does NOT inherit the localhost dev origins.
+  # cv-public-react needs no entry -- it fetches server-side under ISR, so
+  # CORS never applies to it; not asserted here since there's nothing to
+  # assert an absence of.
+  assert {
+    condition = length(regexall("-e CORS_ALLOWED_ORIGINS=\"https://d1234567890abc\\.cloudfront\\.net\"", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 1
+    error_message = "The BFF's CORS_ALLOWED_ORIGINS must include https://<cloudfront_domain>"
+  }
+
+  # Scope 2: the same retry-until-the-image-exists pattern as the domain
+  # service -- the BFF image won't exist on first boot either. Matched
+  # against the rendered fixture value (bff_image is already substituted by
+  # templatefile by this point, not the literal "$${bff_image}" placeholder).
+  assert {
+    condition = length(regexall("until docker pull \"123456789012\\.dkr\\.ecr\\.eu-west-3\\.amazonaws\\.com/cv-project-bff-node:latest\"; do", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      aws_region        = var.aws_region
+      project_name      = var.project_name
+      environment       = var.environment
+      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name           = var.db_name
+      db_username       = var.db_username
+      cloudfront_domain = "d1234567890abc.cloudfront.net"
+      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix     = "mysql-dumps"
+      mysql_volume_id   = "vol-0123456789abcdef0"
+    }))) == 1
+    error_message = "The BFF image pull must retry until the image exists, same pattern as the domain service's own pull loop"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-014 ruling 4 -- /metrics and /health must never rewrite to the SPA shell.
+# functions/spa-router.js is plain JS read via file(), not a resource
+# attribute, so this is a text assertion (same class as the CI Caddyfile
+# regex checks above), not a CloudFront-function-execution test (CloudFront
+# Functions don't run under mock_provider).
+# ---------------------------------------------------------------------------
+run "spa_router_excludes_metrics_and_health" {
+  command = plan
+
+  assert {
+    condition     = length(regexall("uri === '/metrics' \\|\\| uri === '/health'", file("${path.module}/functions/spa-router.js"))) == 1
+    error_message = "functions/spa-router.js must exclude /metrics and /health from the SPA rewrite so they never return the public shell (T-014 ruling 4)"
+  }
+
+  # The exclusion must return the request as-is, ahead of both the /admin/
+  # and default rewrite branches -- not merely be present anywhere in the
+  # file (e.g. in a comment).
+  assert {
+    condition     = length(regexall("uri === '/metrics' \\|\\| uri === '/health'\\) \\{\n    return request;\n  \\}", file("${path.module}/functions/spa-router.js"))) == 1
+    error_message = "The /metrics /health exclusion must return the request unrewritten, ahead of the SPA rewrite branches"
+  }
+}

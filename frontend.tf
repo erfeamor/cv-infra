@@ -91,11 +91,55 @@ resource "aws_cloudfront_distribution" "frontend" {
     }
   }
 
+  # The BFF (T-014): same instance, different port -- see compute.tf's new
+  # bff-node container and network.tf's dedicated security group (its own
+  # ingress rule, kept off aws_security_group.domain_service by the
+  # prefix-list quota). Same EIP, no new EIP/NAT (watch-outs).
+  origin {
+    domain_name = aws_eip.domain_service.public_dns
+    origin_id   = "bff-node"
+
+    custom_origin_config {
+      http_port              = 3000
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
   # API passthrough: no caching (TTLs 0), Authorization forwarded for the
   # Cognito JWTs. Must be declared before the default behavior catches /.
   ordered_cache_behavior {
     path_pattern           = "/api/*"
     target_origin_id       = "domain-service-api"
+    viewer_protocol_policy = "https-only"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+
+    forwarded_values {
+      query_string = true
+      headers      = ["Authorization", "Content-Type", "Accept"]
+      cookies {
+        forward = "none"
+      }
+    }
+  }
+
+  # BFF passthrough (T-014): /bff/* and /api/* are disjoint path prefixes, so
+  # ordering relative to /api/* doesn't matter (ruling 2) -- both still
+  # precede the default behavior. The path is forwarded UNSTRIPPED (no
+  # origin_path, no rewrite function here) so /bff/api/v1/... reaches the BFF
+  # unchanged. Same no-cache posture and forwarded headers/query-string as
+  # /api/* -- Authorization must reach the BFF for its non-public routes, and
+  # the aggregate is per-person/revalidated by ISR upstream, so edge caching
+  # here would fight cv-public-react's own caching story.
+  ordered_cache_behavior {
+    path_pattern           = "/bff/*"
+    target_origin_id       = "bff-node"
     viewer_protocol_policy = "https-only"
     allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
     cached_methods         = ["GET", "HEAD"]

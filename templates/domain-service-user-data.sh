@@ -178,7 +178,7 @@ docker run --rm --network cv \
   -e FLYWAY_PASSWORD="$DB_PASSWORD" \
   -e FLYWAY_LOCATIONS="filesystem:/flyway/sql/migrations" \
   -e FLYWAY_CONNECT_RETRIES=60 \
-  flyway/flyway:10 migrate
+  flyway/flyway:13.7.0 migrate
 
 # --- Domain service (Hibernate ddl-auto=validate against the migrated schema) ---
 REGISTRY=$(echo "${image}" | cut -d/ -f1)
@@ -277,3 +277,31 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now mysql-backup.timer
+
+# --- cv-bff-node (T-014): same box, same `cv` network ---
+# DOMAIN_SERVICE_URL is container-to-container, never the public EIP. Auth is
+# ON (meta CLAUDE.md defaults it off for local dev only; ruling 5): every
+# route under /bff/api/v1 is gated except the contract's own PUBLIC_ROUTES
+# allowlist. No second `docker login` -- both repos share one ECR
+# registry/account/region, already logged in above.
+#
+# Review round 1: this block runs LAST, after the backup service/timer are
+# installed and enabled above, not right after the domain-service container
+# as it did originally. The `until docker pull` loop below blocks forever if
+# the BFF image is ever absent at boot -- everything from here down used to
+# sit behind that loop, which meant a missing BFF image silently skipped
+# installing the nightly mysqldump->S3 timer (T-001). A BFF outage must
+# never cost the database its backups, so every other boot step now
+# completes first regardless of whether the BFF image exists yet.
+until docker pull "${bff_image}"; do
+  echo "bff image not available yet, retrying in 60s"
+  sleep 60
+done
+
+docker run -d --name bff-node --restart unless-stopped --network cv \
+  -p 3000:3000 \
+  -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
+  -e AUTH_ENABLED=true \
+  -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+  -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
+  "${bff_image}"

@@ -91,7 +91,7 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 - Secrets flow: values land in SSM Parameter Store (`/cv-project/<env>/…`); services read them at runtime via the instance role. Never put secrets in tfvars committed files — `terraform.tfvars` is gitignored, `.example` carries placeholders.
 - **Exception: `.../deploy/drone-deploy/*` (T-008).** The drone-deploy IAM user's access key (`aws_iam_access_key.drone_deploy`, `iam.tf`) lives in SSM at `.../deploy/drone-deploy/{access-key-id,secret-access-key}`, deliberately **outside** `ci/*` and readable by **no instance role**. The CI host's role only reads `ci/*`, and the app host's role has an explicit Deny on `deploy/*`. Only an operator's own credentials read it, off-host, via `scripts/drone-reseed-secrets.sh` over an SSM port-forwarding tunnel to Drone (see `docs/runbooks/drone.md`).
 - `.terraform.lock.hcl` **is committed** (HashiCorp guidance). Provider/version bumps are their own PR.
-- CloudFront serves the SPA fallback (403/404 → `/index.html`) and reaches S3 only through OAC + bucket policy — if you touch `frontend.tf`, keep both, they're what make the distribution work at all.
+- CloudFront reaches S3 only through OAC + bucket policy — if you touch `frontend.tf`, keep both, that's what makes the distribution work at all. SPA routing (extension-less URIs → the owning app's `index.html`) is done by `functions/spa-router.js` (a viewer-request CloudFront Function), **not** a `custom_error_response` fallback — `frontend.tf` has no `custom_error_response` block. (Corrected 2026-10-01, T-014: this sentence previously claimed a 403/404 → `/index.html` `custom_error_response`, which doesn't exist here.)
 
 ## Testing convention
 

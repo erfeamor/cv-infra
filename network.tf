@@ -147,3 +147,41 @@ resource "aws_security_group" "drone" {
 # MySQL is now self-hosted in a container on the domain-service instance
 # (localhost, docker `cv` network) rather than RDS, so no dedicated database
 # security group is needed — nothing outside the box reaches port 3306.
+
+# T-014 ruling 1: the BFF's port 3000 needs its OWN security group rather than
+# a second rule on aws_security_group.domain_service above -- that group
+# already carries one reference to the CloudFront origin-facing prefix list,
+# and a managed prefix list counts against the 60-rule-per-SG quota as its
+# ENTRY COUNT (46 on 2026-08-20), not as one rule. Two references (46 + 46)
+# would exceed the quota and fail the apply. Attached to the same instance
+# (compute.tf) alongside the existing group.
+resource "aws_security_group" "bff_node" {
+  name        = "${var.project_name}-bff-node"
+  description = "Allows inbound to the BFF (cv-bff-node) only from the CloudFront origin-facing ranges"
+  vpc_id      = data.aws_vpc.default.id
+
+  # Scoped to CloudFront's origin-facing ranges, same mechanism and same data
+  # source as the 8080 rule above -- CloudFront reaches this instance on 3000
+  # over http-only (frontend.tf's bff-node origin), so this is the exact set
+  # of sources that legitimately arrive here. Not 0.0.0.0/0.
+  ingress {
+    description     = "BFF Node app, reachable only from the CloudFront origin-facing ranges (T-014 ruling 1)"
+    from_port       = 3000
+    to_port         = 3000
+    protocol        = "tcp"
+    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id]
+  }
+
+  # No SSH ingress: shell access goes through SSM Session Manager.
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Project = var.project_name
+  }
+}

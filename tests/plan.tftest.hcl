@@ -2366,3 +2366,133 @@ run "bff_service_token" {
     error_message = "user_data must read each of the four bff/* parameters once via param()"
   }
 }
+
+# T-045 -- GitHub Actions OIDC provider + the cv-public-vanilla deploy role.
+# ---------------------------------------------------------------------------
+# Applied under mock_provider, scoped with plan_options.target to the
+# role/policy/provider so null_resource.jenkins_provision (real `aws ssm`
+# local-exec) is never reached -- same rationale as "backup_iam_scoping". The
+# bucket, distribution and provider ARNs are unknown at plan, which would make
+# both policy documents unknown strings; under apply the mock fills them in,
+# so the decoded policy JSON is compared against the resource ARNs by
+# reference. The SPA-router function is overridden because the mock's random
+# ARN fails provider validation. What stays unassertable
+# offline: that the real ARNs have the right format and that AWS accepts the
+# provider/trust (T-045's live simulate-principal-policy criterion covers it).
+# ---------------------------------------------------------------------------
+run "github_oidc_public_vanilla_deploy" {
+  command = apply
+
+  plan_options {
+    target = [
+      aws_iam_role_policy.public_vanilla_deploy,
+      aws_iam_role.public_vanilla_deploy,
+      output.public_vanilla_deploy_role_arn,
+    ]
+  }
+
+  override_resource {
+    target = aws_cloudfront_function.spa_router
+    values = {
+      arn = "arn:aws:cloudfront::123456789012:function/spa-router"
+    }
+  }
+
+  assert {
+    condition = (
+      aws_iam_openid_connect_provider.github_actions.url == "https://token.actions.githubusercontent.com" &&
+      toset(aws_iam_openid_connect_provider.github_actions.client_id_list) == toset(["sts.amazonaws.com"]) &&
+      length(aws_iam_openid_connect_provider.github_actions.client_id_list) == 1
+    )
+    error_message = "the GitHub OIDC provider must be token.actions.githubusercontent.com with the single client id sts.amazonaws.com (T-045)"
+  }
+
+  # Trust: one statement, federated principal = our provider, web-identity
+  # only, exact aud and exact master-only sub (StringEquals, no wildcard).
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement) == 1 &&
+      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Effect == "Allow" &&
+      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" &&
+      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Principal == {
+        Federated = aws_iam_openid_connect_provider.github_actions.arn
+      }
+    )
+    error_message = "the deploy role must trust only sts:AssumeRoleWithWebIdentity from the GitHub OIDC provider (T-045)"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Condition == {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:erfeamor/cv-public-vanilla:ref:refs/heads/master"
+        }
+      }
+    )
+    error_message = "the trust condition must be exactly StringEquals aud=sts.amazonaws.com and sub=repo:erfeamor/cv-public-vanilla:ref:refs/heads/master, nothing else (T-045)"
+  }
+
+  assert {
+    condition     = aws_iam_role.public_vanilla_deploy.max_session_duration == 3600
+    error_message = "the deploy role keeps the default 1 h session (T-045)"
+  }
+
+  # Permissions.
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement) == 4 &&
+      length([for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement : s if s.Effect == "Allow"]) == 3 &&
+      length([for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement : s if s.Effect == "Deny"]) == 1
+    )
+    error_message = "the deploy policy must be exactly three Allow statements and one Deny (T-045)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
+      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Effect = "Allow", Action = ["s3:ListBucket"], Resource = [aws_s3_bucket.frontend.arn] }))
+    error_message = "must Allow s3:ListBucket on the frontend bucket ARN only (T-045)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
+      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Effect = "Allow", Action = ["s3:DeleteObject", "s3:PutObject"], Resource = ["${aws_s3_bucket.frontend.arn}/*"] }))
+    error_message = "must Allow s3:PutObject and s3:DeleteObject on <frontend bucket>/* only (T-045)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
+      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Effect = "Allow", Action = ["cloudfront:CreateInvalidation"], Resource = [aws_cloudfront_distribution.frontend.arn] }))
+    error_message = "must Allow cloudfront:CreateInvalidation on the frontend distribution ARN only (T-045)"
+  }
+
+  # The live admin shares the bucket; the site deploys to the root.
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
+      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Effect = "Deny", Action = ["s3:DeleteObject", "s3:PutObject"], Resource = ["${aws_s3_bucket.frontend.arn}/admin/*"] }))
+    error_message = "must explicitly Deny s3:PutObject and s3:DeleteObject on <frontend bucket>/admin/* (T-045)"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
+      alltrue([for a in flatten([s.Action]) : a != "*" && !endswith(a, ":*")]) &&
+      alltrue([for r in flatten([s.Resource]) : r != "*"]) &&
+      !contains(keys(s), "NotAction") && !contains(keys(s), "NotResource")
+    ])
+    error_message = "the deploy policy must have no wildcard action, no bare \"*\" resource, and no NotAction/NotResource (T-045)"
+  }
+
+  assert {
+    condition     = output.public_vanilla_deploy_role_arn == aws_iam_role.public_vanilla_deploy.arn
+    error_message = "output public_vanilla_deploy_role_arn must expose the deploy role ARN (T-045)"
+  }
+}

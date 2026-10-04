@@ -115,6 +115,29 @@ print("; ".join(problems) if problems else "OK")
   fi
 fi
 
+# --- 2b. The public-vanilla OIDC deploy role stays master-only and admin-safe (T-045)
+# The role shares the frontend bucket with the live admin (admin/), so its
+# policy must keep the explicit Deny on admin/*, never use a literal or "*"
+# Resource, and its trust must stay a StringEquals on the exact master `sub`.
+oidc_policy=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"public_vanilla_deploy"[ \t]*{' <github-oidc.tf)
+oidc_role=$(extract_block '^resource[ \t]+"aws_iam_role"[ \t]+"public_vanilla_deploy"[ \t]*{' <github-oidc.tf)
+if [ -z "$oidc_policy" ] || [ -z "$oidc_role" ]; then
+  bad 'aws_iam_role/aws_iam_role_policy "public_vanilla_deploy" not found in github-oidc.tf'
+else
+  problems=""
+  grep -qE 'Effect[ \t]*=[ \t]*"Deny"' <<<"$oidc_policy" || problems="$problems no-Deny"
+  grep -qF '"${aws_s3_bucket.frontend.arn}/admin/*"' <<<"$oidc_policy" || problems="$problems no-admin-Deny-resource"
+  grep -qE 'Resource[ \t]*=[ \t]*"\*"|NotAction|NotResource|:\*"' <<<"$oidc_policy" && problems="$problems wildcard-or-Not*"
+  grep -qE 'StringEquals' <<<"$oidc_role" || problems="$problems trust-not-StringEquals"
+  grep -qE 'StringLike|ForAnyValue' <<<"$oidc_role" && problems="$problems trust-uses-pattern-match"
+  grep -qF 'ref:refs/heads/master' github-oidc.tf || problems="$problems sub-not-master"
+  if [ -z "$problems" ]; then
+    ok "the public-vanilla deploy role keeps its admin/* Deny, no wildcard Resource/Action, and an exact master-only StringEquals trust"
+  else
+    bad "github-oidc.tf public_vanilla_deploy:$problems"
+  fi
+fi
+
 # --- 3. Single-parameter ssm:GetParameter grants name one parameter --------
 # The on-demand-CI Lambdas each read exactly one parameter. Their grants must
 # reference a specific aws_ssm_parameter.<name>.arn, never a literal ARN that

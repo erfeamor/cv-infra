@@ -46,3 +46,8 @@ output "ci_doorbell_url" {
 # ssm.tf; `terraform output` / `terraform show` must never be the thing
 # that prints it. scripts/check-static.sh enforces that any future
 # output referencing that resource is marked sensitive = true.
+
+output "public_vanilla_deploy_role_arn" {
+  description = "T-045: role the cv-public-vanilla GitHub workflow assumes via OIDC (master only). Not a secret; set it as a GitHub repo variable for T-403."
+  value       = aws_iam_role.public_vanilla_deploy.arn
+}

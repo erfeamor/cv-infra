@@ -32,12 +32,12 @@ Poll `get-command-invocation` until `Status` is `Success` (or `Failed`). The out
 
 ## Deploying a new image
 
-1. **Save the current digests first.** ECR keeps only the 2 most recent images per repo (`registry.tf` lifecycle, `countNumber = 2`), so the one you are replacing is gone after the next push:
+1. **Save the current digests first.** ECR expires only **untagged** images beyond the 20 newest (`registry.tf` lifecycle; tagged images are never expired), so a digest you replaced by re-pushing `:latest` becomes untagged and is eventually gone:
    ```bash
    aws ecr describe-images --region eu-west-3 --repository-name cv-project-domain-service \
      --query 'sort_by(imageDetails,&imagePushedAt)[].[imageDigest,imageTags]' --output text
    ```
-2. Build and push to `:latest` from the service repo (`<acct>.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service` or `cv-project-bff-node`; log in with `aws ecr get-login-password | docker login --username AWS --password-stdin <registry>`).
+2. Build and push to `:latest` from the service repo, **multi-arch** because the app host is arm64 (t4g.micro, T-035) while the CI host is x86: `docker buildx build --platform linux/amd64,linux/arm64 --push -t <repo>:latest .` (needs QEMU once per boot: `docker run --privileged --rm tonistiigi/binfmt --install arm64`). An amd64-only push breaks the host at the next pull. (`<acct>.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service` or `cv-project-bff-node`; log in with `aws ecr get-login-password | docker login --username AWS --password-stdin <registry>`).
 3. `cv-redeploy domain-service` or `cv-redeploy bff-node` via SSM as above.
 4. **Verify**: the digest printed as `new=` differs from `old=`; `docker ps` shows the container up (via a second send-command, or Session Manager); then hit it: `curl -s localhost:3000/health` on the host, and `https://<cloudfront domain>/bff/api/v1/people/1` returns 200 from outside.
 
@@ -66,7 +66,7 @@ Migrations are forward-only; there is no `migrate` rollback. A failed Flyway run
    (or `docker pull` it by digest, `docker tag`, `docker push`).
 3. `cv-redeploy <service>` again and verify.
 
-**Lifecycle caveat:** only 2 images are kept. After two further pushes the previous digest is expired and unrecoverable; if you may need to roll back, do it before pushing again, or keep your own copy of the image. A schema migration is not rolled back by any of this.
+**Lifecycle caveat:** only the 20 newest untagged images are kept, so an old digest survives roughly four further multi-arch pushes, then is expired and unrecoverable; roll back soon or keep your own copy of the image. A schema migration is not rolled back by any of this.
 
 ## What still needs a host replacement
 

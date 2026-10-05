@@ -6,7 +6,7 @@ db_name     = "cv"
 db_username = "cv"
 db_password = "REPLACE_ME"
 
-domain_service_instance_type = "t3.micro"
+domain_service_instance_type = "t4g.micro" # Graviton/arm64 AMI (T-035); must be a *g family
 
 # t3.small (T-002, H1 decision 2): a Free Tier exception, net ~+$8/mo
 # (~$16.60 vs ~$8.30) -- see variables.tf for the full accounting. Needed

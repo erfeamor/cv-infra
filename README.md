@@ -11,7 +11,7 @@ Part of the [cv-project](../README.md) multi-repo. No dedicated pipeline yet (Te
 
 ## Resources
 
-- **EC2 t3.micro** — runs `cv-domain-service`, `cv-bff-node` (T-014) and a self-hosted MySQL 8.4 container (Flyway-migrated at boot), all as containers on the same box for the demo
+- **EC2 t4g.micro** (Graviton, arm64; T-035) — runs `cv-domain-service`, `cv-bff-node` (T-014) and a self-hosted MySQL 8.4 container (Flyway-migrated at boot), all as containers on the same box for the demo. Images on ECR must be multi-arch (`linux/amd64` + `linux/arm64`); the host requires IMDSv2 (hop limit 1). ~$6.86/month, -$1.75 vs t3.micro
 - **S3 + CloudFront** — hosts the built `cv-admin-react` / `cv-public-vanilla` static assets
 - **Cognito user pool + Hosted UI domain** — auth for `cv-admin-react`
 - **CloudWatch log groups** — one per backend service

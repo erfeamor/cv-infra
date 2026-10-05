@@ -35,9 +35,9 @@ variable "db_password" {
 }
 
 variable "domain_service_instance_type" {
-  description = "EC2 instance type for cv-domain-service (Free Tier: t2.micro/t3.micro)"
+  description = "EC2 instance type for the app host. Must be a Graviton (arm64) family: it runs the arm64 AMI (T-035). t4g.micro = 1 GiB, ~$6.86/month in eu-west-3."
   type        = string
-  default     = "t3.micro"
+  default     = "t4g.micro"
 }
 
 # T-018, ruling 1: data.aws_subnets.default.ids[0] has no ordering guarantee,

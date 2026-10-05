@@ -1,6 +1,13 @@
-# ECR repository for cv-domain-service images. Free Tier private storage is
-# 500 MB, so the lifecycle policy keeps only the two most recent images
-# (a Temurin JRE image runs ~200 MB compressed).
+# ECR repositories for cv-domain-service and cv-bff-node images.
+#
+# T-035: images are multi-arch (linux/amd64 + linux/arm64). A multi-arch tag is
+# an image INDEX plus one manifest per architecture (plus buildx attestation
+# manifests); ECR counts each as an image, and the children are untagged. The
+# old "keep the 2 most recent of any tag status" rule could therefore expire
+# :latest's arm64 child while :latest itself stayed. The rule below never
+# touches a tagged image, and expires only UNTAGGED ones beyond the 20 newest
+# (about 4 pushes' worth of children and orphans). Storage is ~100 MB/image at
+# $0.10/GB-month, so the extra retention costs cents.
 
 resource "aws_ecr_repository" "domain_service" {
   name = "${var.project_name}-domain-service"
@@ -20,11 +27,11 @@ resource "aws_ecr_lifecycle_policy" "domain_service" {
     rules = [
       {
         rulePriority = 1
-        description  = "Keep only the two most recent images (Free Tier 500 MB)"
+        description  = "Expire untagged images beyond the 20 newest; never a tagged one (multi-arch children, T-035)"
         selection = {
-          tagStatus   = "any"
+          tagStatus   = "untagged"
           countType   = "imageCountMoreThan"
-          countNumber = 2
+          countNumber = 20
         }
         action = { type = "expire" }
       }
@@ -32,9 +39,7 @@ resource "aws_ecr_lifecycle_policy" "domain_service" {
   })
 }
 
-# ECR repository for cv-bff-node images (T-014). Mirrors domain_service above:
-# a node:20-alpine runtime image is ~50-60 MB compressed, so two retained
-# tags fit comfortably within the same 500 MB budget.
+# ECR repository for cv-bff-node images (T-014). Mirrors domain_service above.
 resource "aws_ecr_repository" "bff_node" {
   name = "${var.project_name}-bff-node"
 
@@ -53,11 +58,11 @@ resource "aws_ecr_lifecycle_policy" "bff_node" {
     rules = [
       {
         rulePriority = 1
-        description  = "Keep only the two most recent images (Free Tier 500 MB)"
+        description  = "Expire untagged images beyond the 20 newest; never a tagged one (multi-arch children, T-035)"
         selection = {
-          tagStatus   = "any"
+          tagStatus   = "untagged"
           countType   = "imageCountMoreThan"
-          countNumber = 2
+          countNumber = 20
         }
         action = { type = "expire" }
       }

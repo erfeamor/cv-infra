@@ -27,7 +27,8 @@ mock_provider "aws" {
 
   mock_data "aws_ami" {
     defaults = {
-      id = "ami-00000000000000000"
+      id           = "ami-00000000000000000"
+      architecture = "x86_64"
     }
   }
 
@@ -53,6 +54,17 @@ mock_provider "aws" {
   }
 }
 
+# T-035: the app host's AMI lookup is a separate data source from the CI
+# host's; the shared mock above defaults to x86_64, so the arm64 one gets its
+# own value (what the real lookup returns for the arm64 name + filter).
+override_data {
+  target = data.aws_ami.al2023_arm64
+  values = {
+    id           = "ami-00000000000000001"
+    architecture = "arm64"
+  }
+}
+
 variables {
   db_password                = "test-password-not-real"
   drone_rpc_secret           = "test-rpc-secret-not-real"
@@ -62,6 +74,10 @@ variables {
   github_pat_ci              = "test-github-pat-not-real"
   github_webhook_secret      = "test-webhook-secret-not-real"
   github_hooks_token         = "test-hooks-token-not-real"
+
+  # T-035: pinned here so a local terraform.tfvars (which `terraform test`
+  # also loads) can't change what the plan assertions see.
+  domain_service_instance_type = "t4g.micro"
 
   # T-011: no default on budget_credit_grant_amount by design (see
   # variables.tf) -- test value only, never a number that could pass for a
@@ -1858,11 +1874,13 @@ run "bff_node_registry_and_edge" {
 
   assert {
     condition = (
+      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.tagStatus == "untagged" &&
       jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countType == "imageCountMoreThan" &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countNumber == 2 &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].action.type == "expire"
+      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countNumber == 20 &&
+      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].action.type == "expire" &&
+      length(jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules) == 1
     )
-    error_message = "aws_ecr_lifecycle_policy.bff_node must keep only the two most recent images, mirroring domain_service"
+    error_message = "aws_ecr_lifecycle_policy.bff_node must expire only UNTAGGED images beyond 20 and never a tagged one: a multi-arch :latest is an index plus per-arch manifests, and a keep-2-of-any rule can expire its arm64 child (T-035)"
   }
 
   # Ruling 1, the crux: port 3000 gets its OWN security group -- never a
@@ -2775,4 +2793,85 @@ run "github_oidc_public_vanilla_deploy" {
     condition     = output.public_vanilla_deploy_role_arn == aws_iam_role.public_vanilla_deploy.arn
     error_message = "output public_vanilla_deploy_role_arn must expose the deploy role ARN (T-045)"
   }
+}
+
+# --- T-035: app host on Graviton (t4g.micro, arm64 AMI), IMDSv2, safe ECR ---
+run "t035_app_host_graviton" {
+  command = plan
+
+  assert {
+    condition     = var.domain_service_instance_type == "t4g.micro"
+    error_message = "the app host defaults to t4g.micro (T-035, -$1.75/month vs t3.micro)"
+  }
+
+  assert {
+    condition     = aws_instance.domain_service.instance_type == "t4g.micro"
+    error_message = "aws_instance.domain_service must plan as t4g.micro"
+  }
+
+  # The app host and the CI host use DIFFERENT AMI lookups: the CI host stays x86.
+  assert {
+    condition     = aws_instance.domain_service.ami == data.aws_ami.al2023_arm64.id
+    error_message = "the app host must use the arm64 AMI lookup (data.aws_ami.al2023_arm64)"
+  }
+
+  assert {
+    condition     = aws_instance.drone.ami == data.aws_ami.al2023.id && data.aws_ami.al2023.id != data.aws_ami.al2023_arm64.id
+    error_message = "the CI host must keep the x86 lookup (data.aws_ami.al2023), distinct from the app host's"
+  }
+
+  assert {
+    condition     = contains(flatten([for f in data.aws_ami.al2023_arm64.filter : f.values]), "al2023-ami-2023.*-arm64") && contains(flatten([for f in data.aws_ami.al2023_arm64.filter : f.values]), "arm64")
+    error_message = "data.aws_ami.al2023_arm64 must filter the plain AL2023 name pattern AND architecture = arm64"
+  }
+
+  assert {
+    condition     = alltrue(flatten([for f in data.aws_ami.al2023_arm64.filter : [for v in f.values : !can(regex("ecs", v))]]))
+    error_message = "the arm64 lookup must not match the ECS-optimized variant"
+  }
+
+  assert {
+    condition     = contains(flatten([for f in data.aws_ami.al2023.filter : f.values]), "al2023-ami-2023.*-x86_64")
+    error_message = "the CI host's lookup must stay x86_64"
+  }
+
+  # T-005's app-host half: IMDSv2 only, hop limit 1 (a bridge container is one hop away).
+  assert {
+    condition     = aws_instance.domain_service.metadata_options[0].http_tokens == "required"
+    error_message = "the app host must require IMDSv2 tokens"
+  }
+
+  assert {
+    condition     = aws_instance.domain_service.metadata_options[0].http_put_response_hop_limit == 1
+    error_message = "the app host's IMDS hop limit must be 1 so a bridge container gets no credentials"
+  }
+
+  assert {
+    condition     = aws_instance.domain_service.metadata_options[0].http_endpoint == "enabled"
+    error_message = "the app host's IMDS endpoint must stay enabled (the host's own param() reads need it)"
+  }
+
+  # ECR: only untagged images are ever expired.
+  assert {
+    condition = alltrue([
+      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
+      length(jsondecode(p).rules) == 1 &&
+      jsondecode(p).rules[0].selection.tagStatus == "untagged" &&
+      jsondecode(p).rules[0].selection.countType == "imageCountMoreThan" &&
+      jsondecode(p).rules[0].selection.countNumber == 20 &&
+      jsondecode(p).rules[0].action.type == "expire"
+    ])
+    error_message = "both ECR lifecycle policies must expire only untagged images beyond 20, never a tagged (:latest) one"
+  }
+}
+
+# An x86 type on the arm64 AMI (or vice versa) must fail at plan time.
+run "t035_arch_mismatch_rejected" {
+  command = plan
+
+  variables {
+    domain_service_instance_type = "t3.micro"
+  }
+
+  expect_failures = [aws_instance.domain_service]
 }

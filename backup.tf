@@ -1,7 +1,7 @@
 # Nightly logical backup of the self-hosted MySQL container, replacing the
 # managed backups RDS used to provide (see CLAUDE.md's "No RDS" decision).
 # mysqldump runs on the domain-service EC2 via a systemd timer (see
-# templates/domain-service-user-data.sh) and uploads here.
+# templates/domain-service-provision.sh) and uploads here.
 
 locals {
   # Backup objects live under this single prefix so the IAM policy in

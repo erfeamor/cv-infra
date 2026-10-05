@@ -559,4 +559,21 @@ else
   fi
 fi
 
+# --- 18. The app host waits for its S3 script, SSM hash and read grant -----
+# T-044: user_data is a stub that downloads app-host/provision.sh and reads the
+# hash at first boot, so the instance must depend_on all three (the stub's
+# embedded hash orders the S3 object/SSM parameter only implicitly through
+# the script, not through user_data's reference to them). A computed-at-apply
+# ordering `terraform test` cannot see.
+instance_block=$(extract_block '^resource "aws_instance" "domain_service"' <compute.tf)
+missing=""
+for dep in aws_s3_object.app_host_provision aws_ssm_parameter.app_host_provision_sha256 aws_iam_role_policy.app_read_provision_script; do
+  printf '%s\n' "$instance_block" | grep -qE "^[[:space:]]+${dep//./\\.},?[[:space:]]*$" || missing="$missing $dep"
+done
+if [ -n "$missing" ]; then
+  bad "aws_instance.domain_service depends_on is missing:$missing (T-044)"
+else
+  ok "aws_instance.domain_service depends_on its S3 provisioning script, SSM hash and read grant (T-044)"
+fi
+
 exit $fail

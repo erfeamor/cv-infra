@@ -1,5 +1,5 @@
 # T-018: MySQL's data directory used to live on aws_instance.domain_service's
-# root volume (templates/domain-service-user-data.sh). compute.tf sets
+# root volume (templates/domain-service-provision.sh). compute.tf sets
 # user_data_replace_on_change = true, so every user_data edit replaces the
 # instance and, until this task, destroyed the database along with it. This
 # file gives MySQL a volume whose lifecycle is independent of the instance.
@@ -63,7 +63,7 @@ resource "aws_volume_attachment" "mysql_data" {
   # with N unstable across boots. The bootstrap script never uses this
   # value; it resolves the device via
   # /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_<volume-id-without-hyphen>
-  # instead (see templates/domain-service-user-data.sh). This just has to be
+  # instead (see templates/domain-service-provision.sh). This just has to be
   # a syntactically valid, stable /dev/sd* name for the API call.
   device_name = "/dev/sdf"
   volume_id   = aws_ebs_volume.mysql_data.id

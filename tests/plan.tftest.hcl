@@ -2875,3 +2875,290 @@ run "t035_arch_mismatch_rejected" {
 
   expect_failures = [aws_instance.domain_service]
 }
+
+# ---------------------------------------------------------------------------
+# T-047: GitHub OIDC deploy roles for cv-domain-service and cv-bff-node, and one
+# parameterless SSM document per service that runs only `cv-redeploy <svc>`.
+# Apply is scoped with plan_options.target (as the T-045 run above), so
+# null_resource.jenkins_provision's local-exec is never reached.
+# ---------------------------------------------------------------------------
+run "t047_ci_deploy_roles" {
+  command = apply
+
+  plan_options {
+    target = [
+      aws_iam_role_policy.domain_service_deploy,
+      aws_iam_role_policy.bff_node_deploy,
+      aws_ssm_document.redeploy_domain_service,
+      aws_ssm_document.redeploy_bff_node,
+      output.domain_service_deploy_role_arn,
+      output.bff_node_deploy_role_arn,
+      output.domain_service_redeploy_document,
+      output.bff_node_redeploy_document,
+    ]
+  }
+
+  # --- domain-service: trust ---
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role.domain_service_deploy.assume_role_policy).Statement) == 1 &&
+      jsondecode(aws_iam_role.domain_service_deploy.assume_role_policy).Statement[0].Effect == "Allow" &&
+      jsondecode(aws_iam_role.domain_service_deploy.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" &&
+      jsondecode(aws_iam_role.domain_service_deploy.assume_role_policy).Statement[0].Principal == {
+        Federated = aws_iam_openid_connect_provider.github_actions.arn
+      }
+    )
+    error_message = "domain-service deploy role must trust only sts:AssumeRoleWithWebIdentity from the GitHub OIDC provider (T-047)"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role.domain_service_deploy.assume_role_policy).Statement[0].Condition == {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:erfeamor/cv-domain-service:ref:refs/heads/master"
+        }
+      }
+    )
+    error_message = "domain-service trust must be exactly StringEquals aud=sts.amazonaws.com and sub=repo:erfeamor/cv-domain-service:ref:refs/heads/master (T-047)"
+  }
+
+  assert {
+    condition     = aws_iam_role.domain_service_deploy.name == "${var.project_name}-domain-service-deploy" && aws_iam_role.domain_service_deploy.max_session_duration == 3600
+    error_message = "domain-service deploy role name and 1 h session (T-047)"
+  }
+
+  # --- domain-service: permissions ---
+  assert {
+    condition     = length(jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement) == 5 && alltrue([for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement : s.Effect == "Allow" && !contains(keys(s), "NotAction") && !contains(keys(s), "NotResource")])
+    error_message = "domain-service deploy policy must be exactly five plain Allow statements (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Action = ["ecr:GetAuthorizationToken"], Resource = ["*"] }))
+    error_message = "domain-service must Allow ecr:GetAuthorizationToken on * (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+      ], jsonencode({
+        Action = [
+          "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:CompleteLayerUpload",
+          "ecr:GetDownloadUrlForLayer", "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart",
+        ]
+        Resource = [aws_ecr_repository.domain_service.arn]
+    }))
+    error_message = "domain-service must push to its own ECR repository ARN only, with exactly the seven push/read actions (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Action = ["ssm:SendCommand"], Resource = [aws_ssm_document.redeploy_domain_service.arn] }))
+    error_message = "domain-service must ssm:SendCommand on its own document ARN only (T-047)"
+  }
+
+  # Instances: the ARN pattern, only with the app-host Name tag condition.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement : s
+      if contains(flatten([s.Action]), "ssm:SendCommand") && flatten([s.Resource]) == ["arn:aws:ec2:${var.aws_region}:123456789012:instance/*"] &&
+      lookup(s, "Condition", null) == { StringEquals = { "ssm:resourceTag/Name" = "${var.project_name}-domain-service" } }
+    ]) == 1
+    error_message = "domain-service must ssm:SendCommand on instance/* only under StringEquals ssm:resourceTag/Name = <project>-domain-service (T-047)"
+  }
+
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement : s
+      if contains(flatten([s.Action]), "ssm:SendCommand")
+      ]) == 2 && alltrue([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement :
+      contains(flatten([s.Action]), "ssm:SendCommand") ? (!contains(flatten([s.Resource]), "*") && (contains(keys(s), "Condition") || flatten([s.Resource]) == [aws_ssm_document.redeploy_domain_service.arn])) : true
+    ])
+    error_message = "domain-service: exactly two SendCommand statements; never * and instances never unconditioned (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Action = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"], Resource = ["*"] }))
+    error_message = "domain-service must read invocations with ssm:GetCommandInvocation and ssm:ListCommandInvocations on * (no resource-level support) (T-047)"
+  }
+
+  # `*` as a resource appears only on the three actions that cannot be scoped.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement :
+      contains(flatten([s.Resource]), "*") ? toset(flatten([s.Action])) == toset(["ecr:GetAuthorizationToken"]) || toset(flatten([s.Action])) == toset(["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]) : true
+    ])
+    error_message = "domain-service: a bare * resource is allowed only for ecr:GetAuthorizationToken and the two invocation reads (T-047)"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.domain_service_deploy.policy).Statement :
+      alltrue([for a in flatten([s.Action]) : a != "*" && !endswith(a, ":*")])
+    ])
+    error_message = "domain-service: no wildcard actions (T-047)"
+  }
+
+  # --- domain-service: the document ---
+  assert {
+    condition = (
+      aws_ssm_document.redeploy_domain_service.name == "cv-redeploy-domain-service" &&
+      aws_ssm_document.redeploy_domain_service.document_type == "Command" &&
+      jsondecode(aws_ssm_document.redeploy_domain_service.content).schemaVersion == "2.2" &&
+      !contains(keys(jsondecode(aws_ssm_document.redeploy_domain_service.content)), "parameters") &&
+      length(jsondecode(aws_ssm_document.redeploy_domain_service.content).mainSteps) == 1 &&
+      jsondecode(aws_ssm_document.redeploy_domain_service.content).mainSteps[0].action == "aws:runShellScript" &&
+      jsondecode(aws_ssm_document.redeploy_domain_service.content).mainSteps[0].inputs.runCommand == ["/usr/local/bin/cv-redeploy domain-service"] &&
+      jsondecode(aws_ssm_document.redeploy_domain_service.content).mainSteps[0].inputs.timeoutSeconds == "600"
+    )
+    error_message = "document cv-redeploy-domain-service must be schema 2.2, take no parameters, and run exactly /usr/local/bin/cv-redeploy domain-service (T-047)"
+  }
+
+  # --- bff-node: trust ---
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role.bff_node_deploy.assume_role_policy).Statement) == 1 &&
+      jsondecode(aws_iam_role.bff_node_deploy.assume_role_policy).Statement[0].Effect == "Allow" &&
+      jsondecode(aws_iam_role.bff_node_deploy.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" &&
+      jsondecode(aws_iam_role.bff_node_deploy.assume_role_policy).Statement[0].Principal == {
+        Federated = aws_iam_openid_connect_provider.github_actions.arn
+      }
+    )
+    error_message = "bff-node deploy role must trust only sts:AssumeRoleWithWebIdentity from the GitHub OIDC provider (T-047)"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role.bff_node_deploy.assume_role_policy).Statement[0].Condition == {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:erfeamor/cv-bff-node:ref:refs/heads/master"
+        }
+      }
+    )
+    error_message = "bff-node trust must be exactly StringEquals aud=sts.amazonaws.com and sub=repo:erfeamor/cv-bff-node:ref:refs/heads/master (T-047)"
+  }
+
+  assert {
+    condition     = aws_iam_role.bff_node_deploy.name == "${var.project_name}-bff-node-deploy" && aws_iam_role.bff_node_deploy.max_session_duration == 3600
+    error_message = "bff-node deploy role name and 1 h session (T-047)"
+  }
+
+  # --- bff-node: permissions ---
+  assert {
+    condition     = length(jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement) == 5 && alltrue([for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement : s.Effect == "Allow" && !contains(keys(s), "NotAction") && !contains(keys(s), "NotResource")])
+    error_message = "bff-node deploy policy must be exactly five plain Allow statements (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Action = ["ecr:GetAuthorizationToken"], Resource = ["*"] }))
+    error_message = "bff-node must Allow ecr:GetAuthorizationToken on * (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+      ], jsonencode({
+        Action = [
+          "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:CompleteLayerUpload",
+          "ecr:GetDownloadUrlForLayer", "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart",
+        ]
+        Resource = [aws_ecr_repository.bff_node.arn]
+    }))
+    error_message = "bff-node must push to its own ECR repository ARN only, with exactly the seven push/read actions (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Action = ["ssm:SendCommand"], Resource = [aws_ssm_document.redeploy_bff_node.arn] }))
+    error_message = "bff-node must ssm:SendCommand on its own document ARN only (T-047)"
+  }
+
+  # Instances: the ARN pattern, only with the app-host Name tag condition.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement : s
+      if contains(flatten([s.Action]), "ssm:SendCommand") && flatten([s.Resource]) == ["arn:aws:ec2:${var.aws_region}:123456789012:instance/*"] &&
+      lookup(s, "Condition", null) == { StringEquals = { "ssm:resourceTag/Name" = "${var.project_name}-domain-service" } }
+    ]) == 1
+    error_message = "bff-node must ssm:SendCommand on instance/* only under StringEquals ssm:resourceTag/Name = <project>-domain-service (T-047)"
+  }
+
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement : s
+      if contains(flatten([s.Action]), "ssm:SendCommand")
+      ]) == 2 && alltrue([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement :
+      contains(flatten([s.Action]), "ssm:SendCommand") ? (!contains(flatten([s.Resource]), "*") && (contains(keys(s), "Condition") || flatten([s.Resource]) == [aws_ssm_document.redeploy_bff_node.arn])) : true
+    ])
+    error_message = "bff-node: exactly two SendCommand statements; never * and instances never unconditioned (T-047)"
+  }
+
+  assert {
+    condition = contains([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Action = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"], Resource = ["*"] }))
+    error_message = "bff-node must read invocations with ssm:GetCommandInvocation and ssm:ListCommandInvocations on * (no resource-level support) (T-047)"
+  }
+
+  # `*` as a resource appears only on the three actions that cannot be scoped.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement :
+      contains(flatten([s.Resource]), "*") ? toset(flatten([s.Action])) == toset(["ecr:GetAuthorizationToken"]) || toset(flatten([s.Action])) == toset(["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]) : true
+    ])
+    error_message = "bff-node: a bare * resource is allowed only for ecr:GetAuthorizationToken and the two invocation reads (T-047)"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.bff_node_deploy.policy).Statement :
+      alltrue([for a in flatten([s.Action]) : a != "*" && !endswith(a, ":*")])
+    ])
+    error_message = "bff-node: no wildcard actions (T-047)"
+  }
+
+  # --- bff-node: the document ---
+  assert {
+    condition = (
+      aws_ssm_document.redeploy_bff_node.name == "cv-redeploy-bff-node" &&
+      aws_ssm_document.redeploy_bff_node.document_type == "Command" &&
+      jsondecode(aws_ssm_document.redeploy_bff_node.content).schemaVersion == "2.2" &&
+      !contains(keys(jsondecode(aws_ssm_document.redeploy_bff_node.content)), "parameters") &&
+      length(jsondecode(aws_ssm_document.redeploy_bff_node.content).mainSteps) == 1 &&
+      jsondecode(aws_ssm_document.redeploy_bff_node.content).mainSteps[0].action == "aws:runShellScript" &&
+      jsondecode(aws_ssm_document.redeploy_bff_node.content).mainSteps[0].inputs.runCommand == ["/usr/local/bin/cv-redeploy bff-node"] &&
+      jsondecode(aws_ssm_document.redeploy_bff_node.content).mainSteps[0].inputs.timeoutSeconds == "600"
+    )
+    error_message = "document cv-redeploy-bff-node must be schema 2.2, take no parameters, and run exactly /usr/local/bin/cv-redeploy bff-node (T-047)"
+  }
+
+  assert {
+    condition = (
+      output.domain_service_deploy_role_arn == aws_iam_role.domain_service_deploy.arn &&
+      output.bff_node_deploy_role_arn == aws_iam_role.bff_node_deploy.arn &&
+      output.domain_service_redeploy_document == "cv-redeploy-domain-service" &&
+      output.bff_node_redeploy_document == "cv-redeploy-bff-node"
+    )
+    error_message = "T-047 outputs: both role ARNs and both document names"
+  }
+}

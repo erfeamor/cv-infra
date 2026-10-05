@@ -1,6 +1,13 @@
 #!/bin/bash
-# Bootstraps the domain-service host: swap, Docker, a self-hosted MySQL 8.4
+# Provisions the domain-service host: swap, Docker, a self-hosted MySQL 8.4
 # container, Flyway migrations, then the cv-domain-service container.
+#
+# T-044: this is NOT user_data any more. It is an object in the private
+# ci_artifacts bucket (app-host-provision.tf); templates/domain-service-
+# bootstrap.sh is the user_data stub that fetches it, verifies its SHA-256 and
+# runs it. The containers' `docker run` arguments live ONLY in the library
+# written to /usr/local/lib/cv-app.sh below (cv_run_*), shared by this boot
+# flow and /usr/local/bin/cv-redeploy.
 #
 # MySQL runs on this same box (localhost, on the `cv` docker network) instead
 # of RDS: no RDS instance cost, no MySQL 8.0 Extended Support charge, and we
@@ -20,14 +27,150 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab
 dnf install -y docker git xfsprogs
 systemctl enable --now docker
 
+# --- Shared container definitions (T-044) ---
+# The ONE place each container's run arguments are written. Sourced by this
+# boot flow and by /usr/local/bin/cv-redeploy, so the two can never diverge.
+# Secrets are read from SSM at call time (instance role) into function-local
+# variables and never echoed. Quoted heredoc: nothing below expands in this
+# shell; only Terraform's templatefile() substitutions apply.
+mkdir -p /usr/local/lib
+cat > /usr/local/lib/cv-app.sh <<'CV_APP_LIB'
+# Sourced, never executed. Defines param(), cv_ecr_login() and the cv_run_*
+# functions. Each cv_run_* STARTS its container; removing an old one first is
+# the caller's job (cv-redeploy does `docker rm -f` on exactly one).
+CV_DOMAIN_IMAGE="${image}"
+CV_BFF_IMAGE="${bff_image}"
+
 param() {
   aws ssm get-parameter --with-decryption --region "${aws_region}" \
     --name "/${project_name}/${environment}/$1" \
     --query Parameter.Value --output text
 }
 
+cv_ecr_login() {
+  aws ecr get-login-password --region "${aws_region}" \
+    | docker login --username AWS --password-stdin "$(echo "$CV_DOMAIN_IMAGE" | cut -d/ -f1)"
+}
+
+# Clone on first use, fast-forward afterwards (a no-op when current).
+cv_sync_database_repo() {
+  if [ -d /opt/cv-database/.git ]; then
+    git -C /opt/cv-database pull --ff-only
+  else
+    git clone --depth 1 https://github.com/erfeamor/cv-database.git /opt/cv-database
+  fi
+}
+
+# Flyway (schema only): production applies migrations ONLY -- the dev-seeds
+# location is deliberately excluded (see cv-database afterMigrate__seed_dev.sql).
+# FLYWAY_CONNECT_RETRIES lets Flyway wait out MySQL's first-boot init.
+# allowPublicKeyRetrieval is required for MySQL 8's caching_sha2_password over
+# the non-TLS docker network.
+cv_run_flyway() {
+  local DB_PASSWORD
+  DB_PASSWORD=$(param db/password)
+  docker run --rm --network cv \
+    -v /opt/cv-database/sql:/flyway/sql:ro \
+    -e FLYWAY_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true" \
+    -e FLYWAY_USER="${db_username}" \
+    -e FLYWAY_PASSWORD="$DB_PASSWORD" \
+    -e FLYWAY_LOCATIONS="filesystem:/flyway/sql/migrations" \
+    -e FLYWAY_CONNECT_RETRIES=60 \
+    flyway/flyway:13.7.0 migrate
+}
+
+# Hibernate ddl-auto=validate against the migrated schema.
+cv_run_domain_service() {
+  local DB_PASSWORD COGNITO_ISSUER_URI
+  DB_PASSWORD=$(param db/password)
+  COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
+  docker run -d --name domain-service --restart unless-stopped --network cv \
+    -p 8080:8080 \
+    -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true&useSSL=false" \
+    -e SPRING_DATASOURCE_USERNAME="${db_username}" \
+    -e SPRING_DATASOURCE_PASSWORD="$DB_PASSWORD" \
+    -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+    -e AUTH_ENABLED=true \
+    -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
+    "$CV_DOMAIN_IMAGE"
+}
+
+# cv-bff-node (T-014): same box, same `cv` network. DOMAIN_SERVICE_URL is
+# container-to-container, never the public EIP. Auth is ON (meta CLAUDE.md
+# defaults it off for local dev only): every route under /bff/api/v1 is gated
+# except the contract's own PUBLIC_ROUTES allowlist. T-043: client-credentials
+# identity for the domain service (Cognito).
+cv_run_bff_node() {
+  local COGNITO_ISSUER_URI BFF_CLIENT_ID BFF_CLIENT_SECRET BFF_TOKEN_URL BFF_TOKEN_SCOPE
+  COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
+  BFF_CLIENT_ID=$(param bff/service-client-id)
+  BFF_CLIENT_SECRET=$(param bff/service-client-secret)
+  BFF_TOKEN_URL=$(param bff/token-url)
+  BFF_TOKEN_SCOPE=$(param bff/token-scope)
+  docker run -d --name bff-node --restart unless-stopped --network cv \
+    -p 3000:3000 \
+    -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
+    -e AUTH_ENABLED=true \
+    -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+    -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
+    -e COGNITO_TOKEN_URL="$BFF_TOKEN_URL" \
+    -e SERVICE_CLIENT_ID="$BFF_CLIENT_ID" \
+    -e SERVICE_CLIENT_SECRET="$BFF_CLIENT_SECRET" \
+    -e SERVICE_TOKEN_SCOPE="$BFF_TOKEN_SCOPE" \
+    "$CV_BFF_IMAGE"
+}
+CV_APP_LIB
+chmod 644 /usr/local/lib/cv-app.sh
+
+# --- cv-redeploy (T-044): roll one service without replacing the host ---
+# Invoked by an operator over SSM Run Command (docs/runbooks/app-host-deploy.md).
+cat > /usr/local/bin/cv-redeploy <<'CV_REDEPLOY'
+#!/bin/bash
+set -euo pipefail
+# shellcheck source=/dev/null
+source /usr/local/lib/cv-app.sh
+
+usage() {
+  echo "usage: cv-redeploy migrate | domain-service | bff-node" >&2
+  exit 2
+}
+[ "$#" -eq 1 ] || usage
+
+# Recreate ONLY the named container from a freshly pulled :latest.
+roll() {
+  local name="$1" image="$2" old new
+  cv_ecr_login
+  old=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || echo none)
+  docker pull "$image"
+  new=$(docker image inspect --format '{{.Id}}' "$image")
+  echo "$name image: old=$old new=$new"
+  docker rm -f "$name" || true
+  "cv_run_$${name//-/_}"
+}
+
+case "$1" in
+  migrate)
+    cv_sync_database_repo
+    cv_run_flyway
+    ;;
+  domain-service)
+    roll domain-service "$CV_DOMAIN_IMAGE"
+    ;;
+  bff-node)
+    roll bff-node "$CV_BFF_IMAGE"
+    ;;
+  *)
+    usage
+    ;;
+esac
+CV_REDEPLOY
+chmod 750 /usr/local/bin/cv-redeploy
+
+# shellcheck source=/dev/null
+source /usr/local/lib/cv-app.sh
+# MySQL first-init credentials only; Flyway and the services read their own
+# copy at call time (cv_run_*).
 DB_PASSWORD=$(param db/password)
-COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
 
 docker network create cv || true
 
@@ -164,43 +307,21 @@ docker run -d --name mysql --restart unless-stopped --network cv \
   mysql:8.4 \
   --innodb-buffer-pool-size=128M --performance-schema=OFF
 
-# --- Flyway migrations (schema only) ---
-# Production applies migrations ONLY: the dev-seeds location is deliberately
-# excluded (see cv-database afterMigrate__seed_dev.sql). FLYWAY_CONNECT_RETRIES
-# lets Flyway wait out MySQL's first-boot init. allowPublicKeyRetrieval is
-# required for MySQL 8's caching_sha2_password over the non-TLS docker network.
-git clone --depth 1 https://github.com/erfeamor/cv-database.git /opt/cv-database \
-  || (cd /opt/cv-database && git pull --ff-only)
-docker run --rm --network cv \
-  -v /opt/cv-database/sql:/flyway/sql:ro \
-  -e FLYWAY_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true" \
-  -e FLYWAY_USER="${db_username}" \
-  -e FLYWAY_PASSWORD="$DB_PASSWORD" \
-  -e FLYWAY_LOCATIONS="filesystem:/flyway/sql/migrations" \
-  -e FLYWAY_CONNECT_RETRIES=60 \
-  flyway/flyway:13.7.0 migrate
+# --- Flyway migrations (schema only; arguments in cv_run_flyway) ---
+cv_sync_database_repo
+cv_run_flyway
 
-# --- Domain service (Hibernate ddl-auto=validate against the migrated schema) ---
-REGISTRY=$(echo "${image}" | cut -d/ -f1)
-aws ecr get-login-password --region "${aws_region}" \
-  | docker login --username AWS --password-stdin "$REGISTRY"
+# --- Domain service ---
+cv_ecr_login
 
 # The image is pushed manually/by CI after this instance first boots, so keep
 # retrying until it exists rather than failing the boot.
-until docker pull "${image}"; do
+until docker pull "$CV_DOMAIN_IMAGE"; do
   echo "image not available yet, retrying in 60s"
   sleep 60
 done
 
-docker run -d --name domain-service --restart unless-stopped --network cv \
-  -p 8080:8080 \
-  -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true&useSSL=false" \
-  -e SPRING_DATASOURCE_USERNAME="${db_username}" \
-  -e SPRING_DATASOURCE_PASSWORD="$DB_PASSWORD" \
-  -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
-  -e AUTH_ENABLED=true \
-  -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
-  "${image}"
+cv_run_domain_service
 
 # --- Nightly MySQL backup: mysqldump -> S3 (T-001) ---
 # RDS's managed backups went away when MySQL moved onto this instance (see
@@ -278,40 +399,17 @@ EOF
 systemctl daemon-reload
 systemctl enable --now mysql-backup.timer
 
-# --- cv-bff-node (T-014): same box, same `cv` network ---
-# DOMAIN_SERVICE_URL is container-to-container, never the public EIP. Auth is
-# ON (meta CLAUDE.md defaults it off for local dev only; ruling 5): every
-# route under /bff/api/v1 is gated except the contract's own PUBLIC_ROUTES
-# allowlist. No second `docker login` -- both repos share one ECR
-# registry/account/region, already logged in above.
-#
+# --- cv-bff-node (T-014; arguments in cv_run_bff_node) ---
 # Review round 1: this block runs LAST, after the backup service/timer are
-# installed and enabled above, not right after the domain-service container
-# as it did originally. The `until docker pull` loop below blocks forever if
-# the BFF image is ever absent at boot -- everything from here down used to
-# sit behind that loop, which meant a missing BFF image silently skipped
-# installing the nightly mysqldump->S3 timer (T-001). A BFF outage must
-# never cost the database its backups, so every other boot step now
-# completes first regardless of whether the BFF image exists yet.
-# T-043: client-credentials identity for the domain service (Cognito).
-BFF_CLIENT_ID=$(param bff/service-client-id)
-BFF_CLIENT_SECRET=$(param bff/service-client-secret)
-BFF_TOKEN_URL=$(param bff/token-url)
-BFF_TOKEN_SCOPE=$(param bff/token-scope)
-
-until docker pull "${bff_image}"; do
+# installed and enabled above. The `until docker pull` loop below blocks
+# forever if the BFF image is ever absent at boot -- everything from here down
+# used to sit behind that loop, which meant a missing BFF image silently
+# skipped installing the nightly mysqldump->S3 timer (T-001). A BFF outage must
+# never cost the database its backups, so every other boot step completes
+# first. No second `docker login`: both repos share one ECR registry.
+until docker pull "$CV_BFF_IMAGE"; do
   echo "bff image not available yet, retrying in 60s"
   sleep 60
 done
 
-docker run -d --name bff-node --restart unless-stopped --network cv \
-  -p 3000:3000 \
-  -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
-  -e AUTH_ENABLED=true \
-  -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
-  -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
-  -e COGNITO_TOKEN_URL="$BFF_TOKEN_URL" \
-  -e SERVICE_CLIENT_ID="$BFF_CLIENT_ID" \
-  -e SERVICE_CLIENT_SECRET="$BFF_CLIENT_SECRET" \
-  -e SERVICE_TOKEN_SCOPE="$BFF_TOKEN_SCOPE" \
-  "${bff_image}"
+cv_run_bff_node

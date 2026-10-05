@@ -101,7 +101,7 @@ run "plan_succeeds" {
   }
 
   # MySQL is self-hosted on the domain-service EC2 (see compute.tf /
-  # templates/domain-service-user-data.sh) — there is no RDS instance to
+  # templates/domain-service-provision.sh) — there is no RDS instance to
   # assert on anymore.
   assert {
     condition     = aws_instance.domain_service.instance_type == var.domain_service_instance_type
@@ -1989,9 +1989,11 @@ run "app_host_user_data" {
   command = plan
 
   # H1 refresh item 4 / N2, RED FIRST: EC2's hard user_data limit is 16,384
-  # bytes, with no prior size guard. Margin set at 15,500 (T-014 task spec).
+  # bytes. T-044: the full script no longer rides in user_data (it is an S3
+  # object, like T-009's Jenkins script), so this guard on the SCRIPT is only a
+  # sanity bound; the real user_data wall is guarded on the stub below.
   assert {
-    condition = length(templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2003,14 +2005,14 @@ run "app_host_user_data" {
       backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
       backup_prefix     = "mysql-dumps"
       mysql_volume_id   = "vol-0123456789abcdef0"
-    })) <= 15500
-    error_message = "Rendered domain-service-user-data.sh exceeds the 16,384-byte EC2 user_data hard limit's safety margin (15,500) -- trim the BFF block or move something out of user_data (T-014 H1 refresh item 4, N2)"
+    })) <= 40000
+    error_message = "Rendered domain-service-provision.sh exceeds 40,000 bytes -- it is an S3 object now (T-044), not user_data, but a script this big deserves a split"
   }
 
   # AC: production pins Flyway 13.7.0 (T-155/T-156), riding this apply's
   # instance replacement -- was flyway/flyway:10.
   assert {
-    condition = length(regexall("flyway/flyway:13\\.7\\.0 migrate", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("flyway/flyway:13\\.7\\.0 migrate", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2023,13 +2025,13 @@ run "app_host_user_data" {
       backup_prefix     = "mysql-dumps"
       mysql_volume_id   = "vol-0123456789abcdef0"
     }))) == 1
-    error_message = "templates/domain-service-user-data.sh must pin flyway/flyway:13.7.0 at the migrate step, not :10"
+    error_message = "templates/domain-service-provision.sh must pin flyway/flyway:13.7.0 at the migrate step, not :10"
   }
 
   # Scope 2: the BFF container -- same cv network, --restart unless-stopped,
   # --name bff-node.
   assert {
-    condition = length(regexall("docker run -d --name bff-node --restart unless-stopped --network cv", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("docker run -d --name bff-node --restart unless-stopped --network cv", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2048,7 +2050,7 @@ run "app_host_user_data" {
   # Scope 2: the BFF publishes 3000 (unique to the BFF -- the domain service
   # publishes 8080).
   assert {
-    condition = length(regexall("-p 3000:3000", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("-p 3000:3000", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2067,7 +2069,7 @@ run "app_host_user_data" {
   # Ruling 5/scope 2: DOMAIN_SERVICE_URL is container-to-container, NEVER the
   # public EIP -- BFF->domain traffic must not round-trip the internet.
   assert {
-    condition = length(regexall("-e DOMAIN_SERVICE_URL=http://domain-service:8080", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("-e DOMAIN_SERVICE_URL=http://domain-service:8080", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2087,7 +2089,7 @@ run "app_host_user_data" {
   # (meta CLAUDE.md, local dev only), which would be wrong deployed (every
   # /bff/api/v1 route would be anonymous, not just the contract's allowlist).
   assert {
-    condition = length(regexall("-e AUTH_ENABLED=true", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("-e AUTH_ENABLED=true", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2107,7 +2109,7 @@ run "app_host_user_data" {
   # does (COGNITO_ISSUER_URI is read once at boot into $COGNITO_ISSUER_URI,
   # then passed to both containers -- never a literal baked into either).
   assert {
-    condition = length(regexall("-e COGNITO_ISSUER_URI=\"\\$COGNITO_ISSUER_URI\"", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("-e COGNITO_ISSUER_URI=\"\\$COGNITO_ISSUER_URI\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2131,7 +2133,7 @@ run "app_host_user_data" {
   # CORS never applies to it; not asserted here since there's nothing to
   # assert an absence of.
   assert {
-    condition = length(regexall("-e CORS_ALLOWED_ORIGINS=\"https://d1234567890abc\\.cloudfront\\.net\"", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("-e CORS_ALLOWED_ORIGINS=\"https://d1234567890abc\\.cloudfront\\.net\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2152,7 +2154,7 @@ run "app_host_user_data" {
   # against the rendered fixture value (bff_image is already substituted by
   # templatefile by this point, not the literal "$${bff_image}" placeholder).
   assert {
-    condition = length(regexall("until docker pull \"123456789012\\.dkr\\.ecr\\.eu-west-3\\.amazonaws\\.com/cv-project-bff-node:latest\"; do", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("until docker pull \"\\$CV_BFF_IMAGE\"; do", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2176,7 +2178,7 @@ run "app_host_user_data" {
   # exactly once) and assert the BFF's `docker run` line exists only in the
   # half AFTER that split, never in the half before it.
   assert {
-    condition = length(split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2193,7 +2195,7 @@ run "app_host_user_data" {
   }
 
   assert {
-    condition = length(regexall("docker run -d --name bff-node", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("(?m)^cv_run_bff_node$", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2206,11 +2208,11 @@ run "app_host_user_data" {
       backup_prefix     = "mysql-dumps"
       mysql_volume_id   = "vol-0123456789abcdef0"
     }))[0])) == 0
-    error_message = "The BFF's docker run must NOT appear before the MySQL backup timer is enabled -- a missing BFF image must never block the nightly backup from being installed (T-014 review round 1)"
+    error_message = "The BFF start (cv_run_bff_node) must NOT run before the MySQL backup timer is enabled -- a missing BFF image must never block the nightly backup from being installed (T-014 review round 1)"
   }
 
   assert {
-    condition = length(regexall("docker run -d --name bff-node", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+    condition = length(regexall("(?m)^cv_run_bff_node$", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region        = var.aws_region
       project_name      = var.project_name
       environment       = var.environment
@@ -2223,7 +2225,285 @@ run "app_host_user_data" {
       backup_prefix     = "mysql-dumps"
       mysql_volume_id   = "vol-0123456789abcdef0"
     }))[1])) == 1
-    error_message = "The BFF's docker run must appear AFTER the MySQL backup timer is enabled (T-014 review round 1)"
+    error_message = "The BFF start (cv_run_bff_node) must run AFTER the MySQL backup timer is enabled (T-014 review round 1)"
+  }
+
+  # T-044: ONE definition of each container's run arguments. Every docker run
+  # for these four containers' services sits in exactly one place (the library
+  # written to /usr/local/lib/cv-app.sh) and is sourced by both the boot flow
+  # and cv-redeploy -- so each appears exactly once in the script.
+  assert {
+    condition = alltrue([
+      for pat in [
+        "docker run -d --name domain-service ",
+        "docker run -d --name bff-node ",
+        "flyway/flyway:13\\.7\\.0 migrate",
+        ] : length(regexall(pat, templatefile("${path.module}/templates/domain-service-provision.sh", {
+          aws_region        = var.aws_region
+          project_name      = var.project_name
+          environment       = var.environment
+          image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+          bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+          db_name           = var.db_name
+          db_username       = var.db_username
+          cloudfront_domain = "d1234567890abc.cloudfront.net"
+          backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+          backup_prefix     = "mysql-dumps"
+          mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1
+    ])
+    error_message = "docker run for domain-service, bff-node and flyway must each appear exactly once in the provisioning script (inside their cv_run_* function), shared by boot and cv-redeploy (T-044)"
+  }
+
+  assert {
+    condition = alltrue([
+      for fn in ["cv_run_flyway", "cv_run_domain_service", "cv_run_bff_node"] :
+      length(regexall("(?m)^${fn}\\(\\) \\{$", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1
+    ])
+    error_message = "cv_run_flyway, cv_run_domain_service and cv_run_bff_node must each be defined exactly once (T-044)"
+  }
+
+  # The boot flow calls each function; cv-redeploy calls them by name too.
+  assert {
+    condition = alltrue([
+      for fn in ["cv_run_flyway", "cv_run_domain_service", "cv_run_bff_node"] :
+      length(regexall("(?m)^[ ]*${fn}$", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) >= 1
+    ])
+    error_message = "the boot flow must call cv_run_flyway, cv_run_domain_service and cv_run_bff_node (T-044)"
+  }
+
+  # Boot order: MySQL, Flyway, domain-service, backup timer, BFF last.
+  assert {
+    condition = alltrue([
+      length(regexall("(?s)docker run -d --name mysql .*\ncv_run_flyway\n.*\ncv_run_domain_service\n.*systemctl enable --now mysql-backup\\.timer.*\ncv_run_bff_node\n", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1
+    ])
+    error_message = "boot order must be mysql, cv_run_flyway, cv_run_domain_service, backup timer, cv_run_bff_node (T-014 round 1 ordering)"
+  }
+
+  # The images the functions use are rendered into the library.
+  assert {
+    condition = (
+      length(regexall("CV_BFF_IMAGE=\"123456789012\\.dkr\\.ecr\\.eu-west-3\\.amazonaws\\.com/cv-project-bff-node:latest\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1 &&
+      length(regexall("CV_DOMAIN_IMAGE=\"123456789012\\.dkr\\.ecr\\.eu-west-3\\.amazonaws\\.com/cv-project-domain-service:latest\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1
+    )
+    error_message = "the library must define CV_DOMAIN_IMAGE and CV_BFF_IMAGE from the ECR repo URLs"
+  }
+
+  # cv-redeploy: only the allowed verbs, root-only, strict mode, no secrets.
+  assert {
+    condition = (
+      length(regexall("chmod 750 /usr/local/bin/cv-redeploy", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1 &&
+      length(regexall("(?m)^  migrate\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1 &&
+      length(regexall("(?m)^  domain-service\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1 &&
+      length(regexall("(?m)^  bff-node\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
+        aws_region        = var.aws_region
+        project_name      = var.project_name
+        environment       = var.environment
+        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name           = var.db_name
+        db_username       = var.db_username
+        cloudfront_domain = "d1234567890abc.cloudfront.net"
+        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix     = "mysql-dumps"
+        mysql_volume_id   = "vol-0123456789abcdef0"
+      }))) == 1
+    )
+    error_message = "cv-redeploy must be installed 0750 and handle exactly migrate, domain-service and bff-node (T-044)"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-044 -- the app host's user_data is a small fetch-verify-run stub; the full
+# script is a private S3 object whose SHA-256 is in SSM AND embedded in the
+# stub (so a script edit still replaces the host).
+# ---------------------------------------------------------------------------
+run "app_host_bootstrap_stub" {
+  command = plan
+
+  assert {
+    condition = length(templatefile("${path.module}/templates/domain-service-bootstrap.sh", {
+      aws_region       = var.aws_region
+      project_name     = var.project_name
+      environment      = var.environment
+      artifact_bucket  = "cv-project-ci-artifacts-dev"
+      artifact_key     = "app-host/provision.sh"
+      provision_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    })) <= 2048
+    error_message = "the app host's user_data stub must stay <= 2,048 bytes (T-044): the real script lives in S3"
+  }
+
+  assert {
+    condition = (
+      length(regexall("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", templatefile("${path.module}/templates/domain-service-bootstrap.sh", {
+        aws_region       = var.aws_region
+        project_name     = var.project_name
+        environment      = var.environment
+        artifact_bucket  = "cv-project-ci-artifacts-dev"
+        artifact_key     = "app-host/provision.sh"
+        provision_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }))) >= 1 &&
+      length(regexall("s3://cv-project-ci-artifacts-dev/app-host/provision\\.sh", templatefile("${path.module}/templates/domain-service-bootstrap.sh", {
+        aws_region       = var.aws_region
+        project_name     = var.project_name
+        environment      = var.environment
+        artifact_bucket  = "cv-project-ci-artifacts-dev"
+        artifact_key     = "app-host/provision.sh"
+        provision_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }))) >= 1 &&
+      length(regexall("/cv-project/dev/app/provision-sha256", templatefile("${path.module}/templates/domain-service-bootstrap.sh", {
+        aws_region       = var.aws_region
+        project_name     = var.project_name
+        environment      = var.environment
+        artifact_bucket  = "cv-project-ci-artifacts-dev"
+        artifact_key     = "app-host/provision.sh"
+        provision_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }))) >= 1
+    )
+    error_message = "the stub must embed the script hash, fetch s3://<bucket>/app-host/provision.sh, and read /cv-project/<env>/app/provision-sha256 (T-044)"
+  }
+
+  assert {
+    condition     = aws_instance.domain_service.user_data_replace_on_change == true
+    error_message = "aws_instance.domain_service must keep user_data_replace_on_change = true (T-044 H1 point 1)"
+  }
+
+  assert {
+    condition     = aws_s3_object.app_host_provision.key == "app-host/provision.sh"
+    error_message = "the app host provisioning script must live at app-host/provision.sh in the ci_artifacts bucket"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.app_host_provision_sha256.name == "/${var.project_name}/${var.environment}/app/provision-sha256" && aws_ssm_parameter.app_host_provision_sha256.type == "String"
+    error_message = "the script hash must be the String parameter /<project>/<env>/app/provision-sha256"
+  }
+}
+
+# Applied (mocked) and scoped with plan_options.target to the IAM policy so
+# null_resource.jenkins_provision's real local-exec is never reached -- same
+# rationale as backup_iam_scoping.
+run "app_host_provision_iam_scoping" {
+  command = apply
+
+  plan_options {
+    target = [
+      aws_iam_role_policy.app_read_provision_script,
+    ]
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.app_read_provision_script.role == aws_iam_role.domain_service.id
+    error_message = "the provision-script read grant must attach to the domain_service role"
+  }
+
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role_policy.app_read_provision_script.policy).Statement) == 1 &&
+      jsondecode(aws_iam_role_policy.app_read_provision_script.policy).Statement[0].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.app_read_provision_script.policy).Statement[0].Action == ["s3:GetObject"]
+    )
+    error_message = "the grant must be a single Allow of exactly s3:GetObject"
+  }
+
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.app_read_provision_script.policy).Statement[0].Resource == "${aws_s3_bucket.ci_artifacts.arn}/app-host/provision.sh"
+    error_message = "the grant's Resource must be exactly the app-host/provision.sh object ARN -- not the bucket, not a wildcard"
   }
 }
 
@@ -2329,7 +2609,7 @@ run "bff_service_token" {
         "-e SERVICE_CLIENT_ID=\"\\$BFF_CLIENT_ID\"",
         "-e SERVICE_CLIENT_SECRET=\"\\$BFF_CLIENT_SECRET\"",
         "-e SERVICE_TOKEN_SCOPE=\"\\$BFF_TOKEN_SCOPE\"",
-        ] : length(regexall(pat, split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+        ] : length(regexall(pat, templatefile("${path.module}/templates/domain-service-provision.sh", {
           aws_region        = var.aws_region
           project_name      = var.project_name
           environment       = var.environment
@@ -2341,15 +2621,15 @@ run "bff_service_token" {
           backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
           backup_prefix     = "mysql-dumps"
           mysql_volume_id   = "vol-0123456789abcdef0"
-      }))[1])) == 1
+      }))) == 1
     ])
-    error_message = "the BFF docker run (after the backup timer) must pass COGNITO_TOKEN_URL, SERVICE_CLIENT_ID, SERVICE_CLIENT_SECRET, SERVICE_TOKEN_SCOPE from shell variables (T-043)"
+    error_message = "the BFF docker run (cv_run_bff_node) must pass COGNITO_TOKEN_URL, SERVICE_CLIENT_ID, SERVICE_CLIENT_SECRET, SERVICE_TOKEN_SCOPE from shell variables (T-043)"
   }
 
   assert {
     condition = alltrue([
       for p in ["bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope"] :
-      length(regexall("\\(param ${p}\\)", templatefile("${path.module}/templates/domain-service-user-data.sh", {
+      length(regexall("\\(param ${p}\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
         aws_region        = var.aws_region
         project_name      = var.project_name
         environment       = var.environment

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stub `docker`: records every call (argv) and prints nothing sensitive.
+echo "docker $*" >>"${STUB_CALLS_LOG:?}"
+state="${STUB_STATE_DIR:?}/digest"
+case "$1" in
+  login) cat >/dev/null ;;
+  pull) echo "sha256:new" >"$state"; echo "Status: Downloaded newer image for $2" ;;
+  image) [ -f "$state" ] && cat "$state" || echo "sha256:old" ;;
+  rm) echo "$3" ;;
+  run) echo "container-id-stub" ;;
+esac
+exit 0

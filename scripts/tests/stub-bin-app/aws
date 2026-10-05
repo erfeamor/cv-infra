@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Stub `aws` for run-cv-redeploy-tests.sh. Logs argv (secrets are only ever
+# RETURNED to the caller, never logged) and serves fixed SSM values.
+echo "aws $*" >>"${STUB_CALLS_LOG:?}"
+case "$1 $2" in
+  "ssm get-parameter")
+    name=""
+    while [ "$#" -gt 0 ]; do [ "$1" = "--name" ] && name="$2"; shift; done
+    case "$name" in
+      */db/password) echo "SECRET-DB-PASSWORD-1" ;;
+      */bff/service-client-secret) echo "SECRET-BFF-CLIENT-2" ;;
+      */cognito/issuer-uri) echo "https://issuer.example/pool" ;;
+      *) echo "plain-value" ;;
+    esac
+    ;;
+  "ecr get-login-password") echo "SECRET-ECR-TOKEN-3" ;;
+  *) echo "stub aws: unexpected $*" >&2; exit 1 ;;
+esac

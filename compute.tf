@@ -43,22 +43,16 @@ resource "aws_instance" "domain_service" {
   vpc_security_group_ids = [aws_security_group.domain_service.id, aws_security_group.bff_node.id]
   iam_instance_profile   = aws_iam_instance_profile.domain_service.name
 
-  user_data = templatefile("${path.module}/templates/domain-service-user-data.sh", {
-    aws_region        = var.aws_region
-    project_name      = var.project_name
-    environment       = var.environment
-    image             = "${aws_ecr_repository.domain_service.repository_url}:latest"
-    bff_image         = "${aws_ecr_repository.bff_node.repository_url}:latest"
-    db_name           = var.db_name
-    db_username       = var.db_username
-    cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name
-    backup_bucket     = aws_s3_bucket.backup.bucket
-    backup_prefix     = local.mysql_backup_prefix
-    # T-018 ruling 2: the bootstrap resolves the MySQL data device by volume
-    # ID (via /dev/disk/by-id/...), never by the /dev/sdf name below or by
-    # /dev/nvme<N>n1 -- N is not stable across boots on these nitro
-    # instances. See templates/domain-service-user-data.sh.
-    mysql_volume_id = aws_ebs_volume.mysql_data.id
+  # T-044: a small fetch-verify-run stub; the real script is the S3 object in
+  # app-host-provision.tf. The stub embeds the script's SHA-256, so editing the
+  # script still changes user_data and replaces the host.
+  user_data = templatefile("${path.module}/templates/domain-service-bootstrap.sh", {
+    aws_region       = var.aws_region
+    project_name     = var.project_name
+    environment      = var.environment
+    artifact_bucket  = aws_s3_bucket.ci_artifacts.id
+    artifact_key     = local.app_host_provision_key
+    provision_sha256 = local.app_host_provision_sha256
   })
 
   # A user_data edit changes how the box bootstraps, so it must actually
@@ -75,6 +69,10 @@ resource "aws_instance" "domain_service" {
     aws_ssm_parameter.bff_service_client_secret,
     aws_ssm_parameter.bff_token_url,
     aws_ssm_parameter.bff_token_scope,
+    # T-044: the stub downloads and verifies these at first boot.
+    aws_s3_object.app_host_provision,
+    aws_ssm_parameter.app_host_provision_sha256,
+    aws_iam_role_policy.app_read_provision_script,
   ]
 
   # Amazon publishes new AL2023 AMIs continually; without this every apply

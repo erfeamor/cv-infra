@@ -19,6 +19,8 @@ bash scripts/check-static.sh      # invariants plan-time `terraform test` can't 
 bash bootstrap/check-static.sh    # the state bucket keeps prevent_destroy
 bash scripts/tests/run-drone-reseed-tests.sh   # T-008: offline harness for scripts/drone-reseed-secrets.sh
                                                 # (stubs `aws` and the Drone API; no AWS/network needed)
+bash scripts/tests/run-cv-redeploy-tests.sh    # T-044: offline harness for cv-redeploy (extracted from the provisioning
+                                                # template; stubs docker/aws/git in scripts/tests/stub-bin-app/)
 python3 -m unittest discover -s lambda -p 'test_*.py'   # T-034: offline unit tests for lambda/ci_doorbell
                                                           # and lambda/ci_reaper -- boto3/botocore are stubbed
                                                           # in lambda/testsupport.py (neither is installed here
@@ -32,9 +34,9 @@ bash scripts/tests/run-ci-dns-updater-tests.sh   # T-034 phase 2: offline harnes
                                                   # neither harness's fixtures can affect the other)
 ```
 
-`scripts/check-static.sh`, `bootstrap/check-static.sh`, `scripts/tests/run-drone-reseed-tests.sh`, `scripts/tests/run-ci-dns-updater-tests.sh` and the `lambda/` unit tests are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
+`scripts/check-static.sh`, `bootstrap/check-static.sh`, `scripts/tests/run-drone-reseed-tests.sh`, `scripts/tests/run-ci-dns-updater-tests.sh`, `scripts/tests/run-cv-redeploy-tests.sh` and the `lambda/` unit tests are cv-infra-local. The meta repo's `scripts/lint-all.sh` and `scripts/test-all.sh` don't run them, so run them from here as shown above.
 
-Operational procedures live in `docs/runbooks/`: `drone.md` (Drone rebuild, repo secrets, deploy-key rotation, pausing the reaper) and `ci-host-replace.md` (replacing the CI host and verifying the new one).
+Operational procedures live in `docs/runbooks/`: `app-host-deploy.md` (T-044: `cv-redeploy migrate | domain-service | bff-node` on the app host, schema-change order, rollback, what still needs a host replacement), `drone.md` (Drone rebuild, repo secrets, deploy-key rotation, pausing the reaper) and `ci-host-replace.md` (replacing the CI host and verifying the new one).
 
 Real usage (needs AWS credentials, `terraform.tfvars`, and the state bucket/table from `bootstrap/` to already exist — see `bootstrap/README.md`):
 
@@ -46,7 +48,7 @@ terraform apply
 
 ## Layout
 
-One root module, one file per concern: `providers.tf`, `variables.tf`, `network.tf` (default VPC + SGs), `compute.tf` (EC2), `frontend.tf` (S3+CloudFront), `auth.tf` (Cognito), `iam.tf`, `observability.tf` (log groups), `ssm.tf` (parameters), `outputs.tf`. New resources join the matching file or get a new single-concern file. **MySQL is self-hosted** in a container on the domain-service EC2 (`templates/domain-service-user-data.sh`), not RDS — see the decision below.
+One root module, one file per concern: `providers.tf`, `variables.tf`, `network.tf` (default VPC + SGs), `compute.tf` (EC2), `frontend.tf` (S3+CloudFront), `auth.tf` (Cognito), `iam.tf`, `observability.tf` (log groups), `ssm.tf` (parameters), `outputs.tf`. New resources join the matching file or get a new single-concern file. **MySQL is self-hosted** in a container on the domain-service EC2 (`templates/domain-service-provision.sh`, an S3 object since T-044; `templates/domain-service-bootstrap.sh` is the small user_data stub that fetches, hash-verifies and runs it; `app-host-provision.tf`), not RDS — see the decision below.
 
 There is also `bootstrap/`, a **separate root module with its own local state** (T-004 part 2). It creates the S3 bucket and DynamoDB table the main module's `backend "s3"` block (`providers.tf`) points at — the main module never manages the bucket it stores its own state in. See `bootstrap/README.md` for the bootstrap/apply/migrate order and the rollback procedure.
 
@@ -89,7 +91,7 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 - **No RDS — MySQL is self-hosted** on the domain-service EC2 (MySQL 8.4 container, Flyway-migrated at boot, data on a host volume). This was a deliberate move off `db.t3.micro` RDS: it removed the instance cost **and** the MySQL 8.0 Extended Support per-vCPU charge that began Aug 2026. Trade-off: no managed backups/patching/HA — durability rests on the instance's volume, and a `mysqldump→S3` job is the intended backup. A `t3.small` is recommended over `t3.micro` for the DB+app box for RAM headroom.
 - **No SSH anywhere.** Shell access is SSM Session Manager via the instance profile in `iam.tf`. Do not add port-22 ingress or key pairs back.
 - Secrets flow: values land in SSM Parameter Store (`/cv-project/<env>/…`); services read them at runtime via the instance role. Never put secrets in tfvars committed files — `terraform.tfvars` is gitignored, `.example` carries placeholders.
-- **BFF service token (T-043).** The BFF calls the domain service with a Cognito client-credentials token: `aws_cognito_user_pool_client.bff_service` (only that flow, only the `cv-domain/read` scope, 24 h access tokens), whose id, secret (SecureString), token URL and scope sit under `/cv-project/<env>/bff/*` and are read at boot by `templates/domain-service-user-data.sh`. The secret is never an output. The domain service validates the issuer only, so the read scope is not yet enforced there (T-116).
+- **BFF service token (T-043).** The BFF calls the domain service with a Cognito client-credentials token: `aws_cognito_user_pool_client.bff_service` (only that flow, only the `cv-domain/read` scope, 24 h access tokens), whose id, secret (SecureString), token URL and scope sit under `/cv-project/<env>/bff/*` and are read at boot by `templates/domain-service-provision.sh`. The secret is never an output. The domain service validates the issuer only, so the read scope is not yet enforced there (T-116).
 - **Exception: `.../deploy/drone-deploy/*` (T-008).** The drone-deploy IAM user's access key (`aws_iam_access_key.drone_deploy`, `iam.tf`) lives in SSM at `.../deploy/drone-deploy/{access-key-id,secret-access-key}`, deliberately **outside** `ci/*` and readable by **no instance role**. The CI host's role only reads `ci/*`, and the app host's role has an explicit Deny on `deploy/*`. Only an operator's own credentials read it, off-host, via `scripts/drone-reseed-secrets.sh` over an SSM port-forwarding tunnel to Drone (see `docs/runbooks/drone.md`).
 - **GitHub Actions OIDC (T-045).** `github-oidc.tf` holds the account's one `aws_iam_openid_connect_provider.github_actions` (T-203 reuses it for the BFF deploy role; add roles, not a second provider) and `public_vanilla_deploy`, a keyless role assumable only by `repo:erfeamor/cv-public-vanilla:ref:refs/heads/master` (exact `sub` + `aud`, StringEquals). It writes the frontend bucket root with an explicit Deny on `admin/*` (the live admin shares the bucket) and may only invalidate this distribution; ARN in the `public_vanilla_deploy_role_arn` output. `scripts/check-static.sh` guards the Deny and the exact trust.
 - `.terraform.lock.hcl` **is committed** (HashiCorp guidance). Provider/version bumps are their own PR.

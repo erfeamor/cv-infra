@@ -185,7 +185,7 @@ resource "aws_ssm_parameter" "github_hooks_token" {
 }
 
 # T-043: the BFF's client-credentials identity, read at boot by
-# templates/domain-service-user-data.sh. The secret is also in Terraform
+# templates/domain-service-provision.sh. The secret is also in Terraform
 # state (like the other generated secrets here); it is never an output.
 resource "aws_ssm_parameter" "bff_service_client_id" {
   name  = "/${var.project_name}/${var.environment}/bff/service-client-id"

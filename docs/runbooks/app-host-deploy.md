@@ -28,6 +28,18 @@ aws ssm get-command-invocation --region eu-west-3 --command-id "$CMD" --instance
   --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
 ```
 
+### CI deploys use documents, and so can you
+
+Since T-047 the GitHub Actions workflows (cv-domain-service, cv-bff-node) deploy with the parameterless SSM documents `cv-redeploy-domain-service` and `cv-redeploy-bff-node`, each running exactly `/usr/local/bin/cv-redeploy <svc>`, targeting the host **by tag** because it is replaced often:
+
+```bash
+aws ssm send-command --region eu-west-3 --document-name cv-redeploy-domain-service \
+  --targets Key=tag:Name,Values=cv-project-domain-service \
+  --query Command.CommandId --output text
+```
+
+Operators can send the same documents by hand (instead of `AWS-RunShellScript` above); poll with `get-command-invocation` or `list-command-invocations --command-id <id> --details`. The workflows' OIDC roles can send only their own document and only to instances tagged `Name=cv-project-domain-service`; no deploy credential exists on the CI host.
+
 Poll `get-command-invocation` until `Status` is `Success` (or `Failed`). The output contains the old and new image ids; keep them (see Rollback).
 
 ## Deploying a new image

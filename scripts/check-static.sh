@@ -138,6 +138,45 @@ else
   fi
 fi
 
+# --- 2c. CI deploy roles and SSM documents (T-047) ----------------------------
+# The documents must never declare parameters (no injection surface), and no
+# deploy role may allow ssm:SendCommand on AWS-RunShellScript or a bare "*"; the
+# instance grant must carry the ssm:resourceTag/Name condition.
+if [ ! -f ci-deploy.tf ]; then
+  bad 'ci-deploy.tf not found (T-047)'
+else
+  problems=""
+  stripped=$(sed 's/#.*//' ci-deploy.tf)
+  grep -qE '"?parameters"?[ \t]*=' <<<"$stripped" && problems="$problems document-declares-parameters"
+  grep -qE 'AWS-RunShellScript|AWS-[A-Za-z]+' <<<"$stripped" && problems="$problems references-AWS-managed-document"
+  grep -qE 'NotAction|NotResource|:\*"' <<<"$stripped" && problems="$problems wildcard-action-or-Not*"
+  # Every Resource = "*" must sit in a statement whose action is not SendCommand.
+  python3 - ci-deploy.tf <<'PY' || problems="$problems sendcommand-unscoped"
+import re, sys
+src = re.sub(r"#.*", "", open(sys.argv[1]).read())
+bad = False
+# One chunk per policy statement: split on each `Effect = "Allow"`.
+chunks = re.split(r'Effect\s*=\s*"Allow"', src)[1:]
+sends = [c for c in chunks if '"ssm:SendCommand"' in c.split("Effect")[0].split("},")[0]]
+if len(sends) != 4:  # two roles x (document, tagged instances)
+    bad = True
+for c in sends:
+    body = c.split("\n      },")[0]
+    if re.search(r'Resource\s*=\s*"\*"', body):
+        bad = True
+    if "local.app_instances_arn" in body and not re.search(r'StringEquals\s*=\s*{\s*"ssm:resourceTag/Name"\s*=\s*local\.app_host_name_tag', body):
+        bad = True
+    if "local.app_instances_arn" not in body and "aws_ssm_document.redeploy_" not in body:
+        bad = True
+sys.exit(1 if bad else 0)
+PY
+  if [ -z "$problems" ]; then
+    ok "ci-deploy.tf: documents take no parameters; SendCommand is never * or AWS-RunShellScript and instances are tag-conditioned"
+  else
+    bad "ci-deploy.tf:$problems"
+  fi
+fi
+
 # --- 3. Single-parameter ssm:GetParameter grants name one parameter --------
 # The on-demand-CI Lambdas each read exactly one parameter. Their grants must
 # reference a specific aws_ssm_parameter.<name>.arn, never a literal ARN that

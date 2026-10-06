@@ -1066,5 +1066,69 @@ class TestJenkinsReposUntouched(DoorbellTestCase):
             self.assertNotEqual(call.kwargs.get("Name"), ENV["GITHUB_HOOKS_TOKEN_PARAM"])
 
 
+# --- T-048 (RED first): a push to a Jenkins repo while the host is already
+# up is marked on the instance (CILastPush) so the reaper waits for the scan --
+
+
+class TestPushTag(DoorbellTestCase):
+    def _tag_kwargs(self):
+        self.module.ec2.create_tags.assert_called_once()
+        return self.module.ec2.create_tags.call_args.kwargs
+
+    def test_running_host_jenkins_push_is_tagged(self):
+        self.set_instance_state("running")
+        response = self.module.handler(push_event("erfeamor/cv-domain-service"), None)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(response["body"], "already running")
+        kwargs = self._tag_kwargs()
+        self.assertEqual(kwargs["Resources"], [ENV["INSTANCE_ID"]])
+        self.assertEqual(len(kwargs["Tags"]), 1)
+        self.assertEqual(kwargs["Tags"][0]["Key"], "CILastPush")
+        stamp = kwargs["Tags"][0]["Value"]
+        parsed = self.module.datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+        self.assertIsNotNone(parsed)
+        self.module.ec2.start_instances.assert_not_called()
+
+    def test_pending_host_is_tagged_too(self):
+        self.set_instance_state("pending")
+        self.module.handler(push_event("erfeamor/cv-database"), None)
+        self.module.ec2.create_tags.assert_called_once()
+
+    def test_pull_request_event_is_tagged_too(self):
+        self.set_instance_state("running")
+        event = event_with_body("erfeamor/cv-domain-service", body_extra={"action": "synchronize"}, event_type="pull_request")
+        self.module.handler(event, None)
+        self.module.ec2.create_tags.assert_called_once()
+
+    def test_redeliver_repo_is_not_tagged(self):
+        self.set_instance_state("running")
+        with mock.patch.object(self.module, "_self_invoke"):
+            self.module.handler(push_event("erfeamor/cv-admin-react"), None)
+        self.module.ec2.create_tags.assert_not_called()
+
+    def test_stopped_host_takes_the_start_path_without_a_tag(self):
+        self.set_instance_state("stopped")
+        response = self.module.handler(push_event("erfeamor/cv-domain-service"), None)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(response["body"], "starting")
+        self.module.ec2.start_instances.assert_called_once_with(InstanceIds=[ENV["INSTANCE_ID"]])
+        self.module.ec2.create_tags.assert_not_called()
+
+    def test_skipped_events_are_not_tagged(self):
+        self.set_instance_state("running")
+        self.module.handler(event_with_body("erfeamor/cv-domain-service", body_extra={"deleted": True}), None)
+        self.module.ec2.create_tags.assert_not_called()
+
+    def test_tagging_failure_does_not_change_the_response(self):
+        self.set_instance_state("running")
+        self.module.ec2.create_tags.side_effect = self.module.ClientError(
+            {"Error": {"Code": "UnauthorizedOperation", "Message": "x"}}, "CreateTags"
+        )
+        with self.assertLogs(self.module.log, level="ERROR"):
+            response = self.module.handler(push_event("erfeamor/cv-domain-service"), None)
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(response["body"], "already running")
+
+
 if __name__ == "__main__":
     unittest.main()

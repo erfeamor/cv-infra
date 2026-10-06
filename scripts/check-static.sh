@@ -204,9 +204,10 @@ else
   ok "every single-parameter ssm:GetParameter grant references a specific aws_ssm_parameter.<name>.arn"
 fi
 
-# --- 4. aws_instance.drone's ignore_changes keeps its three elements -------
+# --- 4. aws_instance.drone's ignore_changes keeps its five elements --------
 # `ami` stops AMI churn from replacing the CI host on unrelated applies;
-# the CIKeepAlive tag entries let an operator pause the reaper without drift.
+# the CIKeepAlive tag entries let an operator pause the reaper without drift;
+# the CILastPush entries (T-048) keep the doorbell's push marker from drifting.
 # Matched as exact list elements, not substrings.
 drone_block=$(extract_block '^resource[ \t]+"aws_instance"[ \t]+"drone"[ \t]*{' <ci.tf)
 lifecycle_block=$(printf '%s\n' "$drone_block" | extract_block '^[ \t]*lifecycle[ \t]*{')
@@ -218,7 +219,7 @@ else
   elements=()
   for r in "${raw[@]}"; do elements+=("$(printf '%s' "$r" | sed -e 's/^[ \t]*//' -e 's/[ \t]*$//')"); done
   missing=""
-  for want in 'ami' 'tags["CIKeepAlive"]' 'tags_all["CIKeepAlive"]'; do
+  for want in 'ami' 'tags["CIKeepAlive"]' 'tags_all["CIKeepAlive"]' 'tags["CILastPush"]' 'tags_all["CILastPush"]'; do
     hit=0
     for el in "${elements[@]}"; do [ "$el" = "$want" ] && hit=1 && break; done
     [ "$hit" -eq 0 ] && missing="$missing $want"
@@ -226,7 +227,7 @@ else
   if [ -n "$missing" ]; then
     bad "aws_instance.drone's ignore_changes is missing (as exact list elements):$missing"
   else
-    ok "aws_instance.drone's ignore_changes covers ami, tags[\"CIKeepAlive\"], tags_all[\"CIKeepAlive\"]"
+    ok "aws_instance.drone's ignore_changes covers ami and the CIKeepAlive and CILastPush tags"
   fi
 fi
 
@@ -613,6 +614,24 @@ if [ -n "$missing" ]; then
   bad "aws_instance.domain_service depends_on is missing:$missing (T-044)"
 else
   ok "aws_instance.domain_service depends_on its S3 provisioning script, SSM hash and read grant (T-044)"
+fi
+
+# --- 19. The doorbell's tagging grant stays on the CI instance, one tag key -
+# T-048: ec2:CreateTags must be scoped to local.ci_instance_arn and carry
+# the local.ci_doorbell_tag_condition (ForAllValues aws:TagKeys), and no
+# other statement in the doorbell's policy may grant a tag action. The
+# Resource is computed, so terraform test cannot see it.
+doorbell_policy=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"ci_doorbell"[ \t]*{' <ci-on-demand.tf | sed 's/#.*//')
+tag_stmt=$(printf '%s\n' "$doorbell_policy" | tr '\n' ' ' | grep -Eo '\{[^{}]*local\.ci_doorbell_tag_actions[^{}]*\}' || true)
+if [ -z "$tag_stmt" ]; then
+  bad "the ci_doorbell policy has no statement using local.ci_doorbell_tag_actions (T-048)"
+elif ! printf '%s' "$tag_stmt" | grep -Eq 'Resource[ \t]*=[ \t]*local\.ci_instance_arn[ \t]' ||
+  ! printf '%s' "$tag_stmt" | grep -Eq 'Condition[ \t]*=[ \t]*local\.ci_doorbell_tag_condition'; then
+  bad "the doorbell's tagging statement must use Resource = local.ci_instance_arn and Condition = local.ci_doorbell_tag_condition (T-048)"
+elif printf '%s\n' "$doorbell_policy" | grep -Eq 'ec2:(\*|CreateTags|DeleteTags)'; then
+  bad "the ci_doorbell policy names an ec2 tag action inline; tag grants must go through local.ci_doorbell_tag_actions (T-048)"
+else
+  ok "the doorbell's ec2:CreateTags is scoped to the CI instance and the CILastPush tag key (T-048)"
 fi
 
 exit $fail

@@ -70,6 +70,11 @@ DNS_SENTINEL_IP = os.environ.get("DNS_SENTINEL_IP", "192.0.2.1")
 CPU_BUSY_PERCENT = float(os.environ.get("CPU_BUSY_PERCENT", "10"))
 KEEPALIVE_TAG = os.environ.get("KEEPALIVE_TAG", "CIKeepAlive")
 POST_START_GRACE_MINUTES = int(os.environ.get("POST_START_GRACE_MINUTES", "15"))
+# T-048: the doorbell stamps this tag when a push lands on an already-running
+# host; Jenkins only finds it on its next 5-minute scan, so the host must not be
+# stopped until PUSH_GRACE_MINUTES have passed.
+PUSH_TAG = os.environ.get("PUSH_TAG", "CILastPush")
+PUSH_GRACE_MINUTES = int(os.environ.get("PUSH_GRACE_MINUTES", "10"))
 HTTP_TIMEOUT_SECONDS = 5
 
 _password_cache = None
@@ -155,6 +160,23 @@ def within_post_start_grace(launch_time, grace_minutes, now=None):
     return now < launch_time + datetime.timedelta(minutes=grace_minutes)
 
 
+def within_push_grace(last_push, grace_minutes, now=None):
+    """True while now is within grace_minutes after last_push (a datetime).
+    A timestamp in the future never counts, so a bad clock or hand-edited
+    tag cannot hold the host up forever. now is injectable for tests."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return last_push <= now < last_push + datetime.timedelta(minutes=grace_minutes)
+
+
+def _parse_push_tag(raw):
+    """The tag's datetime, or None (with a warning) if it is malformed."""
+    try:
+        return datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        log.warning("ignoring malformed %s tag value %r", PUSH_TAG, raw)
+        return None
+
+
 def _upsert_dns_sentinel():
     """Best-effort: right after stopping the instance, UPSERT CI_HOSTNAME to
     DNS_SENTINEL_IP (review round 2, finding 2(a)). This covers a GRACEFUL
@@ -215,6 +237,18 @@ def handler(event, context):
         # docstring. A boot-time CPU datapoint must never count as "idle".
         log.info("within %d-minute post-start grace; leaving instance running", POST_START_GRACE_MINUTES)
         return {"stopped": False, "reason": "post-start grace"}
+
+    if PUSH_TAG in tags:
+        last_push = _parse_push_tag(tags[PUSH_TAG])
+        if last_push is not None and within_push_grace(last_push, PUSH_GRACE_MINUTES):
+            # T-048: a push reached the doorbell while the host was already up;
+            # Jenkins finds it on its next scan, which may not have run yet.
+            log.info(
+                "within %d-minute push grace (last push %s); leaving instance running",
+                PUSH_GRACE_MINUTES,
+                tags[PUSH_TAG],
+            )
+            return {"stopped": False, "reason": "push grace"}
 
     if not cpu_quiet_over_window():
         return {"stopped": False, "reason": "cpu busy"}

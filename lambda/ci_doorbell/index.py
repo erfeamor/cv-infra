@@ -146,6 +146,10 @@ ALLOWED_REPOS = {r.strip() for r in os.environ.get("ALLOWED_REPOS", "").split(",
 # (ruling 1) and have no per-repo secret a redelivery would even need to
 # thread past. Also the async task's re-validated allowlist (see module
 # docstring, review round 1 finding 1) -- not just the webhook entry point's.
+# T-048: operational tag the doorbell stamps on an already-up host when a push
+# to a Jenkins repo arrives; the reaper then holds off stopping it. See
+# _mark_push_on_running_host.
+PUSH_TAG = os.environ.get("PUSH_TAG", "CILastPush")
 REDELIVER_REPOS = {r.strip() for r in os.environ.get("REDELIVER_REPOS", "").split(",") if r.strip()}
 
 # T-042: Drone and Jenkins only ever build a pull_request on these actions --
@@ -660,6 +664,22 @@ def wait_for_dns_to_match_instance(
         sleep_fn(poll_interval_seconds)
 
 
+def _mark_push_on_running_host(repo):
+    """T-048: Jenkins only discovers pushes by scanning (every 5 min, and on
+    boot), and the doorbell no-ops on an already-up host -- so the reaper could
+    stop an idle host between the push and the next scan. Stamp the instance
+    with the push time; the reaper holds off for PUSH_GRACE_MINUTES.
+
+    Best-effort by design: a tagging failure is logged and never changes the
+    webhook's answer."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        ec2.create_tags(Resources=[INSTANCE_ID], Tags=[{"Key": PUSH_TAG, "Value": stamp}])
+        log.info("tagged %s %s=%s for push to %s", INSTANCE_ID, PUSH_TAG, stamp, repo)
+    except ClientError:
+        log.exception("could not tag %s with %s for push to %s (ignored)", INSTANCE_ID, PUSH_TAG, repo)
+
+
 def _start_instance_if_stopped(repo):
     """The pre-T-034 synchronous behaviour, unchanged: still used directly by
     the Jenkins-repo webhook path. NOT used by the async task any more --
@@ -668,6 +688,11 @@ def _start_instance_if_stopped(repo):
     state = _describe_instance_state()
     if state is None:
         return None
+
+    if state in ("running", "pending") and repo not in REDELIVER_REPOS:
+        # A Jenkins repo (REDELIVER_REPOS are Drone's, which gets a webhook
+        # delivery directly): record the push for the reaper.
+        _mark_push_on_running_host(repo)
 
     if state == "running":
         log.info("%s already running for %s; nothing to do", INSTANCE_ID, repo)

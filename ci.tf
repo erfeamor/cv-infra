@@ -118,7 +118,7 @@ resource "aws_instance" "drone" {
   # `root_block_device` -- a `volume_size` change alone is not (EBS volumes
   # can grow in place via ModifyVolume; a decrease specifically would just
   # fail at apply against the real API, not plan a replace). `ignore_changes`
-  # below covers only `ami` and the CIKeepAlive tags -- it does NOT cover
+  # below covers only `ami` and the CIKeepAlive/CILastPush tags -- it does NOT cover
   # `encrypted`, so once this PR's config lands, even a PLAIN `terraform
   # plan` (no `-replace` needed at all) already proposes replacing this
   # instance, because the live instance's actual root (30 GB, unencrypted --
@@ -232,8 +232,13 @@ resource "aws_instance" "drone" {
   # here, the next `terraform apply` silently strips it and the box starts
   # getting stopped mid-demo, which is precisely when nobody is watching a plan.
   # Found by stage-4 drift check, which flagged the tag as pending removal.
+  #
+  # T-048: CILastPush is the same kind of tag, but written by the doorbell
+  # Lambda (on a push to a Jenkins repo while the host is up) and read by the
+  # reaper, which then leaves the host running for PUSH_GRACE_MINUTES. Same
+  # drift reasoning: an apply must not strip it.
   lifecycle {
-    ignore_changes = [ami, tags["CIKeepAlive"], tags_all["CIKeepAlive"]]
+    ignore_changes = [ami, tags["CIKeepAlive"], tags_all["CIKeepAlive"], tags["CILastPush"], tags_all["CILastPush"]]
   }
 
   tags = {

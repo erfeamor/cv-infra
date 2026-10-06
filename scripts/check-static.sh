@@ -634,4 +634,46 @@ else
   ok "the doorbell's ec2:CreateTags is scoped to the CI instance and the CILastPush tag key (T-048)"
 fi
 
+# --- 20. The app host's SSM read is an exact list covering what it reads --
+# T-005: aws_iam_role_policy.read_parameters Allows an enumerated set of
+# parameter ARNs (iam.tf local app_host_ssm_parameter_names), never a
+# project-wide wildcard, and every `param <path>` / `get-parameter --name`
+# in the two app-host templates must be in that set -- a missed path breaks
+# the next boot. Grep-based cross-check; the bff-node/domain-service
+# redeploy path reads through the same cv-app.sh library.
+app_policy=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"read_parameters"[ \t]*{' <iam.tf)
+allow_stmt=$(printf '%s\n' "$app_policy" | tr '\n' ' ' | grep -Eo '\{[^{}]*Effect[ \t]*=[ \t]*"Allow"[^{}]*\}' || true)
+names_block=$(sed 's/#.*//' iam.tf | awk '/app_host_ssm_parameter_names[ \t]*=[ \t]*\[/ {f=1} f {print} f && /\]/ {exit}')
+if [ -z "$allow_stmt" ] || [ -z "$names_block" ]; then
+  bad "cannot find read_parameters' Allow statement or local.app_host_ssm_parameter_names in iam.tf (T-005)"
+elif ! printf '%s' "$allow_stmt" | grep -Eq 'Resource[ \t]*=[ \t]*local\.app_host_ssm_parameter_arns[ \t]' ||
+  printf '%s' "$allow_stmt" | grep -Eq '\*|GetParametersByPath'; then
+  bad "read_parameters' Allow must use Resource = local.app_host_ssm_parameter_arns, with no wildcard and no GetParametersByPath (T-005)"
+else
+  # resource addresses in the names list -> their `name` suffix in *.tf
+  covered=""
+  for addr in $(printf '%s\n' "$names_block" | grep -Eo 'aws_ssm_parameter\.[a-z0-9_]+'); do
+    res=${addr#aws_ssm_parameter.}
+    path=$(awk -v r="$res" '$0 ~ "resource \"aws_ssm_parameter\" \""r"\"" {f=1} f && /name[ \t]*=/ {print; f=0}' *.tf | head -n1 | sed -E 's|.*\$\{var\.environment\}/||; s|".*||')
+    covered="$covered $path"
+  done
+  needed=$(
+    {
+      grep -hEo '\$\(param [a-z0-9/_-]+\)' templates/domain-service-provision.sh | sed -E 's/^\$\(param //; s/\)$//'
+      grep -hEo -- '--name "/\$\{project_name\}/\$\{environment\}/[a-z0-9/_-]+"' templates/domain-service-provision.sh templates/domain-service-bootstrap.sh | sed -E 's|.*\$\{environment\}/||; s|"$||'
+    } | sort -u
+  )
+  missing=""
+  for n in $needed; do
+    case " $covered " in *" $n "*) ;; *) missing="$missing $n" ;; esac
+  done
+  if [ -z "$needed" ]; then
+    bad "found no SSM reads in the app-host templates -- the cross-check pattern is stale (T-005)"
+  elif [ -n "$missing" ]; then
+    bad "app-host templates read SSM parameters not in read_parameters' Allow:$missing (T-005)"
+  else
+    ok "read_parameters Allows an exact list (no wildcard) covering every app-host SSM read: $(echo $needed) (T-005)"
+  fi
+fi
+
 exit $fail

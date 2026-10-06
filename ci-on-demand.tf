@@ -55,6 +55,18 @@ locals {
   # public unauthenticated endpoint should be able to do it.
   ci_doorbell_ec2_actions = ["ec2:StartInstances"]
   ci_reaper_ec2_actions   = ["ec2:StopInstances"]
+
+  # T-048: the doorbell stamps this operational tag on an already-running CI
+  # host when a push to a Jenkins repo arrives (Jenkins only finds it on its
+  # next scan); the reaper reads it from DescribeInstances (no new grant) and
+  # holds off stopping. The grant is CreateTags on the CI instance only, and
+  # only for this one tag key -- a compromised doorbell cannot retag anything
+  # else (e.g. clear CIKeepAlive or touch Name).
+  ci_push_tag_key         = "CILastPush"
+  ci_doorbell_tag_actions = ["ec2:CreateTags"]
+  ci_doorbell_tag_condition = {
+    "ForAllValues:StringEquals" = { "aws:TagKeys" = [local.ci_push_tag_key] }
+  }
   ci_forbidden_ec2_actions = [
     "ec2:TerminateInstances",
     "ec2:ModifyInstanceAttribute",
@@ -240,6 +252,14 @@ resource "aws_iam_role_policy" "ci_doorbell" {
         Resource = local.ci_instance_arn
       },
       {
+        # T-048: stamp CILastPush on the CI instance (only), for that tag key
+        # (only) -- see local.ci_push_tag_key.
+        Effect    = "Allow"
+        Action    = local.ci_doorbell_tag_actions
+        Resource  = local.ci_instance_arn
+        Condition = local.ci_doorbell_tag_condition
+      },
+      {
         # ec2:DescribeInstances has no resource-level permissions in IAM — it
         # is "*" or nothing. Read-only and account-scoped; noted rather than
         # left looking like carelessness.
@@ -314,6 +334,7 @@ resource "aws_lambda_function" "ci_doorbell" {
       WEBHOOK_SECRET_PARAM          = aws_ssm_parameter.github_webhook_secret.name
       ALLOWED_REPOS                 = join(",", local.ci_allowed_repos)
       REDELIVER_REPOS               = join(",", local.ci_redeliver_repos)
+      PUSH_TAG                      = local.ci_push_tag_key
       GITHUB_HOOKS_TOKEN_PARAM      = aws_ssm_parameter.github_hooks_token.name
       CI_HOSTNAME                   = local.ci_public_host
       ROUTE53_ZONE_ID               = data.aws_route53_zone.ci.zone_id
@@ -514,6 +535,10 @@ resource "aws_lambda_function" "ci_reaper" {
       # POST_START_GRACE_MINUTES has a hardcoded "15" fallback, which meant
       # the variable silently did nothing.
       POST_START_GRACE_MINUTES = tostring(var.ci_post_start_grace_minutes)
+      # T-048: don't stop the host for this long after the doorbell stamped a
+      # push on it (Jenkins scans every 5 minutes; two scan periods of slack).
+      PUSH_TAG           = local.ci_push_tag_key
+      PUSH_GRACE_MINUTES = "10"
       # Review round 2, finding 2(a): the DNS sentinel UPSERT after stopping.
       CI_HOSTNAME     = local.ci_public_host
       ROUTE53_ZONE_ID = data.aws_route53_zone.ci.zone_id

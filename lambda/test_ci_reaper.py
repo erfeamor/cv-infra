@@ -29,6 +29,7 @@ ENV = {
     "IDLE_WINDOW_MINUTES": "20",
     "CPU_BUSY_PERCENT": "10",
     "POST_START_GRACE_MINUTES": "15",
+    "PUSH_GRACE_MINUTES": "10",
     "CI_HOSTNAME": "ci.erfeamor.com",
     "ROUTE53_ZONE_ID": "Z0608270B7WND031GVOW",
 }
@@ -140,6 +141,55 @@ class TestDnsSentinelOnStop(ReaperTestCase):
         with mock.patch.object(self.module, "cpu_quiet_over_window", return_value=False):
             self.module.handler({}, None)
         self.module.route53.change_resource_record_sets.assert_not_called()
+
+
+# --- T-048 (RED first): CILastPush, written by the doorbell, holds the stop --
+
+
+class TestPushGrace(ReaperTestCase):
+    def _run(self, tags):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.set_instance(instance(launch_time=now - datetime.timedelta(hours=2), tags=tags))
+        with mock.patch.object(self.module, "cpu_quiet_over_window", return_value=True), mock.patch.object(
+            self.module, "jenkins_is_idle", return_value=True
+        ):
+            return self.module.handler({}, None)
+
+    @staticmethod
+    def _push_tag(minutes_ago):
+        ts = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes_ago)
+        return [{"Key": "CILastPush", "Value": ts.strftime("%Y-%m-%dT%H:%M:%SZ")}]
+
+    def test_recent_push_keeps_the_instance_up(self):
+        with self.assertLogs(self.module.log, level="INFO") as logs:
+            result = self._run(self._push_tag(3))
+        self.assertEqual(result, {"stopped": False, "reason": "push grace"})
+        self.module.ec2.stop_instances.assert_not_called()
+        self.assertTrue(any("within 10-minute push grace (last push " in m and "leaving instance running" in m for m in logs.output))
+
+    def test_old_push_does_not_block_a_normal_stop(self):
+        result = self._run(self._push_tag(11))
+        self.assertEqual(result, {"stopped": True, "reason": "idle"})
+
+    def test_no_tag_is_unaffected(self):
+        self.assertEqual(self._run([]), {"stopped": True, "reason": "idle"})
+
+    def test_malformed_tag_warns_and_is_ignored(self):
+        with self.assertLogs(self.module.log, level="WARNING") as logs:
+            result = self._run([{"Key": "CILastPush", "Value": "not-a-timestamp"}])
+        self.assertEqual(result, {"stopped": True, "reason": "idle"})
+        self.assertTrue(any("CILastPush" in m for m in logs.output))
+
+    def test_future_timestamp_does_not_block_forever(self):
+        result = self._run(self._push_tag(-600))
+        self.assertEqual(result, {"stopped": True, "reason": "idle"})
+
+    def test_within_push_grace_takes_an_injectable_now(self):
+        last = datetime.datetime(2026, 10, 6, 10, 0, tzinfo=datetime.timezone.utc)
+        inside = last + datetime.timedelta(minutes=9, seconds=59)
+        outside = last + datetime.timedelta(minutes=10)
+        self.assertTrue(self.module.within_push_grace(last, 10, now=inside))
+        self.assertFalse(self.module.within_push_grace(last, 10, now=outside))
 
 
 if __name__ == "__main__":

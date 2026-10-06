@@ -13,7 +13,9 @@ Drone runs on the CI host (`aws_instance.drone`, `../../ci.tf`) as `drone-server
 
 ## Before any host-up session: pause the reaper without drift
 
-The reaper Lambda stops an idle CI host every 5 minutes, with no grace after a start, and it can't see Drone. Pause it with the instance's `CIKeepAlive` tag. That tag is in `aws_instance.drone`'s `ignore_changes`, so Terraform never plans against it. **Don't disable the EventBridge rule**: it's Terraform-managed, so that shows as drift.
+The reaper Lambda stops an idle CI host every 5 minutes, with a 15-minute post-start grace (and the push grace below), and it can't see Drone. Pause it with the instance's `CIKeepAlive` tag. That tag is in `aws_instance.drone`'s `ignore_changes`, so Terraform never plans against it. **Don't disable the EventBridge rule**: it's Terraform-managed, so that shows as drift.
+
+**Push grace (T-048).** Jenkins only finds a push by scanning (every 5 minutes, and on boot), and the doorbell does nothing about a host that is already up. So when a push to a Jenkins repo (cv-domain-service, cv-database) arrives while the host is `running` or `pending`, the doorbell stamps the instance with the operational tag `CILastPush=<UTC ISO-8601>`, and the reaper leaves the host running while `now - CILastPush < PUSH_GRACE_MINUTES` (10), logging `within 10-minute push grace (last push <ts>); leaving instance running`. Like `CIKeepAlive`, `CILastPush` is operational: it is in `ignore_changes`, you don't set it by hand, and a missing, malformed (logged, ignored) or future-dated value has no effect. A stopped host is woken as before and needs no tag. The doorbell's grant is `ec2:CreateTags` on the CI instance only, for the `CILastPush` key only; a tagging failure never changes the webhook's response.
 
 ```bash
 I=$(terraform state show -no-color aws_instance.drone | awk -F'"' '/^ *id *=/{print $2; exit}')

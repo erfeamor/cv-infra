@@ -3162,3 +3162,51 @@ run "t047_ci_deploy_roles" {
     error_message = "T-047 outputs: both role ARNs and both document names"
   }
 }
+
+# --- T-048: the doorbell marks a push on an already-running CI host -------
+# The policy JSON embeds the computed instance ARN, so (as for the other CI
+# grants) the security-relevant pieces are named locals asserted here; the
+# Resource scoping and ignore_changes are guarded by scripts/check-static.sh.
+run "t048_push_tag" {
+  command = plan
+
+  assert {
+    condition     = local.ci_push_tag_key == "CILastPush"
+    error_message = "The push-marker tag key must be CILastPush (the operational tag the reaper reads)"
+  }
+
+  assert {
+    condition     = join(",", local.ci_doorbell_tag_actions) == "ec2:CreateTags"
+    error_message = "The doorbell's tagging grant must be ec2:CreateTags and nothing else (no DeleteTags, no wildcard)"
+  }
+
+  assert {
+    condition     = jsonencode(local.ci_doorbell_tag_condition) == jsonencode({ "ForAllValues:StringEquals" = { "aws:TagKeys" = ["CILastPush"] } })
+    error_message = "ec2:CreateTags must be conditioned on ForAllValues:StringEquals aws:TagKeys = [CILastPush] and nothing else -- the doorbell may stamp that one tag key, never any other"
+  }
+
+  assert {
+    condition     = length(setintersection(local.ci_doorbell_tag_actions, local.ci_forbidden_ec2_actions)) == 0
+    error_message = "The doorbell's tag grant intersects the forbidden destructive set"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["PUSH_TAG"] == local.ci_push_tag_key
+    error_message = "PUSH_TAG must be wired to the doorbell from local.ci_push_tag_key"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["PUSH_TAG"] == local.ci_push_tag_key
+    error_message = "PUSH_TAG must be wired to the reaper from local.ci_push_tag_key (same key the doorbell writes)"
+  }
+
+  assert {
+    condition     = aws_lambda_function.ci_reaper.environment[0].variables["PUSH_GRACE_MINUTES"] == "10"
+    error_message = "PUSH_GRACE_MINUTES must be 10 on the reaper (T-048 H1)"
+  }
+
+  assert {
+    condition     = join(",", local.ci_reaper_ec2_actions) == "ec2:StopInstances"
+    error_message = "The reaper needs no new EC2 grant for T-048: it reads CILastPush from DescribeInstances"
+  }
+}

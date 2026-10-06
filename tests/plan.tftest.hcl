@@ -3214,6 +3214,118 @@ run "t047_ci_deploy_roles" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# T-049: the cv-database migrate role and its parameterless SSM document. Plan
+# only (no apply), scoped by plan_options.target so nothing else is reached.
+# The policy JSON embeds the own-document ARN (computed, unknown at plan), so
+# the other two statements are asserted through their named local;
+# scripts/check-static.sh 2c guards the document statement and the policy as a
+# whole (no ecr) against the source.
+# ---------------------------------------------------------------------------
+run "t049_database_migrate" {
+  command = plan
+
+  plan_options {
+    target = [
+      aws_iam_role.database_migrate,
+      aws_iam_role_policy.database_migrate,
+      aws_ssm_document.redeploy_migrate,
+      output.database_migrate_document,
+    ]
+  }
+
+  # --- the document ---
+  assert {
+    condition = (
+      aws_ssm_document.redeploy_migrate.name == "cv-redeploy-migrate" &&
+      aws_ssm_document.redeploy_migrate.document_type == "Command" &&
+      aws_ssm_document.redeploy_migrate.document_format == "JSON" &&
+      jsondecode(aws_ssm_document.redeploy_migrate.content).schemaVersion == "2.2" &&
+      !contains(keys(jsondecode(aws_ssm_document.redeploy_migrate.content)), "parameters") &&
+      length(jsondecode(aws_ssm_document.redeploy_migrate.content).mainSteps) == 1 &&
+      jsondecode(aws_ssm_document.redeploy_migrate.content).mainSteps[0].action == "aws:runShellScript" &&
+      jsondecode(aws_ssm_document.redeploy_migrate.content).mainSteps[0].inputs.runCommand == ["/usr/local/bin/cv-redeploy migrate"] &&
+      jsondecode(aws_ssm_document.redeploy_migrate.content).mainSteps[0].inputs.timeoutSeconds == "600" &&
+      aws_ssm_document.redeploy_migrate.tags["Project"] == var.project_name
+    )
+    error_message = "document cv-redeploy-migrate must be schema 2.2, take no parameters, and run exactly /usr/local/bin/cv-redeploy migrate (T-049)"
+  }
+
+  # --- trust ---
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role.database_migrate.assume_role_policy).Statement) == 1 &&
+      jsondecode(aws_iam_role.database_migrate.assume_role_policy).Statement[0].Effect == "Allow" &&
+      jsondecode(aws_iam_role.database_migrate.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" &&
+      jsondecode(aws_iam_role.database_migrate.assume_role_policy).Statement[0].Principal == {
+        Federated = aws_iam_openid_connect_provider.github_actions.arn
+      }
+    )
+    error_message = "migrate role must trust only sts:AssumeRoleWithWebIdentity from the GitHub OIDC provider (T-049)"
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_iam_role.database_migrate.assume_role_policy).Statement[0].Condition == {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:erfeamor/cv-database:ref:refs/heads/master"
+        }
+      }
+    )
+    error_message = "migrate trust must be exactly StringEquals aud=sts.amazonaws.com and sub=repo:erfeamor/cv-database:ref:refs/heads/master (T-049)"
+  }
+
+  assert {
+    condition     = aws_iam_role.database_migrate.name == "${var.project_name}-database-migrate" && aws_iam_role.database_migrate.max_session_duration == 3600
+    error_message = "migrate role name must be <project>-database-migrate with a 1 h session (T-049)"
+  }
+
+  # --- permissions: SSM only, no ECR ---
+  assert {
+    condition     = length(local.database_migrate_known_statements) == 2 && alltrue([for s in local.database_migrate_known_statements : s.Effect == "Allow" && !contains(keys(s), "NotAction") && !contains(keys(s), "NotResource")])
+    error_message = "migrate: the instance-send and invocation-read statements must be plain Allows (T-049)"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in local.database_migrate_known_statements :
+      alltrue([for a in flatten([s.Action]) : startswith(a, "ssm:") && a != "ssm:*" && !endswith(a, ":*")])
+    ])
+    error_message = "migrate policy: only ssm: actions (no ecr:, no wildcards) (T-049)"
+  }
+
+  assert {
+    condition = length([
+      for s in local.database_migrate_known_statements : s
+      if flatten([s.Action]) == ["ssm:SendCommand"] && flatten([s.Resource]) == ["arn:aws:ec2:${var.aws_region}:123456789012:instance/*"] &&
+      lookup(s, "Condition", null) == { StringEquals = { "ssm:resourceTag/Name" = "${var.project_name}-domain-service" } }
+    ]) == 1
+    error_message = "migrate role must ssm:SendCommand on instance/* only under StringEquals ssm:resourceTag/Name = <project>-domain-service (T-049)"
+  }
+
+  assert {
+    condition = length([for s in local.database_migrate_known_statements : s if contains(flatten([s.Action]), "ssm:SendCommand")]) == 1 && alltrue([
+      for s in local.database_migrate_known_statements :
+      contains(flatten([s.Action]), "ssm:SendCommand") ? (!contains(flatten([s.Resource]), "*") && contains(keys(s), "Condition")) : true
+    ])
+    error_message = "migrate: the instance SendCommand statement must be conditioned and never on * (T-049)"
+  }
+
+  assert {
+    condition = contains([
+      for s in local.database_migrate_known_statements :
+      jsonencode({ Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
+    ], jsonencode({ Action = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"], Resource = ["*"] }))
+    error_message = "migrate must read invocations with ssm:GetCommandInvocation and ssm:ListCommandInvocations on * (T-049)"
+  }
+
+  assert {
+    condition     = output.database_migrate_document == "cv-redeploy-migrate"
+    error_message = "database_migrate_document output must be the document name (T-049)"
+  }
+}
+
 # --- T-048: the doorbell marks a push on an already-running CI host -------
 # The policy JSON embeds the computed instance ARN, so (as for the other CI
 # grants) the security-relevant pieces are named locals asserted here; the

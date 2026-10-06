@@ -158,7 +158,7 @@ bad = False
 # One chunk per policy statement: split on each `Effect = "Allow"`.
 chunks = re.split(r'Effect\s*=\s*"Allow"', src)[1:]
 sends = [c for c in chunks if '"ssm:SendCommand"' in c.split("Effect")[0].split("},")[0]]
-if len(sends) != 4:  # two roles x (document, tagged instances)
+if len(sends) != 6:  # three roles x (document, tagged instances)
     bad = True
 for c in sends:
     body = c.split("\n      },")[0]
@@ -170,8 +170,44 @@ for c in sends:
         bad = True
 sys.exit(1 if bad else 0)
 PY
+  # T-049: the migrate role gets no ECR at all, and its trust is exactly
+  # StringEquals aud + sub = cv-database master; its own document is the only
+  # document it may send.
+  python3 - ci-deploy.tf <<'PY' || problems="$problems migrate-role-shape"
+import re, sys
+src = re.sub(r"#.*", "", open(sys.argv[1]).read())
+def block(kind, name):
+    m = re.search(r'resource\s+"%s"\s+"%s"\s*{' % (kind, name), src)
+    if not m:
+        return None
+    i, depth = m.end(), 1
+    while depth and i < len(src):
+        depth += {"{": 1, "}": -1}.get(src[i], 0)
+        i += 1
+    return src[m.start():i]
+role = block("aws_iam_role", "database_migrate")
+pol = block("aws_iam_role_policy", "database_migrate")
+doc = block("aws_ssm_document", "redeploy_migrate")
+# The policy's statements are split between the resource and a named local.
+loc = re.search(r'database_migrate_known_statements\s*=\s*\[.*?\n  \]\n', src, re.S)
+bad = not (role and pol and doc and loc)
+if loc:
+    pol = pol + loc.group(0)
+if not bad:
+    if re.search(r'ecr|ECR', pol):
+        bad = True
+    if "aws_ssm_document.redeploy_migrate.arn" not in pol or re.search(r"aws_ssm_document\.redeploy_(?!migrate)", pol):
+        bad = True
+    if not re.search(r'StringEquals\s*=\s*{\s*"token\.actions\.githubusercontent\.com:aud"\s*=\s*"sts\.amazonaws\.com"\s*"token\.actions\.githubusercontent\.com:sub"\s*=\s*"repo:\${local\.github_org}/cv-database:ref:refs/heads/master"\s*}', role):
+        bad = True
+    if re.search(r'StringLike|ForAnyValue|ForAllValues', role):
+        bad = True
+    if '"/usr/local/bin/cv-redeploy migrate"' not in doc:
+        bad = True
+sys.exit(1 if bad else 0)
+PY
   if [ -z "$problems" ]; then
-    ok "ci-deploy.tf: documents take no parameters; SendCommand is never * or AWS-RunShellScript and instances are tag-conditioned"
+    ok "ci-deploy.tf: documents take no parameters; SendCommand is never * or AWS-RunShellScript and instances are tag-conditioned; the migrate role has no ECR and an exact cv-database master trust"
   else
     bad "ci-deploy.tf:$problems"
   fi

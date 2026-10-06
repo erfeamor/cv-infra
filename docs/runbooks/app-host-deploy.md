@@ -38,6 +38,14 @@ aws ssm send-command --region eu-west-3 --document-name cv-redeploy-domain-servi
   --query Command.CommandId --output text
 ```
 
+Since T-049 cv-database's workflow (T-158) applies production migrations the same way with `cv-redeploy-migrate` (no parameters, runs exactly `/usr/local/bin/cv-redeploy migrate`), through the role `cv-project-database-migrate` (OIDC, `cv-database` master only; its ARN is the `database_migrate_role_arn` output, set as cv-database's repo variable `AWS_DEPLOY_ROLE_ARN`). That role has no ECR access and can send only its own document, to the tagged app host only:
+
+```bash
+aws ssm send-command --region eu-west-3 --document-name cv-redeploy-migrate \
+  --targets Key=tag:Name,Values=cv-project-domain-service \
+  --query Command.CommandId --output text
+```
+
 Operators can send the same documents by hand (instead of `AWS-RunShellScript` above); poll with `get-command-invocation` or `list-command-invocations --command-id <id> --details`. The workflows' OIDC roles can send only their own document and only to instances tagged `Name=cv-project-domain-service`; no deploy credential exists on the CI host.
 
 Poll `get-command-invocation` until `Status` is `Success` (or `Failed`). The output contains the old and new image ids; keep them (see Rollback).
@@ -56,6 +64,8 @@ Poll `get-command-invocation` until `Status` is `Success` (or `Failed`). The out
 ## A schema change
 
 Hibernate validates the schema at startup, so the order is fixed: **migrate first, then the domain service.**
+
+**Ordering rule (T-049/T-158):** a schema change merges in `cv-database` **first**, and its migrate run (the cv-database workflow, document `cv-redeploy-migrate`) must be **green** before the `cv-domain-service` change that needs it merges. The domain service runs Hibernate `ddl-auto: validate` and its master push deploys itself, so merging it first deploys an image that fails to start and takes the API down. There is no cross-repo guard; the order is a rule.
 
 1. Merge the migration to `cv-database` master (the host pulls master).
 2. `cv-redeploy migrate`. It is a no-op when the schema is current (Flyway reports "Schema is up to date").

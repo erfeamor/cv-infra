@@ -1772,7 +1772,7 @@ run "drone_deploy_credentials" {
     condition = alltrue([
       for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
       s.Effect == "Deny" || (
-        !anytrue([for r in flatten([s.Resource]) : strcontains(r, "*")]) &&
+        !anytrue([for r in flatten([try(s.Resource, [])]) : strcontains(r, "*")]) &&
         !contains(s.Action, "ssm:GetParametersByPath")
       )
     ])
@@ -1782,9 +1782,45 @@ run "drone_deploy_credentials" {
   assert {
     condition = anytrue([
       for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
-      s.Effect == "Deny" && contains(s.Action, "ssm:GetParameter") && s.Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
+      s.Effect == "Deny" && contains(s.Action, "ssm:GetParameter") && try(s.Resource, "") == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
     ])
     error_message = "aws_iam_role_policy.read_parameters must explicit-Deny ssm:GetParameter* on the deploy/ prefix -- otherwise the app host's own role (IMDSv1, no metadata_options) can read the frontend deploy key via an SSRF/RCE in the domain service (T-008 security review round 2)"
+  }
+
+  # T-005 round 1: AmazonSSMManagedInstanceCore (attached to both roles) grants
+  # ssm:GetParameter(s) on "*", so the inline Allows alone narrow nothing.
+  # Each role therefore carries an explicit Deny + NotResource on the four
+  # read actions: everything outside the role's own parameter set is denied.
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
+      s.Effect == "Deny" && try(s.Resource, null) == null &&
+      toset(s.Action) == toset(["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory"]) &&
+      toset(flatten([try(s.NotResource, [])])) == toset([
+        for p in ["app/provision-sha256", "db/password", "cognito/issuer-uri", "bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope"] :
+        "arn:aws:ssm:${var.aws_region}:123456789012:parameter/${var.project_name}/${var.environment}/${p}"
+      ])
+    ])
+    error_message = "read_parameters must Deny the four ssm read actions with NotResource = exactly the app host's 7 parameter ARNs (the managed AmazonSSMManagedInstanceCore grants GetParameter on * otherwise) (T-005 round 1)"
+  }
+
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement :
+      s.Effect == "Deny" && try(s.Resource, null) == null &&
+      toset(s.Action) == toset(["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory"]) &&
+      toset(flatten([try(s.NotResource, [])])) == toset(["arn:aws:ssm:${var.aws_region}:123456789012:parameter/${var.project_name}/${var.environment}/ci/*"])
+    ])
+    error_message = "drone_read_ci_parameters must Deny the four ssm read actions with NotResource = exactly the ci/* parameter ARN (T-005 round 1)"
+  }
+
+  # No Allow was widened by the fix: the CI host's Allow stays ci/* only.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement :
+      s.Effect == "Deny" || try(s.Resource, "") == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
+    ])
+    error_message = "drone_read_ci_parameters Allow must stay ci/* only (T-005 round 1)"
   }
 
   # Ties the Deny's literal Resource pattern to the REAL parameter names

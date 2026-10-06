@@ -44,6 +44,13 @@ resource "aws_iam_role_policy_attachment" "ecr_read" {
 #
 # The explicit Deny on `deploy/*` (T-008) stays as defense in depth; IAM
 # evaluates an explicit Deny before any Allow.
+#
+# AmazonSSMManagedInstanceCore (attached above, needed for Session Manager and
+# Run Command) itself grants ssm:GetParameter(s) on "*", so the Allow above
+# narrows nothing on its own. The Deny + NotResource below is what actually
+# limits the role: every read of a parameter outside the list is denied
+# (T-005 round 1). Do not detach the managed policy; the agent needs its
+# other actions.
 locals {
   app_host_ssm_parameter_names = [
     aws_ssm_parameter.app_host_provision_sha256.name,
@@ -59,6 +66,15 @@ locals {
   app_host_ssm_parameter_arns = [
     for n in local.app_host_ssm_parameter_names :
     "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${n}"
+  ]
+}
+
+locals {
+  ssm_parameter_read_actions = [
+    "ssm:GetParameter",
+    "ssm:GetParameters",
+    "ssm:GetParametersByPath",
+    "ssm:GetParameterHistory",
   ]
 }
 
@@ -78,6 +94,11 @@ resource "aws_iam_role_policy" "read_parameters" {
         Effect   = "Deny"
         Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
+      },
+      {
+        Effect      = "Deny"
+        Action      = local.ssm_parameter_read_actions
+        NotResource = local.app_host_ssm_parameter_arns
       }
     ]
   })
@@ -136,6 +157,15 @@ resource "aws_iam_role_policy_attachment" "drone_ssm_core" {
 }
 
 # The Drone host only needs the CI secrets, not the whole parameter tree.
+# Every parameter it reads is under ci/*: drone-user-data.sh and
+# jenkins-provision.sh param() (drone-rpc-secret, github-client-id|secret,
+# drone/database-secret, jenkins-admin-password, github-pat) and
+# jenkins-bootstrap.sh (jenkins-provision-sha256). The DNS updater and
+# sentinel read no SSM. As on the app host, the managed
+# AmazonSSMManagedInstanceCore grants GetParameter on "*", so the Deny +
+# NotResource is what keeps deploy/*, db/password and bff/* unreadable from a
+# build container (T-005 round 1). A new parameter read here must live under
+# ci/ or be added to the NotResource list, else it fails with AccessDenied.
 resource "aws_iam_role_policy" "drone_read_ci_parameters" {
   name = "read-ci-parameters"
   role = aws_iam_role.drone.id
@@ -147,6 +177,11 @@ resource "aws_iam_role_policy" "drone_read_ci_parameters" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
+      },
+      {
+        Effect      = "Deny"
+        Action      = local.ssm_parameter_read_actions
+        NotResource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/${var.environment}/ci/*"]
       }
     ]
   })

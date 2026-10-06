@@ -29,23 +29,55 @@ resource "aws_iam_role_policy_attachment" "ecr_read" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
-# Lets the services read their secrets from SSM Parameter Store at runtime.
+# Lets the app host read exactly the SSM parameters its scripts read (T-005).
 #
-# T-008 security review round 2 (Medium, accepted): the Allow below is
-# `/${var.project_name}/*` -- the whole parameter tree, including
-# `deploy/drone-deploy/*` (ssm.tf), which this app host's own role has no
-# business reading. Being outside `ci/*` only isolates that credential from
-# the DRONE host's role; it does nothing against THIS role, which is
-# broader by design (it legitimately needs db/, cognito/, observability/,
-# etc across the tree). This host also has no `metadata_options` set (IMDSv1
-# is on) and runs containers that could reach instance credentials via an
-# SSRF/RCE in the domain service -- so an explicit Deny on `deploy/*` closes
-# that path without narrowing the Allow itself (narrowing the Allow to an
-# enumerated list is T-005 work; a missed path there would break this
-# host's own boot, which an explicit Deny cannot do since it only ever
-# subtracts). IAM evaluates an explicit Deny before any Allow, regardless
-# of statement order or which policy/role it's attached through, so this
-# holds even though it's declared after the Allow.
+# The Allow is an enumerated list of full parameter ARNs, no wildcard: this
+# role used to read the whole `/${var.project_name}/*` tree, including every
+# `ci/*` secret and `deploy/*`, though it needs a handful of paths. The set is
+# what templates/domain-service-bootstrap.sh (app/provision-sha256),
+# domain-service-provision.sh and the /usr/local/lib/cv-app.sh library it
+# writes (param(): db/password, cognito/issuer-uri, bff/*), and the backup
+# script (db/password) read. Nothing reads by path, so GetParametersByPath is
+# gone. scripts/check-static.sh cross-checks the templates against this list:
+# a new `param x` / `get-parameter --name` there needs its parameter added
+# here, or the next boot fails.
+#
+# The explicit Deny on `deploy/*` (T-008) stays as defense in depth; IAM
+# evaluates an explicit Deny before any Allow.
+#
+# AmazonSSMManagedInstanceCore (attached above, needed for Session Manager and
+# Run Command) itself grants ssm:GetParameter(s) on "*", so the Allow above
+# narrows nothing on its own. The Deny + NotResource below is what actually
+# limits the role: every read of a parameter outside the list is denied
+# (T-005 round 1). Do not detach the managed policy; the agent needs its
+# other actions.
+locals {
+  app_host_ssm_parameter_names = [
+    aws_ssm_parameter.app_host_provision_sha256.name,
+    aws_ssm_parameter.db_password.name,
+    aws_ssm_parameter.cognito_issuer_uri.name,
+    aws_ssm_parameter.bff_service_client_id.name,
+    aws_ssm_parameter.bff_service_client_secret.name,
+    aws_ssm_parameter.bff_token_url.name,
+    aws_ssm_parameter.bff_token_scope.name,
+  ]
+  # Parameter names start with "/", which an ARN's resource part also does
+  # not repeat after "parameter".
+  app_host_ssm_parameter_arns = [
+    for n in local.app_host_ssm_parameter_names :
+    "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${n}"
+  ]
+}
+
+locals {
+  ssm_parameter_read_actions = [
+    "ssm:GetParameter",
+    "ssm:GetParameters",
+    "ssm:GetParametersByPath",
+    "ssm:GetParameterHistory",
+  ]
+}
+
 resource "aws_iam_role_policy" "read_parameters" {
   name = "read-cv-parameters"
   role = aws_iam_role.domain_service.id
@@ -55,13 +87,18 @@ resource "aws_iam_role_policy" "read_parameters" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
-        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/*"
+        Action   = ["ssm:GetParameter", "ssm:GetParameters"]
+        Resource = local.app_host_ssm_parameter_arns
       },
       {
         Effect   = "Deny"
         Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
+      },
+      {
+        Effect      = "Deny"
+        Action      = local.ssm_parameter_read_actions
+        NotResource = local.app_host_ssm_parameter_arns
       }
     ]
   })
@@ -120,6 +157,15 @@ resource "aws_iam_role_policy_attachment" "drone_ssm_core" {
 }
 
 # The Drone host only needs the CI secrets, not the whole parameter tree.
+# Every parameter it reads is under ci/*: drone-user-data.sh and
+# jenkins-provision.sh param() (drone-rpc-secret, github-client-id|secret,
+# drone/database-secret, jenkins-admin-password, github-pat) and
+# jenkins-bootstrap.sh (jenkins-provision-sha256). The DNS updater and
+# sentinel read no SSM. As on the app host, the managed
+# AmazonSSMManagedInstanceCore grants GetParameter on "*", so the Deny +
+# NotResource is what keeps deploy/*, db/password and bff/* unreadable from a
+# build container (T-005 round 1). A new parameter read here must live under
+# ci/ or be added to the NotResource list, else it fails with AccessDenied.
 resource "aws_iam_role_policy" "drone_read_ci_parameters" {
   name = "read-ci-parameters"
   role = aws_iam_role.drone.id
@@ -131,6 +177,11 @@ resource "aws_iam_role_policy" "drone_read_ci_parameters" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
+      },
+      {
+        Effect      = "Deny"
+        Action      = local.ssm_parameter_read_actions
+        NotResource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/${var.environment}/ci/*"]
       }
     ]
   })

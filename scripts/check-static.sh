@@ -634,4 +634,92 @@ else
   ok "the doorbell's ec2:CreateTags is scoped to the CI instance and the CILastPush tag key (T-048)"
 fi
 
+# --- 20. The app host's SSM read is an exact list covering what it reads --
+# T-005: aws_iam_role_policy.read_parameters Allows an enumerated set of
+# parameter ARNs (iam.tf local app_host_ssm_parameter_names), never a
+# project-wide wildcard, and every `param <path>` / `get-parameter --name`
+# in the two app-host templates must be in that set -- a missed path breaks
+# the next boot. Grep-based cross-check; the bff-node/domain-service
+# redeploy path reads through the same cv-app.sh library.
+app_policy=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"read_parameters"[ \t]*{' <iam.tf)
+allow_stmt=$(printf '%s\n' "$app_policy" | tr '\n' ' ' | grep -Eo '\{[^{}]*Effect[ \t]*=[ \t]*"Allow"[^{}]*\}' || true)
+names_block=$(sed 's/#.*//' iam.tf | awk '/app_host_ssm_parameter_names[ \t]*=[ \t]*\[/ {f=1} f {print} f && /\]/ {exit}')
+if [ -z "$allow_stmt" ] || [ -z "$names_block" ]; then
+  bad "cannot find read_parameters' Allow statement or local.app_host_ssm_parameter_names in iam.tf (T-005)"
+elif ! printf '%s' "$allow_stmt" | grep -Eq 'Resource[ \t]*=[ \t]*local\.app_host_ssm_parameter_arns[ \t]' ||
+  printf '%s' "$allow_stmt" | grep -Eq '\*|GetParametersByPath'; then
+  bad "read_parameters' Allow must use Resource = local.app_host_ssm_parameter_arns, with no wildcard and no GetParametersByPath (T-005)"
+else
+  # resource addresses in the names list -> their `name` suffix in *.tf
+  covered=""
+  for addr in $(printf '%s\n' "$names_block" | grep -Eo 'aws_ssm_parameter\.[a-z0-9_]+'); do
+    res=${addr#aws_ssm_parameter.}
+    path=$(awk -v r="$res" '$0 ~ "resource \"aws_ssm_parameter\" \""r"\"" {f=1} f && /name[ \t]*=/ {print; f=0}' *.tf | head -n1 | sed -E 's|.*\$\{var\.environment\}/||; s|".*||')
+    covered="$covered $path"
+  done
+  needed=$(
+    {
+      grep -hEo '\$\(param [a-z0-9/_-]+\)' templates/domain-service-provision.sh | sed -E 's/^\$\(param //; s/\)$//'
+      grep -hEo -- '--name "/\$\{project_name\}/\$\{environment\}/[a-z0-9/_-]+"' templates/domain-service-provision.sh templates/domain-service-bootstrap.sh | sed -E 's|.*\$\{environment\}/||; s|"$||'
+    } | sort -u
+  )
+  missing=""
+  for n in $needed; do
+    case " $covered " in *" $n "*) ;; *) missing="$missing $n" ;; esac
+  done
+  if [ -z "$needed" ]; then
+    bad "found no SSM reads in the app-host templates -- the cross-check pattern is stale (T-005)"
+  elif [ -n "$missing" ]; then
+    bad "app-host templates read SSM parameters not in read_parameters' Allow:$missing (T-005)"
+  else
+    ok "read_parameters Allows an exact list (no wildcard) covering every app-host SSM read: $(echo $needed) (T-005)"
+  fi
+fi
+
+# --- 21. Both instance roles Deny SSM reads outside their own set ----------
+# T-005 round 1: AmazonSSMManagedInstanceCore (attached to both roles) grants
+# ssm:GetParameter(s) on "*", which swallows any inline Allow. So each role
+# must carry an explicit Deny + NotResource on the four read actions while
+# the managed policy is attached. And every parameter the CI host's templates
+# read must fall inside its NotResource set (ci/*), or the read gets
+# AccessDenied.
+ssm_actions_local=$(sed 's/#.*//' iam.tf | awk '/ssm_parameter_read_actions[ \t]*=[ \t]*\[/ {f=1} f {print} f && /\]/ {exit}')
+actions_ok=1
+for a in GetParameter GetParameters GetParametersByPath GetParameterHistory; do
+  printf '%s\n' "$ssm_actions_local" | grep -Eq "\"ssm:$a\"" || actions_ok=0
+done
+for pair in "domain_service:read_parameters:local.app_host_ssm_parameter_arns" "drone:drone_read_ci_parameters:ci/\\*"; do
+  role=${pair%%:*}
+  rest=${pair#*:}
+  pol=${rest%%:*}
+  want=${rest#*:}
+  if ! sed 's/#.*//' iam.tf | tr '\n' ' ' | grep -Eq "resource[ \t]+\"aws_iam_role_policy_attachment\"[^{]*{[^}]*aws_iam_role\.$role\.name[^}]*AmazonSSMManagedInstanceCore"; then
+    bad "cannot find AmazonSSMManagedInstanceCore attached to aws_iam_role.$role -- the T-005 SSM Deny guard is stale"
+    continue
+  fi
+  blk=$(extract_block "^resource[ \t]+\"aws_iam_role_policy\"[ \t]+\"$pol\"[ \t]*{" <iam.tf | tr '\n' ' ' | sed -E 's/\$\{[^}]*\}/X/g')
+  deny=$(printf '%s\n' "$blk" | grep -Eo '\{[^{}]*Effect[ \t]*=[ \t]*"Deny"[^{}]*NotResource[^{}]*\}' || true)
+  if [ -z "$deny" ] || [ "$actions_ok" = 0 ] ||
+    ! printf '%s' "$deny" | grep -Eq 'Action[ \t]*=[ \t]*local\.ssm_parameter_read_actions' ||
+    ! printf '%s' "$deny" | grep -Eq "NotResource[ \t]*=.*$want"; then
+    bad "aws_iam_role.$role must carry a Deny + NotResource ($want) on local.ssm_parameter_read_actions (all four ssm read actions) in $pol while AmazonSSMManagedInstanceCore is attached (T-005 round 1)"
+  else
+    ok "aws_iam_role.$role Denies SSM parameter reads outside its NotResource set ($pol)"
+  fi
+done
+
+ci_reads=$(grep -hEo -- '--name "/\$\{project_name\}/\$\{environment\}/[^"]+"' templates/drone-user-data.sh templates/jenkins-provision.sh templates/jenkins-bootstrap.sh | sed -E 's|.*\$\{environment\}/||; s|"$||')
+ci_name_total=$(grep -h -A2 -- 'get-parameter' templates/drone-user-data.sh templates/jenkins-provision.sh templates/jenkins-bootstrap.sh scripts/ci-dns-updater.sh scripts/ci-dns-sentinel.sh | grep -c -- '--name')
+ci_outside=""
+for n in $ci_reads; do
+  case "$n" in ci/*) ;; *) ci_outside="$ci_outside $n" ;; esac
+done
+if [ -z "$ci_reads" ] || [ "$ci_name_total" != "$(printf '%s\n' "$ci_reads" | wc -l)" ]; then
+  bad "the CI-host SSM read cross-check pattern is stale: found '$ci_reads' for $ci_name_total get-parameter --name (T-005 round 1)"
+elif [ -n "$ci_outside" ]; then
+  bad "CI-host templates read SSM parameters outside ci/*, which drone_read_ci_parameters' Deny NotResource blocks:$ci_outside -- add their exact ARN to the NotResource list (T-005 round 1)"
+else
+  ok "every CI-host SSM read is inside ci/*, the NotResource set of drone_read_ci_parameters: $(echo $ci_reads) (T-005 round 1)"
+fi
+
 exit $fail

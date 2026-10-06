@@ -51,9 +51,9 @@ resource "aws_s3_object" "app_host_provision" {
   }
 }
 
-# Under /<project>/<env>/app/, which the app host role's existing
-# /<project>/* read grant covers (iam.tf read_parameters); the Deny on deploy/*
-# is untouched. No new SSM permission.
+# Under /<project>/<env>/app/. The app host role reads it through its exact
+# ARN in iam.tf's app_host_ssm_parameter_names (T-005); a new parameter the
+# app host reads must be added there.
 resource "aws_ssm_parameter" "app_host_provision_sha256" {
   name  = "/${var.project_name}/${var.environment}/app/provision-sha256"
   type  = "String"

@@ -3352,9 +3352,10 @@ run "t048_push_tag" {
   }
 }
 
-# T-050: ECR retention. Both repos carry the same three rules: (1) claim
-# :latest, (2) keep the 4 newest other tagged images, (3) expire untagged
-# beyond 20 (T-035). The invariant: (rule 2 count + 1) * 4 children <= rule 3.
+# T-050: ECR retention. Both repos come from one local (identical by
+# construction). Rule 1 claims :latest (exact match), rule 2 keeps
+# ecr_keep_tagged tagged images (`*` matches :latest too, so latest + 4 previous
+# shas), rule 3 expires untagged beyond keep x children + orphan headroom.
 run "t050_ecr_lifecycle_rules" {
   command = plan
 
@@ -3371,36 +3372,45 @@ run "t050_ecr_lifecycle_rules" {
       length(jsondecode(p).rules) == 3 &&
       [for r in jsondecode(p).rules : r.rulePriority] == [1, 2, 3] &&
       jsondecode(p).rules[0].selection.tagStatus == "tagged" &&
-      jsondecode(p).rules[0].selection.tagPrefixList == ["latest"] &&
+      jsondecode(p).rules[0].selection.tagPatternList == ["latest"] &&
+      !contains(keys(jsondecode(p).rules[0].selection), "tagPrefixList") &&
       jsondecode(p).rules[0].selection.countType == "imageCountMoreThan" &&
       jsondecode(p).rules[0].selection.countNumber == 1 &&
       jsondecode(p).rules[0].action.type == "expire" &&
       jsondecode(p).rules[1].selection.tagStatus == "tagged" &&
       jsondecode(p).rules[1].selection.tagPatternList == ["*"] &&
       jsondecode(p).rules[1].selection.countType == "imageCountMoreThan" &&
-      jsondecode(p).rules[1].selection.countNumber == 4 &&
       jsondecode(p).rules[1].action.type == "expire" &&
       jsondecode(p).rules[2].selection.tagStatus == "untagged" &&
       jsondecode(p).rules[2].selection.countType == "imageCountMoreThan" &&
-      jsondecode(p).rules[2].selection.countNumber == 20 &&
       jsondecode(p).rules[2].action.type == "expire"
     ])
-    error_message = "both ECR policies must be exactly: 1 = protect :latest (prefix, count 1), 2 = keep 4 newest other tagged (pattern *), 3 = untagged beyond 20"
+    error_message = "both ECR policies must be: 1 = exact tagPatternList [latest] (no tagPrefixList), 2 = tagged pattern *, 3 = untagged; priorities 1,2,3"
   }
 
-  assert {
-    condition     = aws_ecr_lifecycle_policy.domain_service.policy == aws_ecr_lifecycle_policy.bff_node.policy
-    error_message = "the two ECR lifecycle policies must be identical (one shared local)"
-  }
-
-  # Kept tagged indexes = latest + rule 2's count; each has up to 4 untagged
-  # children (2 arch + attestations), all of which must fit rule 3, or a kept
-  # tag stops pulling.
+  # Rule 2 counts :latest too (lower rules still identify what a higher rule
+  # matched), so 5 keeps latest + 4 previous shas.
   assert {
     condition = alltrue([
       for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
-      (jsondecode(p).rules[1].selection.countNumber + 1) * 4 <= jsondecode(p).rules[2].selection.countNumber
+      jsondecode(p).rules[1].selection.countNumber == 5
     ])
-    error_message = "(kept shas + latest) x 4 children must fit the untagged budget, else kept tags lose their children"
+    error_message = "rule 2 must keep 5 tagged images: latest + the 4 previous shas"
+  }
+
+  # Both workflows build with provenance: false => 2 children per deploy. Rule 3
+  # = 5 x 2 + 10 headroom.
+  assert {
+    condition = alltrue([
+      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
+      jsondecode(p).rules[2].selection.countNumber == 5 * 2 + 10
+    ])
+    error_message = "rule 3 must be keep (5) x children (2) + headroom (10) = 20"
+  }
+
+  # Headroom must absorb at least two failed deploys' orphaned children.
+  assert {
+    condition     = local.ecr_orphan_headroom >= 2 * local.ecr_children_per_index
+    error_message = "orphan headroom must be at least 2 x children per index"
   }
 }

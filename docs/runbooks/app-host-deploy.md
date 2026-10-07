@@ -52,7 +52,7 @@ Poll `get-command-invocation` until `Status` is `Success` (or `Failed`). The out
 
 ## Deploying a new image
 
-1. **Save the current digests first.** ECR expires only **untagged** images beyond the 20 newest (`registry.tf` lifecycle; tagged images are never expired), so a digest you replaced by re-pushing `:latest` becomes untagged and is eventually gone:
+1. **Save the current digests first.** ECR keeps only `:latest` and the 4 previous `:<sha>` images per repo (`registry.tf` lifecycle, T-050), plus the 20 newest untagged images of any kind; a digest you replaced by re-pushing `:latest` becomes untagged and is eventually gone:
    ```bash
    aws ecr describe-images --region eu-west-3 --repository-name cv-project-domain-service \
      --query 'sort_by(imageDetails,&imagePushedAt)[].[imageDigest,imageTags]' --output text
@@ -88,7 +88,7 @@ Migrations are forward-only; there is no `migrate` rollback. A failed Flyway run
    (or `docker pull` it by digest, `docker tag`, `docker push`).
 3. `cv-redeploy <service>` again and verify.
 
-**Lifecycle caveat:** only the 20 newest untagged images are kept, so an old digest survives roughly four further multi-arch pushes, then is expired and unrecoverable; roll back soon or keep your own copy of the image. A schema migration is not rolled back by any of this.
+**Lifecycle caveat (T-050):** per repo, ECR keeps `:latest` and the 4 previous `:<sha>` images, and (rule 3) the 20 newest untagged images of any kind: per-arch children, orphans, and digests you replaced. That untagged pool turns over after roughly a few deploys, so a replaced (de-tagged) digest is not safe for long. Beyond that retention there is no rollback from ECR: rebuild the old commit multi-arch and push it as `:latest` (`docker buildx build --platform linux/amd64,linux/arm64 --push -t <repo>:latest .`), then `cv-redeploy <service>`. (`~/.local/share/cv-image-backups/` is an occasional hand-made archive, partial and not maintained; do not rely on it.) A schema migration is not rolled back by any of this.
 
 ## What still needs a host replacement
 

@@ -1923,16 +1923,7 @@ run "bff_node_registry_and_edge" {
     error_message = "aws_ecr_repository.bff_node must keep force_delete = true, mirroring domain_service (demo project, parity)"
   }
 
-  assert {
-    condition = (
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.tagStatus == "untagged" &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countType == "imageCountMoreThan" &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countNumber == 20 &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].action.type == "expire" &&
-      length(jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules) == 1
-    )
-    error_message = "aws_ecr_lifecycle_policy.bff_node must expire only UNTAGGED images beyond 20 and never a tagged one: a multi-arch :latest is an index plus per-arch manifests, and a keep-2-of-any rule can expire its arm64 child (T-035)"
-  }
+  # Lifecycle rules: see run "t050_ecr_lifecycle_rules".
 
   # Ruling 1, the crux: port 3000 gets its OWN security group -- never a
   # second rule on aws_security_group.domain_service (prefix-list quota, see
@@ -2901,19 +2892,6 @@ run "t035_app_host_graviton" {
     condition     = aws_instance.domain_service.metadata_options[0].http_endpoint == "enabled"
     error_message = "the app host's IMDS endpoint must stay enabled (the host's own param() reads need it)"
   }
-
-  # ECR: only untagged images are ever expired.
-  assert {
-    condition = alltrue([
-      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
-      length(jsondecode(p).rules) == 1 &&
-      jsondecode(p).rules[0].selection.tagStatus == "untagged" &&
-      jsondecode(p).rules[0].selection.countType == "imageCountMoreThan" &&
-      jsondecode(p).rules[0].selection.countNumber == 20 &&
-      jsondecode(p).rules[0].action.type == "expire"
-    ])
-    error_message = "both ECR lifecycle policies must expire only untagged images beyond 20, never a tagged (:latest) one"
-  }
 }
 
 # An x86 type on the arm64 AMI (or vice versa) must fail at plan time.
@@ -3371,5 +3349,68 @@ run "t048_push_tag" {
   assert {
     condition     = join(",", local.ci_reaper_ec2_actions) == "ec2:StopInstances"
     error_message = "The reaper needs no new EC2 grant for T-048: it reads CILastPush from DescribeInstances"
+  }
+}
+
+# T-050: ECR retention. Both repos come from one local (identical by
+# construction). Rule 1 claims :latest (exact match), rule 2 keeps
+# ecr_keep_tagged tagged images (`*` matches :latest too, so latest + 4 previous
+# shas), rule 3 expires untagged beyond keep x children + orphan headroom.
+run "t050_ecr_lifecycle_rules" {
+  command = plan
+
+  plan_options {
+    target = [
+      aws_ecr_lifecycle_policy.domain_service,
+      aws_ecr_lifecycle_policy.bff_node,
+    ]
+  }
+
+  assert {
+    condition = alltrue([
+      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
+      length(jsondecode(p).rules) == 3 &&
+      [for r in jsondecode(p).rules : r.rulePriority] == [1, 2, 3] &&
+      jsondecode(p).rules[0].selection.tagStatus == "tagged" &&
+      jsondecode(p).rules[0].selection.tagPatternList == ["latest"] &&
+      !contains(keys(jsondecode(p).rules[0].selection), "tagPrefixList") &&
+      jsondecode(p).rules[0].selection.countType == "imageCountMoreThan" &&
+      jsondecode(p).rules[0].selection.countNumber == 1 &&
+      jsondecode(p).rules[0].action.type == "expire" &&
+      jsondecode(p).rules[1].selection.tagStatus == "tagged" &&
+      jsondecode(p).rules[1].selection.tagPatternList == ["*"] &&
+      jsondecode(p).rules[1].selection.countType == "imageCountMoreThan" &&
+      jsondecode(p).rules[1].action.type == "expire" &&
+      jsondecode(p).rules[2].selection.tagStatus == "untagged" &&
+      jsondecode(p).rules[2].selection.countType == "imageCountMoreThan" &&
+      jsondecode(p).rules[2].action.type == "expire"
+    ])
+    error_message = "both ECR policies must be: 1 = exact tagPatternList [latest] (no tagPrefixList), 2 = tagged pattern *, 3 = untagged; priorities 1,2,3"
+  }
+
+  # Rule 2 counts :latest too (lower rules still identify what a higher rule
+  # matched), so 5 keeps latest + 4 previous shas.
+  assert {
+    condition = alltrue([
+      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
+      jsondecode(p).rules[1].selection.countNumber == 5
+    ])
+    error_message = "rule 2 must keep 5 tagged images: latest + the 4 previous shas"
+  }
+
+  # Both workflows build with provenance: false => 2 children per deploy. Rule 3
+  # = 5 x 2 + 10 headroom.
+  assert {
+    condition = alltrue([
+      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
+      jsondecode(p).rules[2].selection.countNumber == 5 * 2 + 10
+    ])
+    error_message = "rule 3 must be keep (5) x children (2) + headroom (10) = 20"
+  }
+
+  # Headroom must absorb at least two failed deploys' orphaned children.
+  assert {
+    condition     = local.ecr_orphan_headroom >= 2 * local.ecr_children_per_index
+    error_message = "orphan headroom must be at least 2 x children per index"
   }
 }

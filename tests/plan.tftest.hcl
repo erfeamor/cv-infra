@@ -1923,16 +1923,7 @@ run "bff_node_registry_and_edge" {
     error_message = "aws_ecr_repository.bff_node must keep force_delete = true, mirroring domain_service (demo project, parity)"
   }
 
-  assert {
-    condition = (
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.tagStatus == "untagged" &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countType == "imageCountMoreThan" &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].selection.countNumber == 20 &&
-      jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules[0].action.type == "expire" &&
-      length(jsondecode(aws_ecr_lifecycle_policy.bff_node.policy).rules) == 1
-    )
-    error_message = "aws_ecr_lifecycle_policy.bff_node must expire only UNTAGGED images beyond 20 and never a tagged one: a multi-arch :latest is an index plus per-arch manifests, and a keep-2-of-any rule can expire its arm64 child (T-035)"
-  }
+  # Lifecycle rules: see run "t050_ecr_lifecycle_rules".
 
   # Ruling 1, the crux: port 3000 gets its OWN security group -- never a
   # second rule on aws_security_group.domain_service (prefix-list quota, see
@@ -2901,19 +2892,6 @@ run "t035_app_host_graviton" {
     condition     = aws_instance.domain_service.metadata_options[0].http_endpoint == "enabled"
     error_message = "the app host's IMDS endpoint must stay enabled (the host's own param() reads need it)"
   }
-
-  # ECR: only untagged images are ever expired.
-  assert {
-    condition = alltrue([
-      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
-      length(jsondecode(p).rules) == 1 &&
-      jsondecode(p).rules[0].selection.tagStatus == "untagged" &&
-      jsondecode(p).rules[0].selection.countType == "imageCountMoreThan" &&
-      jsondecode(p).rules[0].selection.countNumber == 20 &&
-      jsondecode(p).rules[0].action.type == "expire"
-    ])
-    error_message = "both ECR lifecycle policies must expire only untagged images beyond 20, never a tagged (:latest) one"
-  }
 }
 
 # An x86 type on the arm64 AMI (or vice versa) must fail at plan time.
@@ -3371,5 +3349,58 @@ run "t048_push_tag" {
   assert {
     condition     = join(",", local.ci_reaper_ec2_actions) == "ec2:StopInstances"
     error_message = "The reaper needs no new EC2 grant for T-048: it reads CILastPush from DescribeInstances"
+  }
+}
+
+# T-050: ECR retention. Both repos carry the same three rules: (1) claim
+# :latest, (2) keep the 4 newest other tagged images, (3) expire untagged
+# beyond 20 (T-035). The invariant: (rule 2 count + 1) * 4 children <= rule 3.
+run "t050_ecr_lifecycle_rules" {
+  command = plan
+
+  plan_options {
+    target = [
+      aws_ecr_lifecycle_policy.domain_service,
+      aws_ecr_lifecycle_policy.bff_node,
+    ]
+  }
+
+  assert {
+    condition = alltrue([
+      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
+      length(jsondecode(p).rules) == 3 &&
+      [for r in jsondecode(p).rules : r.rulePriority] == [1, 2, 3] &&
+      jsondecode(p).rules[0].selection.tagStatus == "tagged" &&
+      jsondecode(p).rules[0].selection.tagPrefixList == ["latest"] &&
+      jsondecode(p).rules[0].selection.countType == "imageCountMoreThan" &&
+      jsondecode(p).rules[0].selection.countNumber == 1 &&
+      jsondecode(p).rules[0].action.type == "expire" &&
+      jsondecode(p).rules[1].selection.tagStatus == "tagged" &&
+      jsondecode(p).rules[1].selection.tagPatternList == ["*"] &&
+      jsondecode(p).rules[1].selection.countType == "imageCountMoreThan" &&
+      jsondecode(p).rules[1].selection.countNumber == 4 &&
+      jsondecode(p).rules[1].action.type == "expire" &&
+      jsondecode(p).rules[2].selection.tagStatus == "untagged" &&
+      jsondecode(p).rules[2].selection.countType == "imageCountMoreThan" &&
+      jsondecode(p).rules[2].selection.countNumber == 20 &&
+      jsondecode(p).rules[2].action.type == "expire"
+    ])
+    error_message = "both ECR policies must be exactly: 1 = protect :latest (prefix, count 1), 2 = keep 4 newest other tagged (pattern *), 3 = untagged beyond 20"
+  }
+
+  assert {
+    condition     = aws_ecr_lifecycle_policy.domain_service.policy == aws_ecr_lifecycle_policy.bff_node.policy
+    error_message = "the two ECR lifecycle policies must be identical (one shared local)"
+  }
+
+  # Kept tagged indexes = latest + rule 2's count; each has up to 4 untagged
+  # children (2 arch + attestations), all of which must fit rule 3, or a kept
+  # tag stops pulling.
+  assert {
+    condition = alltrue([
+      for p in [aws_ecr_lifecycle_policy.domain_service.policy, aws_ecr_lifecycle_policy.bff_node.policy] :
+      (jsondecode(p).rules[1].selection.countNumber + 1) * 4 <= jsondecode(p).rules[2].selection.countNumber
+    ])
+    error_message = "(kept shas + latest) x 4 children must fit the untagged budget, else kept tags lose their children"
   }
 }

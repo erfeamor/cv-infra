@@ -52,25 +52,22 @@ cv_ecr_login() {
     | docker login --username AWS --password-stdin "$(echo "$CV_DOMAIN_IMAGE" | cut -d/ -f1)"
 }
 
-# T-054: the EC2 instance id, from IMDSv2, for the awslogs stream names. Runs
-# on the HOST (hop limit 1 blocks containers, not host processes). Fails loudly
-# rather than yielding an empty stream name.
+# T-054: the EC2 instance id for the awslogs stream names, from the file
+# cloud-init writes before user_data runs (no network call, so neither boot nor
+# a redeploy gains an IMDS dependency). Fails loudly rather than yielding an
+# empty or malformed stream name. The path is overridable for the test harness.
 cv_instance_id() {
-  local token id
-  token=$(curl -sf -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
-    http://169.254.169.254/latest/api/token) || {
-    echo "FATAL: could not get an IMDSv2 token (awslogs stream name needs the instance id)" >&2
+  local f id
+  f="$${CV_INSTANCE_ID_FILE:-/var/lib/cloud/data/instance-id}"
+  if [ ! -r "$f" ]; then
+    echo "FATAL: cannot read the instance id from $f (awslogs stream name needs it)" >&2
     return 1
-  }
-  id=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
-    http://169.254.169.254/latest/meta-data/instance-id) || {
-    echo "FATAL: could not read meta-data/instance-id from IMDS" >&2
-    return 1
-  }
+  fi
+  id=$(head -n 1 "$f" | tr -d '[:space:]')
   case "$id" in
     i-?*) printf '%s' "$id" ;;
     *)
-      echo "FATAL: unexpected instance id from IMDS: '$id'" >&2
+      echo "FATAL: unexpected instance id in $f: '$id'" >&2
       return 1
       ;;
   esac
@@ -114,6 +111,7 @@ cv_run_domain_service() {
     --log-opt awslogs-region="${aws_region}" \
     --log-opt awslogs-group="${log_group_domain_service}" \
     --log-opt awslogs-stream="domain-service-$INSTANCE_ID" \
+    --log-opt awslogs-datetime-format='%Y-%m-%dT%H:%M:%S' \
     --log-opt mode=non-blocking \
     --log-opt max-buffer-size=4m \
     -p 8080:8080 \
@@ -182,7 +180,7 @@ roll() {
   docker pull "$image"
   new=$(docker image inspect --format '{{.Id}}' "$image")
   echo "$name image: old=$old new=$new"
-  # T-054: fail BEFORE removing the running container if IMDS is unreachable.
+  # T-054: fail BEFORE removing the running container if the id is unreadable.
   cv_instance_id >/dev/null
   docker rm -f "$name" || true
   "cv_run_$${name//-/_}"

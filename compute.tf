@@ -108,6 +108,8 @@ resource "aws_instance" "domain_service" {
     aws_s3_object.app_host_provision,
     aws_ssm_parameter.app_host_provision_sha256,
     aws_iam_role_policy.app_read_provision_script,
+    # T-054: in non-blocking mode a missing grant silently drops every line.
+    aws_iam_role_policy.app_write_container_logs,
   ]
 
   # Amazon publishes new AL2023 AMIs continually; without this every apply

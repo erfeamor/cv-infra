@@ -3495,7 +3495,7 @@ run "t054_app_container_logs" {
   }
 
   # The group ARNs are unknown until apply, so the two stream ARNs themselves
-  # (<group arn>:*, no doubled :*) are guarded by scripts/check-static.sh 8.
+  # (<group arn>:*, no doubled :*) are guarded by scripts/check-static.sh check 22.
   assert {
     condition     = length(local.app_container_logs_resources) == 2
     error_message = "the grant must cover exactly the two groups' stream ARNs"
@@ -3557,5 +3557,24 @@ run "t054_app_container_logs" {
       log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
     }))) == 2
     error_message = "exactly two containers (domain-service, bff-node) use the awslogs driver"
+  }
+
+  assert {
+    condition = length(regexall("--log-opt awslogs-datetime-format='%Y-%m-%dT%H:%M:%S'", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 1
+    error_message = "only domain-service sets awslogs-datetime-format (stack traces stay one event)"
   }
 }

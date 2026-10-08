@@ -643,13 +643,13 @@ fi
 # ordering `terraform test` cannot see.
 instance_block=$(extract_block '^resource "aws_instance" "domain_service"' <compute.tf)
 missing=""
-for dep in aws_s3_object.app_host_provision aws_ssm_parameter.app_host_provision_sha256 aws_iam_role_policy.app_read_provision_script; do
+for dep in aws_s3_object.app_host_provision aws_ssm_parameter.app_host_provision_sha256 aws_iam_role_policy.app_read_provision_script aws_iam_role_policy.app_write_container_logs; do
   printf '%s\n' "$instance_block" | grep -qE "^[[:space:]]+${dep//./\\.},?[[:space:]]*$" || missing="$missing $dep"
 done
 if [ -n "$missing" ]; then
   bad "aws_instance.domain_service depends_on is missing:$missing (T-044)"
 else
-  ok "aws_instance.domain_service depends_on its S3 provisioning script, SSM hash and read grant (T-044)"
+  ok "aws_instance.domain_service depends_on its S3 provisioning script, SSM hash, read grant and container-logs grant (T-044, T-054)"
 fi
 
 # --- 19. The doorbell's tagging grant stays on the CI instance, one tag key -
@@ -758,10 +758,11 @@ else
   ok "every CI-host SSM read is inside ci/*, the NotResource set of drone_read_ci_parameters: $(echo $ci_reads) (T-005 round 1)"
 fi
 
-# --- 8. The app host role never gets logs:* or logs:CreateLogGroup (T-054) ---
+# --- 22. The app host role never gets logs:* or logs:CreateLogGroup (T-054) ---
 # The awslogs driver only needs CreateLogStream + PutLogEvents on groups that
 # Terraform already creates. Every aws_iam_role_policy attached to
-# aws_iam_role.domain_service, in any .tf file, may name no other logs: action.
+# aws_iam_role.domain_service, in any .tf file, may name no other logs: action,
+# and no managed CloudWatch/Logs policy may be attached to that role.
 logs_bad=""
 logs_seen=0
 for f in *.tf; do
@@ -797,8 +798,13 @@ for f in *.tf; do
     fi
   done <<<"$blks"
 done
+managed_logs=$(cat ./*.tf | sed 's/#.*//' | tr '\n' ' ' | grep -Eo 'resource[ \t]+"aws_iam_role_policy_attachment"[^{]*\{[^}]*\}' |
+  grep -E 'aws_iam_role\.domain_service\.' | grep -E 'policy_arn[ \t]*=[^}]*(CloudWatch|Logs)' || true)
+if [ -n "$managed_logs" ]; then
+  logs_bad="$logs_bad managed-CloudWatch/Logs-policy-attachment"
+fi
 if [ -n "$logs_bad" ]; then
-  bad "the app host role (aws_iam_role.domain_service) grants log actions beyond CreateLogStream/PutLogEvents:$logs_bad (T-054)"
+  bad "the app host role (aws_iam_role.domain_service) grants log actions beyond CreateLogStream/PutLogEvents (or attaches a CloudWatch/Logs managed policy):$logs_bad (T-054)"
 elif [ "$logs_seen" -lt 1 ]; then
   bad "no logs: grant found on aws_iam_role.domain_service -- the T-054 awslogs policy is missing or this check is stale"
 else

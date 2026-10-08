@@ -89,7 +89,7 @@ resource "aws_iam_role_policy" "app_read_provision_script" {
 # provider's log-group arn has no trailing ":*", so ":*" is appended once.
 # The actions and resources are named locals so `terraform test` (plan-only)
 # can assert the actions: the group ARNs are unknown until apply, which makes
-# the encoded policy string unknown. scripts/check-static.sh check 8 reads
+# the encoded policy string unknown. scripts/check-static.sh check 22 reads
 # both the policy block and these locals.
 locals {
   app_container_logs_actions = ["logs:CreateLogStream", "logs:PutLogEvents"]

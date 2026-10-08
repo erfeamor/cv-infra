@@ -54,10 +54,15 @@ chmod +x "$workdir/cv-redeploy"
 calls="$workdir/calls.log"
 out="$workdir/out.log"
 
-run_redeploy() { # run_redeploy <args...>; sets $rc. STUB_IMDS selects the curl stub's mode.
+# cv_instance_id reads cloud-init's file (T-054), overridable via CV_INSTANCE_ID_FILE.
+printf 'i-0abc123def4567890\n' >"$workdir/instance-id.ok"
+printf 'not-an-instance-id\n' >"$workdir/instance-id.bad"
+: >"$workdir/instance-id.empty"
+
+run_redeploy() { # run_redeploy <args...>; sets $rc. ID_FILE selects the fixture.
   : >"$calls"; rm -f "$workdir/state/digest"
   set +e
-  env -i STUB_IMDS="${STUB_IMDS:-ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
+  env -i CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
     bash "$workdir/cv-redeploy" "$@" >"$out" 2>&1
   rc=$?
   set -e
@@ -137,15 +142,14 @@ awslogs_check() { # awslogs_check <case> <container> <group>
 echo "case 6: awslogs on domain-service and bff-node (T-054)"
 run_redeploy domain-service
 awslogs_check "case 6a" domain-service /cv-project/cv-domain-service
-grep -q '^curl .*-X PUT .*169.254.169.254/latest/api/token' "$calls" && ok "IMDSv2 token PUT" || bad "no IMDSv2 token PUT"
-grep -q '^curl .*169.254.169.254/latest/meta-data/instance-id' "$calls" && ok "instance-id GET" || bad "no instance-id GET"
+grep '^docker run -d --name domain-service ' "$calls" | grep -q -- ' --log-opt awslogs-datetime-format=%Y-%m-%dT%H:%M:%S ' && ok "domain-service: multiline datetime format" || bad "domain-service: no awslogs-datetime-format"
 run_redeploy bff-node
 awslogs_check "case 6b" bff-node /cv-project/cv-bff-node
+! grep '^docker run -d --name bff-node ' "$calls" | grep -q datetime-format && ok "bff-node: no datetime format" || bad "bff-node: has a datetime format"
 
 echo "case 7: mysql and flyway do not use awslogs"
 run_redeploy migrate
 ! grep -q 'log-driver\|log-opt' "$calls" && ok "flyway run has no log options" || bad "flyway run carries log options"
-! grep -q '^curl' "$calls" && ok "migrate never calls IMDS" || bad "migrate called IMDS"
 if grep -n 'docker run -d --name mysql' "$tpl" >/dev/null; then
   mysql_run=$(awk '/docker run -d --name mysql/{c=1} c{print} c&&/performance-schema/{exit}' "$tpl")
   case "$mysql_run" in
@@ -156,11 +160,12 @@ else
   bad "could not find the mysql run in the template"
 fi
 
-echo "case 8: an IMDS failure aborts instead of producing an empty stream"
-for mode in token-fail id-fail id-empty; do
+echo "case 8: a missing/malformed instance-id file aborts instead of producing an empty stream"
+for mode in missing bad empty; do
   for svc in domain-service bff-node; do
-    STUB_IMDS=$mode run_redeploy "$svc"
-    [ "$rc" -ne 0 ] && ok "$svc/$mode: non-zero exit" || bad "$svc/$mode: exit 0 despite IMDS failure"
+    if [ "$mode" = missing ]; then f="$workdir/nonexistent"; else f="$workdir/instance-id.$mode"; fi
+    ID_FILE=$f run_redeploy "$svc"
+    [ "$rc" -ne 0 ] && ok "$svc/$mode: non-zero exit" || bad "$svc/$mode: exit 0 despite a bad instance-id file"
     ! grep -q '^docker run ' "$calls" && ok "$svc/$mode: container not started" || bad "$svc/$mode: container started"
     ! grep -q '^docker rm ' "$calls" && ok "$svc/$mode: running container left alone" || bad "$svc/$mode: removed the running container"
     grep -q 'FATAL' "$out" && ok "$svc/$mode: clear error" || bad "$svc/$mode: no FATAL message"

@@ -89,7 +89,7 @@ cv_sync_database_repo() {
 # allowPublicKeyRetrieval is required for MySQL 8's caching_sha2_password over
 # the non-TLS docker network.
 cv_run_flyway() {
-  local DB_PASSWORD
+  local +x DB_PASSWORD
   cv_need DB_PASSWORD db/password || return 1
   docker run --rm --network cv \
     -v /opt/cv-database/sql:/flyway/sql:ro \
@@ -111,12 +111,14 @@ cv_run_flyway() {
 # ignored (as `docker rm -f ... || true` was): there may be nothing to remove,
 # and docker run reports a real name clash. `docker run` is the last command so
 # its exit status is the function's. The secrets live in function locals, are
-# never exported or echoed, and vanish when the function returns.
+# never exported or echoed, and vanish when the function returns. `local +x`: a
+# plain `local` over an already-exported variable of the same name inherits the
+# export flag (bash 5.3), which would hand the secret to aws/docker as environment.
 # cv_need <VARNAME> <ssm-name>: assign the parameter to the caller's VARNAME
 # (which the caller must already have declared `local`, or global in boot), or
 # fail without printing the value.
 cv_need() {
-  local v
+  local +x v
   v=$(param "$2") || {
     echo "FATAL: could not read SSM parameter $2" >&2
     return 1
@@ -130,7 +132,7 @@ cv_need() {
 
 # Hibernate ddl-auto=validate against the migrated schema.
 cv_run_domain_service() {
-  local CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI
+  local +x CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI
   CV_DS_INSTANCE_ID=$(cv_instance_id) || return 1
   cv_need CV_DS_DB_PASSWORD db/password || return 1
   cv_need CV_DS_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
@@ -159,7 +161,7 @@ cv_run_domain_service() {
 # except the contract's own PUBLIC_ROUTES allowlist. T-043: client-credentials
 # identity for the domain service (Cognito).
 cv_run_bff_node() {
-  local CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE
+  local +x CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE
   CV_BFF_INSTANCE_ID=$(cv_instance_id) || return 1
   cv_need CV_BFF_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
   cv_need CV_BFF_CLIENT_ID bff/service-client-id || return 1

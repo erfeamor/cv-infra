@@ -271,6 +271,16 @@ grep -q '^docker run .*SPRING_DATASOURCE_PASSWORD=SECRET-DB-PASSWORD-1 ' "$calls
 ! grep -q EVIL-PRESET "$calls" && ok "domain-service: preset not passed on" || bad "domain-service: preset reached docker"
 boot_run bff_node 'export CV_BFF_CLIENT_SECRET=EVIL-PRESET'
 grep -q '^docker run .*SERVICE_CLIENT_SECRET=SECRET-BFF-CLIENT-2 ' "$calls" && ok "bff-node: used the SSM value, not the preset" || bad "bff-node: the preset leaked into the run"
+nosecret_env() { # nosecret_env <label>: docker run's inherited environment holds no SSM secret
+  ! grep -qE 'SECRET-(DB-PASSWORD-1|BFF-CLIENT-2)' "$env_dump" && ok "$1: SSM secret not in docker's environment despite a pre-exported name" || bad "$1: SSM secret exported to docker via the pre-exported name"
+}
+boot_run bff_node 'export CV_BFF_CLIENT_SECRET=EVIL-PRESET'
+nosecret_env "bff-node"
+boot_run domain_service 'export CV_DS_DB_PASSWORD=EVIL-PRESET'
+nosecret_env "domain-service"
+boot_run flyway 'export DB_PASSWORD=EVIL-PRESET'
+nosecret_env "flyway"
+! grep -q EVIL-PRESET "$calls" && ok "flyway: preset not used" || bad "flyway: preset reached docker"
 # hook: failure ignored, runs before docker run, not at all if resolve fails
 : >"$calls"
 set +e

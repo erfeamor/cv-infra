@@ -62,16 +62,16 @@ State lives in S3 (`cv-project-tfstate-760904708057`, bucket versioning + SSE-S3
 
 ## Binding constraints & decisions
 
-- **Cost model — read this before citing "Free Tier". The account moved to the Paid plan on 2026-09-29; figures re-measured that day (T-012/T-020). Re-read them, don't inherit them.** The account was created 2026-07-12 on AWS's post-July-2025 Free Tier (a fixed pot of signup credits, **not** the legacy 12-month/750-hour allowance). There's **no free EC2 allowance**, so every instance-hour bills and is paid from the remaining credits first. **Since the Paid upgrade, anything the credits don't cover bills the card**: the Free plan's hard stop is gone, and the budget alarms (`budgets.tf`, two budgets, SNS to a confirmed email) are the only guard.
+- **Cost model — read this before citing "Free Tier". The account moved to the Paid plan on 2026-09-29; figures re-measured 2026-10-08 after the trims (T-051; earlier T-012/T-020). Re-read them, don't inherit them.** The account was created 2026-07-12 on AWS's post-July-2025 Free Tier (a fixed pot of signup credits, **not** the legacy 12-month/750-hour allowance). There's **no free EC2 allowance**, so every instance-hour bills and is paid from the remaining credits first. **Since the Paid upgrade, anything the credits don't cover bills the card**: the Free plan's hard stop is gone, and the budget alarms (`budgets.tf`, two budgets, SNS to a confirmed email) are the only guard.
 
-  | Measured 2026-09-29 | |
+  | Measured 2026-10-08 (T-051) | |
   |---|---|
   | Plan | **PAID**, ACTIVE (upgraded 2026-09-29) |
-  | Credits remaining | **$102.13** on 2026-09-29; **$120.75 on 2026-10-01**, after the last $20 activity (Bedrock) — the grant is now **$200** (signup plus all five $20 activities) |
-  | Run rate | **~$0.69/day ≈ $21/month** (09-20 to 09-28: $0.67–0.80/day, the higher days being CI host sessions) |
-  | Binding constraint | **the credits**: about 5½ months from 2026-10-01 at this rate (longer since T-034 released the CI host's EIP), then the bill is real money. Check the Billing console's Credits page for any expiry date (the API doesn't expose one). |
+  | Credits remaining | **$116.15 on 2026-10-08** ($120.75 on 2026-10-01, after the last $20 activity). The grant is **$200** (signup plus all five $20 activities) |
+  | Run rate | **~$0.51/day ≈ $15.5/month**: fixed ~$0.47 (app host `t4g.micro` $0.226, EBS $0.108, the app host's EIP $0.120, the Route 53 zone ~$0.016, other ~$0.005) plus the CI host, ~$0.04/day typical. Measured on 10-06, the first full Graviton day ($0.513). It was ~$0.69/day before T-034 released the CI host's EIP and T-035 moved to Graviton. |
+  | Binding constraint | **the credits**: enough until about **late May 2027** at this rate, before they expire on 2027-07-12. After that the bill (~$15–16/month) is real money. Check the Billing console's Credits page for the exact expiry (the API doesn't expose it). |
 
-  **The rate assumes a specific instance state, and that is the whole point of writing it down**: `cv-project-domain-service` (`t4g.micro` since T-035, Graviton/arm64, ~$6.86/month, -$1.75 vs t3.micro; the table figures above were measured on t3.micro) running 24/7, and the `cv-project-drone` CI host (`t3.small`) **stopped except during builds**, which the reaper enforces. Leave that CI host running continuously and the rate goes to **~$1.23/day ≈ $37/month**, burning the credits roughly twice as fast and then billing the card at that rate. So "is the CI host up?" is a money question, not a convenience one.
+  **The rate assumes a specific instance state, and that is the whole point of writing it down**: `cv-project-domain-service` (`t4g.micro` since T-035, Graviton/arm64, ~$6.86/month) running 24/7, and the `cv-project-drone` CI host (`t3.small`) **stopped except during builds**, which the reaper enforces. Leave that CI host running continuously and the rate goes to **~$1.2/day ≈ $35/month** (its `t3.small` hours plus its public IPv4, which bills only while it runs since T-034), burning the credits roughly twice as fast and then billing the card at that rate. So "is the CI host up?" is a money question, not a convenience one.
 
   Read the numbers yourself rather than trusting this table — the console is **not** required, contrary to what T-010 recorded:
 

@@ -758,4 +758,51 @@ else
   ok "every CI-host SSM read is inside ci/*, the NotResource set of drone_read_ci_parameters: $(echo $ci_reads) (T-005 round 1)"
 fi
 
+# --- 8. The app host role never gets logs:* or logs:CreateLogGroup (T-054) ---
+# The awslogs driver only needs CreateLogStream + PutLogEvents on groups that
+# Terraform already creates. Every aws_iam_role_policy attached to
+# aws_iam_role.domain_service, in any .tf file, may name no other logs: action.
+logs_bad=""
+logs_seen=0
+for f in *.tf; do
+  blks=$(sed 's/#.*//' "$f" | awk '
+    /^resource[ \t]+"aws_iam_role_policy"/ { inb = 1; buf = "" }
+    inb { buf = buf " " $0 }
+    inb && /^}/ { print buf; inb = 0 }')
+  [ -n "$blks" ] || continue
+  while IFS= read -r b; do
+    printf '%s' "$b" | grep -Eq 'role[ \t]*=[ \t]*aws_iam_role\.domain_service\.' || continue
+    # Actions/resources may live in named locals (plan-testable); read them too.
+    for ln in $(printf '%s' "$b" | grep -Eo 'local\.app_container_logs_[a-z]+' | sed 's/local\.//' | sort -u); do
+      b="$b $(sed 's/#.*//' "$f" | awk -v n="$ln" '$1 == n { inb = 1 } inb { print } inb && /\]/ { exit }' | tr '\n' ' ')"
+    done
+    acts=$(printf '%s' "$b" | grep -Eo '"logs:[^"]*"' || true)
+    [ -n "$acts" ] && logs_seen=$((logs_seen + 1))
+    for a in $acts; do
+      case "$a" in
+        '"logs:CreateLogStream"' | '"logs:PutLogEvents"') ;;
+        *) logs_bad="$logs_bad $a($f)" ;;
+      esac
+    done
+    if printf '%s' "$b" | grep -Eq '"(\*|logs:\*)"' && printf '%s' "$b" | grep -Eq 'logs:'; then
+      logs_bad="$logs_bad wildcard-action($f)"
+    fi
+    # Resources: exactly the two groups' stream ARNs, referenced by address.
+    if printf '%s' "$b" | grep -q 'logs:'; then
+      res=$(printf '%s' "$b" | grep -Eo '"\$\{[^}]*\}[^"]*"' | grep -v '"\${var\.' || true)
+      want=$(printf '%s\n' '"${aws_cloudwatch_log_group.domain_service.arn}:*"' '"${aws_cloudwatch_log_group.bff_node.arn}:*"')
+      if [ "$(printf '%s\n' "$res" | sort)" != "$(printf '%s\n' "$want" | sort)" ]; then
+        logs_bad="$logs_bad resources-not-the-two-group-stream-arns($f)"
+      fi
+    fi
+  done <<<"$blks"
+done
+if [ -n "$logs_bad" ]; then
+  bad "the app host role (aws_iam_role.domain_service) grants log actions beyond CreateLogStream/PutLogEvents:$logs_bad (T-054)"
+elif [ "$logs_seen" -lt 1 ]; then
+  bad "no logs: grant found on aws_iam_role.domain_service -- the T-054 awslogs policy is missing or this check is stale"
+else
+  ok "the app host role's only logs: actions are CreateLogStream and PutLogEvents (T-054)"
+fi
+
 exit $fail

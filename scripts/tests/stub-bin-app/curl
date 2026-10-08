@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Stub `curl` for the IMDSv2 calls (T-054). STUB_IMDS=ok (default) | token-fail
+# | id-fail | id-empty selects the failure mode.
+echo "curl $*" >>"${STUB_CALLS_LOG:?}"
+mode="${STUB_IMDS:-ok}"
+case "$*" in
+  *"-X PUT"*"/latest/api/token"*)
+    [ "$mode" = token-fail ] && exit 22
+    echo "STUB-IMDS-TOKEN"
+    ;;
+  *"X-aws-ec2-metadata-token: STUB-IMDS-TOKEN"*"meta-data/instance-id"*)
+    [ "$mode" = id-fail ] && exit 22
+    [ "$mode" = id-empty ] && exit 0
+    printf 'i-0abc123def4567890'
+    ;;
+  *) exit 22 ;;
+esac
+exit 0

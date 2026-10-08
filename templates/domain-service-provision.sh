@@ -36,8 +36,8 @@ systemctl enable --now docker
 mkdir -p /usr/local/lib
 cat > /usr/local/lib/cv-app.sh <<'CV_APP_LIB'
 # Sourced, never executed. Defines param(), cv_ecr_login() and the cv_run_*
-# functions. Each cv_run_* STARTS its container; removing an old one first is
-# the caller's job (cv-redeploy does `docker rm -f` on exactly one).
+# functions (each = cv_resolve_* then cv_start_*, T-055). Starting a container
+# does not remove an old one first; that is the caller's job (cv-redeploy does `docker rm -f` on exactly one).
 CV_DOMAIN_IMAGE="${image}"
 CV_BFF_IMAGE="${bff_image}"
 
@@ -100,28 +100,67 @@ cv_run_flyway() {
     flyway/flyway:13.7.0 migrate
 }
 
+# T-055: resolve every input BEFORE anything is removed. cv_resolve_* reads the
+# instance id and every SSM parameter into process-global, NON-exported shell
+# variables (CV_DS_*, CV_BFF_*; `local` would not survive to cv_start_*), and
+# fails -- naming the parameter, never its value -- if any read fails or is
+# empty. cv_start_* then runs `docker run` and unsets the secrets. cv_run_* is
+# the boot flow's resolve-then-start; cv-redeploy calls the halves itself so it
+# can `docker rm -f` between them. Never export these, never echo them.
+# cv_need <VARNAME> <ssm-name>: assign param to VARNAME, or fail without a value.
+cv_need() {
+  local v
+  v=$(param "$2") || {
+    echo "FATAL: could not read SSM parameter $2" >&2
+    return 1
+  }
+  if [ -z "$v" ]; then
+    echo "FATAL: SSM parameter $2 is empty" >&2
+    return 1
+  fi
+  printf -v "$1" '%s' "$v"
+}
+
+cv_clear_domain_service() {
+  unset CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI
+}
+
+cv_clear_bff_node() {
+  unset CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE
+}
+
+cv_resolve_domain_service() {
+  CV_DS_INSTANCE_ID=$(cv_instance_id) || { cv_clear_domain_service; return 1; }
+  cv_need CV_DS_DB_PASSWORD db/password \
+    && cv_need CV_DS_COGNITO_ISSUER_URI cognito/issuer-uri \
+    || { cv_clear_domain_service; return 1; }
+}
+
 # Hibernate ddl-auto=validate against the migrated schema.
-cv_run_domain_service() {
-  local DB_PASSWORD COGNITO_ISSUER_URI INSTANCE_ID
-  INSTANCE_ID=$(cv_instance_id) || return 1
-  DB_PASSWORD=$(param db/password)
-  COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
+cv_start_domain_service() {
+  local rc=0
   docker run -d --name domain-service --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
     --log-opt awslogs-group="${log_group_domain_service}" \
-    --log-opt awslogs-stream="domain-service-$INSTANCE_ID" \
+    --log-opt awslogs-stream="domain-service-$CV_DS_INSTANCE_ID" \
     --log-opt awslogs-datetime-format='%Y-%m-%dT%H:%M:%S' \
     --log-opt mode=non-blocking \
     --log-opt max-buffer-size=4m \
     -p 8080:8080 \
     -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true&useSSL=false" \
     -e SPRING_DATASOURCE_USERNAME="${db_username}" \
-    -e SPRING_DATASOURCE_PASSWORD="$DB_PASSWORD" \
-    -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+    -e SPRING_DATASOURCE_PASSWORD="$CV_DS_DB_PASSWORD" \
+    -e COGNITO_ISSUER_URI="$CV_DS_COGNITO_ISSUER_URI" \
     -e AUTH_ENABLED=true \
     -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
-    "$CV_DOMAIN_IMAGE"
+    "$CV_DOMAIN_IMAGE" || rc=$?
+  cv_clear_domain_service
+  return "$rc"
+}
+
+cv_run_domain_service() {
+  cv_resolve_domain_service && cv_start_domain_service
 }
 
 # cv-bff-node (T-014): same box, same `cv` network. DOMAIN_SERVICE_URL is
@@ -129,31 +168,41 @@ cv_run_domain_service() {
 # defaults it off for local dev only): every route under /bff/api/v1 is gated
 # except the contract's own PUBLIC_ROUTES allowlist. T-043: client-credentials
 # identity for the domain service (Cognito).
-cv_run_bff_node() {
-  local COGNITO_ISSUER_URI BFF_CLIENT_ID BFF_CLIENT_SECRET BFF_TOKEN_URL BFF_TOKEN_SCOPE INSTANCE_ID
-  INSTANCE_ID=$(cv_instance_id) || return 1
-  COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
-  BFF_CLIENT_ID=$(param bff/service-client-id)
-  BFF_CLIENT_SECRET=$(param bff/service-client-secret)
-  BFF_TOKEN_URL=$(param bff/token-url)
-  BFF_TOKEN_SCOPE=$(param bff/token-scope)
+cv_resolve_bff_node() {
+  CV_BFF_INSTANCE_ID=$(cv_instance_id) || { cv_clear_bff_node; return 1; }
+  cv_need CV_BFF_COGNITO_ISSUER_URI cognito/issuer-uri \
+    && cv_need CV_BFF_CLIENT_ID bff/service-client-id \
+    && cv_need CV_BFF_CLIENT_SECRET bff/service-client-secret \
+    && cv_need CV_BFF_TOKEN_URL bff/token-url \
+    && cv_need CV_BFF_TOKEN_SCOPE bff/token-scope \
+    || { cv_clear_bff_node; return 1; }
+}
+
+cv_start_bff_node() {
+  local rc=0
   docker run -d --name bff-node --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
     --log-opt awslogs-group="${log_group_bff_node}" \
-    --log-opt awslogs-stream="bff-node-$INSTANCE_ID" \
+    --log-opt awslogs-stream="bff-node-$CV_BFF_INSTANCE_ID" \
     --log-opt mode=non-blocking \
     --log-opt max-buffer-size=4m \
     -p 3000:3000 \
     -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
     -e AUTH_ENABLED=true \
-    -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+    -e COGNITO_ISSUER_URI="$CV_BFF_COGNITO_ISSUER_URI" \
     -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
-    -e COGNITO_TOKEN_URL="$BFF_TOKEN_URL" \
-    -e SERVICE_CLIENT_ID="$BFF_CLIENT_ID" \
-    -e SERVICE_CLIENT_SECRET="$BFF_CLIENT_SECRET" \
-    -e SERVICE_TOKEN_SCOPE="$BFF_TOKEN_SCOPE" \
-    "$CV_BFF_IMAGE"
+    -e COGNITO_TOKEN_URL="$CV_BFF_TOKEN_URL" \
+    -e SERVICE_CLIENT_ID="$CV_BFF_CLIENT_ID" \
+    -e SERVICE_CLIENT_SECRET="$CV_BFF_CLIENT_SECRET" \
+    -e SERVICE_TOKEN_SCOPE="$CV_BFF_TOKEN_SCOPE" \
+    "$CV_BFF_IMAGE" || rc=$?
+  cv_clear_bff_node
+  return "$rc"
+}
+
+cv_run_bff_node() {
+  cv_resolve_bff_node && cv_start_bff_node
 }
 CV_APP_LIB
 chmod 644 /usr/local/lib/cv-app.sh
@@ -174,16 +223,21 @@ usage() {
 
 # Recreate ONLY the named container from a freshly pulled :latest.
 roll() {
-  local name="$1" image="$2" old new
+  local name="$1" image="$2" old new fn
   cv_ecr_login
   old=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || echo none)
   docker pull "$image"
   new=$(docker image inspect --format '{{.Id}}' "$image")
   echo "$name image: old=$old new=$new"
-  # T-054: fail BEFORE removing the running container if the id is unreadable.
-  cv_instance_id >/dev/null
+  # T-055: resolve EVERY input (instance id + SSM) before removing anything, so a
+  # failed read leaves the old container serving.
+  fn="$${name//-/_}"
+  "cv_resolve_$fn" || {
+    echo "FATAL: $name inputs not resolved; the running container was left untouched" >&2
+    return 1
+  }
   docker rm -f "$name" || true
-  "cv_run_$${name//-/_}"
+  "cv_start_$fn"
 }
 
 case "$1" in

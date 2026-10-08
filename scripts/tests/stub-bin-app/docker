@@ -7,6 +7,9 @@ case "$1" in
   pull) echo "sha256:new" >"$state"; echo "Status: Downloaded newer image for $2" ;;
   image) [ -f "$state" ] && cat "$state" || echo "sha256:old" ;;
   rm) echo "$3" ;;
-  run) echo "container-id-stub" ;;
+  run)
+    # T-055: STUB_ENV_DUMP=<file> records the environment `docker run` inherits.
+    [ -z "${STUB_ENV_DUMP:-}" ] || env >"$STUB_ENV_DUMP"
+    echo "container-id-stub" ;;
 esac
 exit 0

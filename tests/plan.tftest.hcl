@@ -2181,7 +2181,7 @@ run "app_host_user_data" {
   # does (COGNITO_ISSUER_URI is read once at boot into $COGNITO_ISSUER_URI,
   # then passed to both containers -- never a literal baked into either).
   assert {
-    condition = length(regexall("-e COGNITO_ISSUER_URI=\"\\$COGNITO_ISSUER_URI\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
+    condition = length(regexall("-e COGNITO_ISSUER_URI=\"\\$CV_(DS|BFF)_COGNITO_ISSUER_URI\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region               = var.aws_region
       project_name             = var.project_name
       environment              = var.environment
@@ -2709,10 +2709,10 @@ run "bff_service_token" {
   assert {
     condition = alltrue([
       for pat in [
-        "-e COGNITO_TOKEN_URL=\"\\$BFF_TOKEN_URL\"",
-        "-e SERVICE_CLIENT_ID=\"\\$BFF_CLIENT_ID\"",
-        "-e SERVICE_CLIENT_SECRET=\"\\$BFF_CLIENT_SECRET\"",
-        "-e SERVICE_TOKEN_SCOPE=\"\\$BFF_TOKEN_SCOPE\"",
+        "-e COGNITO_TOKEN_URL=\"\\$CV_BFF_TOKEN_URL\"",
+        "-e SERVICE_CLIENT_ID=\"\\$CV_BFF_CLIENT_ID\"",
+        "-e SERVICE_CLIENT_SECRET=\"\\$CV_BFF_CLIENT_SECRET\"",
+        "-e SERVICE_TOKEN_SCOPE=\"\\$CV_BFF_TOKEN_SCOPE\"",
         ] : length(regexall(pat, templatefile("${path.module}/templates/domain-service-provision.sh", {
           aws_region               = var.aws_region
           project_name             = var.project_name
@@ -2735,7 +2735,7 @@ run "bff_service_token" {
   assert {
     condition = alltrue([
       for p in ["bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope"] :
-      length(regexall("\\(param ${p}\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      length(regexall("cv_need CV_BFF_[A-Z_]+ ${p} ", templatefile("${path.module}/templates/domain-service-provision.sh", {
         aws_region               = var.aws_region
         project_name             = var.project_name
         environment              = var.environment

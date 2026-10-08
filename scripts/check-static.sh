@@ -696,6 +696,8 @@ else
   needed=$(
     {
       grep -hEo '\$\(param [a-z0-9/_-]+\)' templates/domain-service-provision.sh | sed -E 's/^\$\(param //; s/\)$//'
+      # T-055: cv_resolve_* reads through `cv_need <VAR> <path>`.
+      grep -hEo '\bcv_need [A-Z_]+ [a-z0-9/_-]+' templates/domain-service-provision.sh | awk '{print $3}'
       grep -hEo -- '--name "/\$\{project_name\}/\$\{environment\}/[a-z0-9/_-]+"' templates/domain-service-provision.sh templates/domain-service-bootstrap.sh | sed -E 's|.*\$\{environment\}/||; s|"$||'
     } | sort -u
   )
@@ -809,6 +811,23 @@ elif [ "$logs_seen" -lt 1 ]; then
   bad "no logs: grant found on aws_iam_role.domain_service -- the T-054 awslogs policy is missing or this check is stale"
 else
   ok "the app host role's only logs: actions are CreateLogStream and PutLogEvents (T-054)"
+fi
+
+# --- 23. roll() resolves every input before it removes the container (T-055) ---
+# cv-redeploy's roll() must call cv_resolve_ BEFORE `docker rm`, and cv_start_
+# after it: a failed SSM read must leave the old container serving. The harness
+# (run-cv-redeploy-tests.sh) proves the behaviour; this pins the ordering in
+# the template text so a refactor cannot quietly move the rm back up.
+roll_body=$(awk '/^roll\(\) \{/{c=1} c{print} c&&/^\}/{exit}' templates/domain-service-provision.sh)
+resolve_ln=$(printf '%s\n' "$roll_body" | grep -n 'cv_resolve_' | head -1 | cut -d: -f1 || true)
+rm_ln=$(printf '%s\n' "$roll_body" | grep -n 'docker rm' | head -1 | cut -d: -f1 || true)
+start_ln=$(printf '%s\n' "$roll_body" | grep -n 'cv_start_' | head -1 | cut -d: -f1 || true)
+if [ -z "$roll_body" ] || [ -z "$resolve_ln" ] || [ -z "$rm_ln" ] || [ -z "$start_ln" ]; then
+  bad "roll() in domain-service-provision.sh must call cv_resolve_, docker rm and cv_start_ (T-055)"
+elif [ "$resolve_ln" -lt "$rm_ln" ] && [ "$rm_ln" -lt "$start_ln" ]; then
+  ok "roll() resolves inputs (cv_resolve_) before docker rm, then cv_start_ (T-055)"
+else
+  bad "roll() must order cv_resolve_ < docker rm < cv_start_ (T-055)"
 fi
 
 exit $fail

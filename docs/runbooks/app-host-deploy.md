@@ -8,7 +8,7 @@ cv-redeploy domain-service   # ECR login, pull :latest, print old/new image ids,
 cv-redeploy bff-node         # same, for the BFF
 ```
 
-Any other argument prints usage and exits 2. Each container's run arguments exist once, in `/usr/local/lib/cv-app.sh` (`cv_run_flyway`, `cv_run_domain_service`, `cv_run_bff_node`), which boot and `cv-redeploy` both source. Secrets are read from SSM at call time and never printed. Downtime is that one container's restart (seconds to under a minute for the JVM).
+Any other argument prints usage and exits 2. Each container's run arguments exist once, in `/usr/local/lib/cv-app.sh` (`cv_run_flyway`, `cv_run_domain_service`, `cv_run_bff_node`), which boot and `cv-redeploy` both source. Secrets are read from SSM at call time into function locals and never printed. Since T-055 each container's run arguments live in its `cv_run_*` function, which resolves every input (the instance id and each SSM parameter) *before* the pre-start `docker rm -f` that `cv-redeploy` hands it, so a failed or empty SSM read aborts with a non-zero exit and the old container keeps serving. Downtime is that one container's restart (seconds to under a minute for the JVM).
 
 ## Running a command on the host
 

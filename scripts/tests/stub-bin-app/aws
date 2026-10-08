@@ -6,11 +6,22 @@ case "$1 $2" in
   "ssm get-parameter")
     name=""
     while [ "$#" -gt 0 ]; do [ "$1" = "--name" ] && name="$2"; shift; done
+    # T-055: STUB_AWS_FAIL / STUB_AWS_EMPTY = a substring of the parameter name
+    # whose read should fail (exit 254) / come back empty.
+    if [ -n "${STUB_AWS_FAIL:-}" ] && [[ "$name" == *"$STUB_AWS_FAIL"* ]]; then
+      echo "An error occurred (ThrottlingException) when calling GetParameter" >&2
+      exit 254
+    fi
+    if [ -n "${STUB_AWS_EMPTY:-}" ] && [[ "$name" == *"$STUB_AWS_EMPTY"* ]]; then
+      echo ""
+      exit 0
+    fi
     case "$name" in
       */db/password) echo "SECRET-DB-PASSWORD-1" ;;
       */bff/service-client-secret) echo "SECRET-BFF-CLIENT-2" ;;
       */cognito/issuer-uri) echo "https://issuer.example/pool" ;;
-      *) echo "plain-value" ;;
+      # unique per parameter, so a swapped parameter->variable mapping is visible
+      *) echo "value-of-${name#/cv-project/dev/}" ;;
     esac
     ;;
   "ecr get-login-password") echo "SECRET-ECR-TOKEN-3" ;;

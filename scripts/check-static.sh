@@ -696,6 +696,8 @@ else
   needed=$(
     {
       grep -hEo '\$\(param [a-z0-9/_-]+\)' templates/domain-service-provision.sh | sed -E 's/^\$\(param //; s/\)$//'
+      # T-055: cv_resolve_* reads through `cv_need <VAR> <path>`.
+      grep -hEo '\bcv_need [A-Z_]+ [a-z0-9/_-]+' templates/domain-service-provision.sh | awk '{print $3}'
       grep -hEo -- '--name "/\$\{project_name\}/\$\{environment\}/[a-z0-9/_-]+"' templates/domain-service-provision.sh templates/domain-service-bootstrap.sh | sed -E 's|.*\$\{environment\}/||; s|"$||'
     } | sort -u
   )
@@ -809,6 +811,24 @@ elif [ "$logs_seen" -lt 1 ]; then
   bad "no logs: grant found on aws_iam_role.domain_service -- the T-054 awslogs policy is missing or this check is stale"
 else
   ok "the app host role's only logs: actions are CreateLogStream and PutLogEvents (T-054)"
+fi
+
+# --- 23. roll() hands the rm to cv_run_*, which resolves inputs first (T-055) ---
+# A failed SSM read must leave the old container serving, so roll() must not
+# remove anything itself: its ONLY `docker rm` is the argument list of the
+# cv_run_<svc> call (which runs it after every input is resolved), and that call
+# must not be followed by `||` (a resolve failure has to propagate). Comments
+# are stripped first so a comment cannot satisfy or defeat the check. The
+# harness proves the behaviour; this pins the shape of the template text.
+roll_body=$(awk '/^roll\(\) \{/{c=1} c{print} c&&/^\}/{exit}' templates/domain-service-provision.sh | sed 's/[[:space:]]*#.*$//')
+rm_lines=$(printf '%s\n' "$roll_body" | grep -c 'docker rm' || true)
+call_lines=$(printf '%s\n' "$roll_body" | grep -cE '^[[:space:]]*"cv_run_\$\$\{name//-/_\}" docker rm -f "\$name"[[:space:]]*$' || true)
+if [ -z "$roll_body" ]; then
+  bad "cannot find roll() in domain-service-provision.sh (T-055)"
+elif [ "$rm_lines" -ne 1 ] || [ "$call_lines" -ne 1 ]; then
+  bad "roll() must contain exactly one docker rm, as the arguments of its cv_run_<svc> call (\"cv_run_\$\${name//-/_}\" docker rm -f \"\$name\"), with no || after it (T-055)"
+else
+  ok "roll() removes the container only as cv_run_<svc>'s pre-start hook, after it resolved every input (T-055)"
 fi
 
 exit $fail

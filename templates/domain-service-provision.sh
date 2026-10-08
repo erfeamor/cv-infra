@@ -31,13 +31,14 @@ systemctl enable --now docker
 # The ONE place each container's run arguments are written. Sourced by this
 # boot flow and by /usr/local/bin/cv-redeploy, so the two can never diverge.
 # Secrets are read from SSM at call time (instance role) into function-local
-# variables and never echoed. Quoted heredoc: nothing below expands in this
+# variables (cv_need) and never echoed. Quoted heredoc: nothing below expands in this
 # shell; only Terraform's templatefile() substitutions apply.
 mkdir -p /usr/local/lib
 cat > /usr/local/lib/cv-app.sh <<'CV_APP_LIB'
 # Sourced, never executed. Defines param(), cv_ecr_login() and the cv_run_*
-# functions. Each cv_run_* STARTS its container; removing an old one first is
-# the caller's job (cv-redeploy does `docker rm -f` on exactly one).
+# functions. A cv_run_* STARTS its container; it removes an old one only via the
+# optional pre-start hook its caller passes as arguments, after every input is
+# resolved (T-055). cv-redeploy passes `docker rm -f` of exactly one container.
 CV_DOMAIN_IMAGE="${image}"
 CV_BFF_IMAGE="${bff_image}"
 
@@ -88,8 +89,8 @@ cv_sync_database_repo() {
 # allowPublicKeyRetrieval is required for MySQL 8's caching_sha2_password over
 # the non-TLS docker network.
 cv_run_flyway() {
-  local DB_PASSWORD
-  DB_PASSWORD=$(param db/password)
+  local +x DB_PASSWORD
+  cv_need DB_PASSWORD db/password || return 1
   docker run --rm --network cv \
     -v /opt/cv-database/sql:/flyway/sql:ro \
     -e FLYWAY_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true" \
@@ -100,25 +101,55 @@ cv_run_flyway() {
     flyway/flyway:13.7.0 migrate
 }
 
+# T-055: inputs are resolved BEFORE anything is removed. cv_run_* declares every
+# input `local`, resolves them all (the instance id and each SSM parameter) and
+# only then runs the optional pre-start hook given as its arguments, then
+# `docker run`. A failed or empty read returns 1 naming the parameter, never its
+# value, and neither the hook nor docker run has happened. Boot calls cv_run_*
+# with no arguments; cv-redeploy passes `docker rm -f <name>` so the old
+# container is removed only once every input is in hand. The hook's failure is
+# ignored (as `docker rm -f ... || true` was): there may be nothing to remove,
+# and docker run reports a real name clash. `docker run` is the last command so
+# its exit status is the function's. The secrets live in function locals, are
+# never exported or echoed, and vanish when the function returns. `local +x`: a
+# plain `local` over an already-exported variable of the same name inherits the
+# export flag (bash 5.3), which would hand the secret to aws/docker as environment.
+# cv_need <VARNAME> <ssm-name>: assign the parameter to the caller's VARNAME
+# (which the caller must already have declared `local`, or global in boot), or
+# fail without printing the value.
+cv_need() {
+  local +x v
+  v=$(param "$2") || {
+    echo "FATAL: could not read SSM parameter $2" >&2
+    return 1
+  }
+  if [ -z "$v" ]; then
+    echo "FATAL: SSM parameter $2 is empty" >&2
+    return 1
+  fi
+  printf -v "$1" '%s' "$v"
+}
+
 # Hibernate ddl-auto=validate against the migrated schema.
 cv_run_domain_service() {
-  local DB_PASSWORD COGNITO_ISSUER_URI INSTANCE_ID
-  INSTANCE_ID=$(cv_instance_id) || return 1
-  DB_PASSWORD=$(param db/password)
-  COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
+  local +x CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI
+  CV_DS_INSTANCE_ID=$(cv_instance_id) || return 1
+  cv_need CV_DS_DB_PASSWORD db/password || return 1
+  cv_need CV_DS_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
+  if [ "$#" -gt 0 ]; then "$@" || true; fi
   docker run -d --name domain-service --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
     --log-opt awslogs-group="${log_group_domain_service}" \
-    --log-opt awslogs-stream="domain-service-$INSTANCE_ID" \
+    --log-opt awslogs-stream="domain-service-$CV_DS_INSTANCE_ID" \
     --log-opt awslogs-datetime-format='%Y-%m-%dT%H:%M:%S' \
     --log-opt mode=non-blocking \
     --log-opt max-buffer-size=4m \
     -p 8080:8080 \
     -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true&useSSL=false" \
     -e SPRING_DATASOURCE_USERNAME="${db_username}" \
-    -e SPRING_DATASOURCE_PASSWORD="$DB_PASSWORD" \
-    -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+    -e SPRING_DATASOURCE_PASSWORD="$CV_DS_DB_PASSWORD" \
+    -e COGNITO_ISSUER_URI="$CV_DS_COGNITO_ISSUER_URI" \
     -e AUTH_ENABLED=true \
     -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
     "$CV_DOMAIN_IMAGE"
@@ -130,29 +161,30 @@ cv_run_domain_service() {
 # except the contract's own PUBLIC_ROUTES allowlist. T-043: client-credentials
 # identity for the domain service (Cognito).
 cv_run_bff_node() {
-  local COGNITO_ISSUER_URI BFF_CLIENT_ID BFF_CLIENT_SECRET BFF_TOKEN_URL BFF_TOKEN_SCOPE INSTANCE_ID
-  INSTANCE_ID=$(cv_instance_id) || return 1
-  COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
-  BFF_CLIENT_ID=$(param bff/service-client-id)
-  BFF_CLIENT_SECRET=$(param bff/service-client-secret)
-  BFF_TOKEN_URL=$(param bff/token-url)
-  BFF_TOKEN_SCOPE=$(param bff/token-scope)
+  local +x CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE
+  CV_BFF_INSTANCE_ID=$(cv_instance_id) || return 1
+  cv_need CV_BFF_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
+  cv_need CV_BFF_CLIENT_ID bff/service-client-id || return 1
+  cv_need CV_BFF_CLIENT_SECRET bff/service-client-secret || return 1
+  cv_need CV_BFF_TOKEN_URL bff/token-url || return 1
+  cv_need CV_BFF_TOKEN_SCOPE bff/token-scope || return 1
+  if [ "$#" -gt 0 ]; then "$@" || true; fi
   docker run -d --name bff-node --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
     --log-opt awslogs-group="${log_group_bff_node}" \
-    --log-opt awslogs-stream="bff-node-$INSTANCE_ID" \
+    --log-opt awslogs-stream="bff-node-$CV_BFF_INSTANCE_ID" \
     --log-opt mode=non-blocking \
     --log-opt max-buffer-size=4m \
     -p 3000:3000 \
     -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
     -e AUTH_ENABLED=true \
-    -e COGNITO_ISSUER_URI="$COGNITO_ISSUER_URI" \
+    -e COGNITO_ISSUER_URI="$CV_BFF_COGNITO_ISSUER_URI" \
     -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
-    -e COGNITO_TOKEN_URL="$BFF_TOKEN_URL" \
-    -e SERVICE_CLIENT_ID="$BFF_CLIENT_ID" \
-    -e SERVICE_CLIENT_SECRET="$BFF_CLIENT_SECRET" \
-    -e SERVICE_TOKEN_SCOPE="$BFF_TOKEN_SCOPE" \
+    -e COGNITO_TOKEN_URL="$CV_BFF_TOKEN_URL" \
+    -e SERVICE_CLIENT_ID="$CV_BFF_CLIENT_ID" \
+    -e SERVICE_CLIENT_SECRET="$CV_BFF_CLIENT_SECRET" \
+    -e SERVICE_TOKEN_SCOPE="$CV_BFF_TOKEN_SCOPE" \
     "$CV_BFF_IMAGE"
 }
 CV_APP_LIB
@@ -180,10 +212,10 @@ roll() {
   docker pull "$image"
   new=$(docker image inspect --format '{{.Id}}' "$image")
   echo "$name image: old=$old new=$new"
-  # T-054: fail BEFORE removing the running container if the id is unreadable.
-  cv_instance_id >/dev/null
-  docker rm -f "$name" || true
-  "cv_run_$${name//-/_}"
+  # T-055: cv_run_* resolves every input (instance id + SSM) first, then runs
+  # its arguments (the rm) and starts the container, so a failed read leaves the
+  # old container serving. No `|| true` here: a resolve failure must propagate.
+  "cv_run_$${name//-/_}" docker rm -f "$name"
 }
 
 case "$1" in
@@ -208,7 +240,7 @@ chmod 750 /usr/local/bin/cv-redeploy
 source /usr/local/lib/cv-app.sh
 # MySQL first-init credentials only; Flyway and the services read their own
 # copy at call time (cv_run_*).
-DB_PASSWORD=$(param db/password)
+cv_need DB_PASSWORD db/password
 
 docker network create cv || true
 

@@ -7,6 +7,11 @@ case "$1" in
   pull) echo "sha256:new" >"$state"; echo "Status: Downloaded newer image for $2" ;;
   image) [ -f "$state" ] && cat "$state" || echo "sha256:old" ;;
   rm) echo "$3" ;;
-  run) echo "container-id-stub" ;;
+  run)
+    # T-055: STUB_ENV_DUMP=<file> records the environment `docker run` inherits.
+    [ -z "${STUB_ENV_DUMP:-}" ] || env >"$STUB_ENV_DUMP"
+    # STUB_DOCKER_RUN_FAIL=<code>: make `docker run` fail with that exit status.
+    [ -z "${STUB_DOCKER_RUN_FAIL:-}" ] || { echo "docker: Error response from daemon" >&2; exit "$STUB_DOCKER_RUN_FAIL"; }
+    echo "container-id-stub" ;;
 esac
 exit 0

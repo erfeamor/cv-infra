@@ -11,7 +11,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/../.." && pwd)"
-tpl="$repo_root/templates/domain-service-provision.sh"
+tpl="${CV_TEMPLATE:-$repo_root/templates/domain-service-provision.sh}"  # override: compare against another revision
 
 pass=0
 fail=0
@@ -62,7 +62,7 @@ printf 'not-an-instance-id\n' >"$workdir/instance-id.bad"
 run_redeploy() { # run_redeploy <args...>; sets $rc. ID_FILE selects the fixture.
   : >"$calls"; rm -f "$workdir/state/digest"
   set +e
-  env -i CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
+  env -i ${STUB_AWS_FAIL:+STUB_AWS_FAIL="$STUB_AWS_FAIL"} ${STUB_AWS_EMPTY:+STUB_AWS_EMPTY="$STUB_AWS_EMPTY"} ${STUB_ENV_DUMP:+STUB_ENV_DUMP="$STUB_ENV_DUMP"} ${STUB_DOCKER_RUN_FAIL:+STUB_DOCKER_RUN_FAIL="$STUB_DOCKER_RUN_FAIL"} CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
     bash "$workdir/cv-redeploy" "$@" >"$out" 2>&1
   rc=$?
   set -e
@@ -124,8 +124,8 @@ set -e
 [ "$rc" -ne 0 ] && ok "non-zero exit on pull failure" || bad "pull failure was swallowed"
 ! grep -q '^docker rm ' "$calls" && ok "the running container was left alone" || bad "removed the container despite a failed pull"
 
-# T-054: the awslogs driver, defined once in cv_run_* and so reached by both the
-# boot flow and cv-redeploy.
+# T-054: the awslogs driver, defined once in cv_run_* (the only place the run
+# arguments are written) and so reached by both the boot flow and cv-redeploy.
 awslogs_check() { # awslogs_check <case> <container> <group>
   local c="$1" name="$2" group="$3" line
   line=$(grep "^docker run -d --name $name " "$calls" || true)
@@ -171,6 +171,123 @@ for mode in missing bad empty; do
     grep -q 'FATAL' "$out" && ok "$svc/$mode: clear error" || bad "$svc/$mode: no FATAL message"
   done
 done
+
+# ---- T-055: resolve every input before removing the running container ----
+golden="$here/fixtures/docker-run-args.golden"
+env_dump="$workdir/env.dump"
+
+echo "case 9: a failing or empty SSM read aborts before docker rm / docker run (T-055)"
+# parameter substring that each service reads, incl. the secret ones
+for svc in domain-service bff-node; do
+  if [ "$svc" = domain-service ]; then params="db/password cognito/issuer-uri"
+  else params="cognito/issuer-uri bff/service-client-id bff/service-client-secret bff/token-url bff/token-scope"; fi
+  for p in $params; do
+    for mode in FAIL EMPTY; do
+      env_assign="STUB_AWS_$mode=$p"
+      # shellcheck disable=SC2163
+      export "$env_assign"
+      run_redeploy "$svc"
+      unset "STUB_AWS_$mode"
+      [ "$rc" -ne 0 ] && ok "$svc/$p/$mode: non-zero exit" || bad "$svc/$p/$mode: exit 0"
+      ! grep -q '^docker rm ' "$calls" && ok "$svc/$p/$mode: no docker rm" || bad "$svc/$p/$mode: removed the running container"
+      ! grep -q '^docker run ' "$calls" && ok "$svc/$p/$mode: no docker run" || bad "$svc/$p/$mode: started a container"
+      grep -q "$p" "$out" && ok "$svc/$p/$mode: error names the parameter" || bad "$svc/$p/$mode: error does not name $p"
+      no_secrets "$svc/$p/$mode"
+    done
+  done
+done
+
+echo "case 10: happy path removes then runs exactly once, with the pre-T-055 arguments"
+actual="$workdir/actual.args"
+: >"$actual"
+for svc in domain-service bff-node; do
+  run_redeploy "$svc"
+  [ "$(grep -c '^docker run ' "$calls")" -eq 1 ] && [ "$(grep -c '^docker rm ' "$calls")" -eq 1 ] && ok "$svc: one rm, one run" || bad "$svc: wrong rm/run count"
+  rm_line=$(grep -n '^docker rm ' "$calls" | cut -d: -f1)
+  run_line=$(grep -n '^docker run ' "$calls" | cut -d: -f1)
+  [ "$rm_line" -lt "$run_line" ] && ok "$svc: rm before run" || bad "$svc: run before rm"
+  grep '^docker run ' "$calls" >>"$actual"
+done
+if [ -n "${REGEN_GOLDEN:-}" ]; then cp "$actual" "$golden"; echo "  (golden regenerated)"; fi
+diff -u "$golden" "$actual" >"$workdir/golden.diff" && ok "docker run arguments identical to the master (pre-T-055) golden" || { bad "docker run arguments changed"; cat "$workdir/golden.diff" >&2; }
+
+echo "case 11: secrets are not exported to docker, and never printed"
+for svc in domain-service bff-node; do
+  rm -f "$env_dump"
+  STUB_ENV_DUMP="$env_dump" run_redeploy "$svc"
+  [ -s "$env_dump" ] && ok "$svc: env dump captured" || bad "$svc: no env dump"
+  ! grep -qE 'SECRET-(DB-PASSWORD-1|BFF-CLIENT-2|ECR-TOKEN-3)' "$env_dump" && ok "$svc: no secret in docker's environment" || bad "$svc: a secret is exported"
+  ! grep -qE '^CV_(DS|BFF)_' "$env_dump" && ok "$svc: no CV_DS_/CV_BFF_ variable exported" || bad "$svc: CV_* variable exported"
+  no_secrets "case 11 $svc"
+done
+
+# boot_run <svc: domain_service|bff_node> <snippet run before cv_run_*> [VAR=val ...]
+# Mimics the bootstrap: sources the library and calls cv_run_<svc> with NO
+# arguments, then reports its status and any CV_DS_/CV_BFF_ variable still set.
+boot_run() {
+  local svc="$1" pre="$2"
+  shift 2
+  : >"$calls"; rm -f "$workdir/state/digest" "$env_dump"
+  set +e
+  env -i CV_INSTANCE_ID_FILE="$workdir/instance-id.ok" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" STUB_ENV_DUMP="$env_dump" "$@" \
+    bash -c "source '$workdir/lib/cv-app.sh'; $pre; cv_run_$svc; echo \"cv_run_rc=\$?\"; echo \"set-vars=\$(compgen -A variable | grep -E '^CV_(DS|BFF)_(INSTANCE_ID|DB_PASSWORD|COGNITO_ISSUER_URI|CLIENT_ID|CLIENT_SECRET|TOKEN_URL|TOKEN_SCOPE)$' | tr '\\n' ' ')\"" >"$out" 2>&1
+  set -e
+}
+
+echo "case 12: the bootstrap path (cv_run_*, no arguments) works and leaves no secret variable behind"
+for svc in domain_service bff_node; do
+  boot_run "$svc" true
+  grep -qx 'cv_run_rc=0' "$out" && ok "cv_run_$svc: exit 0" || bad "cv_run_$svc: non-zero"
+  [ "$(grep -c "^docker run -d --name ${svc//_/-} " "$calls")" -eq 1 ] && ok "cv_run_$svc: one docker run" || bad "cv_run_$svc: wrong docker run count"
+  ! grep -q '^docker rm ' "$calls" && ok "cv_run_$svc: no hook, no docker rm" || bad "cv_run_$svc: removed something without a hook"
+  grep -qx 'set-vars=' "$out" && ok "cv_run_$svc: no CV_DS_/CV_BFF_ variable set afterwards" || bad "cv_run_$svc: variables linger: $(grep '^set-vars=' "$out")"
+  ! grep -qE 'SECRET-(DB-PASSWORD-1|BFF-CLIENT-2)' "$env_dump" && ok "cv_run_$svc: secrets not in docker's environment" || bad "cv_run_$svc: secret in docker's environment"
+  no_secrets "cv_run_$svc"
+done
+
+echo "case 13: a docker run failure is a non-zero exit (cv-redeploy and boot)"
+for svc in domain-service bff-node; do
+  STUB_DOCKER_RUN_FAIL=125 run_redeploy "$svc"
+  [ "$rc" -ne 0 ] && ok "cv-redeploy $svc: non-zero when docker run fails" || bad "cv-redeploy $svc: swallowed a docker run failure"
+  no_secrets "case 13 $svc"
+  boot_run "${svc//-/_}" true STUB_DOCKER_RUN_FAIL=125
+  ! grep -qx 'cv_run_rc=0' "$out" && ok "cv_run_${svc//-/_}: non-zero when docker run fails" || bad "cv_run_${svc//-/_}: swallowed a docker run failure"
+  grep -qx 'set-vars=' "$out" && ok "cv_run_${svc//-/_}: no variable lingers after a failed run" || bad "cv_run_${svc//-/_}: variables linger after a failed run"
+done
+
+echo "case 14: a resolve that fails AFTER earlier reads succeeded leaves nothing behind and runs nothing"
+for pair in "domain_service cognito/issuer-uri" "bff_node bff/token-scope" "bff_node bff/service-client-secret"; do
+  set -- $pair
+  boot_run "$1" true STUB_AWS_FAIL="$2"
+  ! grep -qx 'cv_run_rc=0' "$out" && ok "cv_run_$1/$2: non-zero" || bad "cv_run_$1/$2: exit 0"
+  ! grep -q '^docker ' "$calls" && ok "cv_run_$1/$2: no docker call" || bad "cv_run_$1/$2: called docker"
+  grep -qx 'set-vars=' "$out" && ok "cv_run_$1/$2: no variable lingers" || bad "cv_run_$1/$2: variables linger"
+  no_secrets "cv_run_$1/$2"
+done
+
+echo "case 15: the hook runs after resolve, and a pre-exported variable of the same name is never the one used"
+boot_run domain_service 'export CV_DS_DB_PASSWORD=EVIL-PRESET' 
+grep -q '^docker run .*SPRING_DATASOURCE_PASSWORD=SECRET-DB-PASSWORD-1 ' "$calls" && ok "domain-service: used the SSM value, not the preset" || bad "domain-service: the preset leaked into the run"
+! grep -q EVIL-PRESET "$calls" && ok "domain-service: preset not passed on" || bad "domain-service: preset reached docker"
+boot_run bff_node 'export CV_BFF_CLIENT_SECRET=EVIL-PRESET'
+grep -q '^docker run .*SERVICE_CLIENT_SECRET=SECRET-BFF-CLIENT-2 ' "$calls" && ok "bff-node: used the SSM value, not the preset" || bad "bff-node: the preset leaked into the run"
+nosecret_env() { # nosecret_env <label>: docker run's inherited environment holds no SSM secret
+  ! grep -qE 'SECRET-(DB-PASSWORD-1|BFF-CLIENT-2)' "$env_dump" && ok "$1: SSM secret not in docker's environment despite a pre-exported name" || bad "$1: SSM secret exported to docker via the pre-exported name"
+}
+boot_run bff_node 'export CV_BFF_CLIENT_SECRET=EVIL-PRESET'
+nosecret_env "bff-node"
+boot_run domain_service 'export CV_DS_DB_PASSWORD=EVIL-PRESET'
+nosecret_env "domain-service"
+boot_run flyway 'export DB_PASSWORD=EVIL-PRESET'
+nosecret_env "flyway"
+! grep -q EVIL-PRESET "$calls" && ok "flyway: preset not used" || bad "flyway: preset reached docker"
+# hook: failure ignored, runs before docker run, not at all if resolve fails
+: >"$calls"
+set +e
+env -i CV_INSTANCE_ID_FILE="$workdir/instance-id.ok" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
+  bash -c "source '$workdir/lib/cv-app.sh'; cv_run_bff_node false; echo rc=\$?" >"$out" 2>&1
+set -e
+grep -qx 'rc=0' "$out" && grep -q '^docker run ' "$calls" && ok "a failing hook is ignored and docker run still happens" || bad "a failing hook blocked the run"
 
 echo
 echo "cv-redeploy harness: $pass passed, $fail failed"

@@ -90,6 +90,30 @@ Migrations are forward-only; there is no `migrate` rollback. A failed Flyway run
 
 **Lifecycle caveat (T-050):** per repo, ECR keeps `:latest` and the 4 previous `:<sha>` images, and (rule 3) the 20 newest untagged images of any kind: per-arch children, orphans, and digests you replaced. That untagged pool turns over after roughly a few deploys, so a replaced (de-tagged) digest is not safe for long. Beyond that retention there is no rollback from ECR: rebuild the old commit multi-arch and push it as `:latest` (`docker buildx build --platform linux/amd64,linux/arm64 --push -t <repo>:latest .`), then `cv-redeploy <service>`. (`~/.local/share/cv-image-backups/` is an occasional hand-made archive, partial and not maintained; do not rely on it.) A schema migration is not rolled back by any of this.
 
+## Reading the logs (T-054)
+
+domain-service and bff-node ship stdout/stderr to CloudWatch with Docker's `awslogs` driver (set once, in `cv_run_*` in `templates/domain-service-provision.sh`, so the boot flow and `cv-redeploy` both get it). Log groups `/cv-project/cv-domain-service` and `/cv-project/cv-bff-node`, stream `<container>-<instance id>` (a host replacement starts new streams):
+
+```bash
+aws logs tail /cv-project/cv-domain-service --follow --region eu-west-3
+aws logs tail /cv-project/cv-bff-node --since 1h --region eu-west-3
+```
+
+- Retention is **14 days**; the logs survive a host replacement for that long.
+- The driver runs in `non-blocking` mode with a 4 MB buffer: the apps never stall on logging, but when the buffer is full (a long CloudWatch outage) Docker drops the **newest** messages.
+- `docker logs domain-service` (via SSM, as above) still works on the host (dual logging). MySQL is not shipped; it stays on `docker logs mysql`.
+- **A missing grant is silent.** If stream creation never succeeds (the role lacks `logs:CreateLogStream`/`PutLogEvents`), no lines reach CloudWatch at all, `docker logs` still works, and nothing alerts. Check that streams are receiving events:
+
+  ```bash
+  aws logs describe-log-streams --log-group-name /cv-project/cv-domain-service \
+    --order-by LastEventTime --descending --max-items 2 --region eu-west-3
+  ```
+
+  (`lastEventTimestamp` should be recent.)
+- The stream name needs the instance id, read from `/var/lib/cloud/data/instance-id` (no IMDS call); if it is missing or malformed `cv-redeploy` aborts **before** removing the running container.
+- domain-service sets `awslogs-datetime-format` (ISO timestamp), so a Java stack trace stays one CloudWatch event; bff-node does not.
+- The role may only `logs:CreateLogStream` / `logs:PutLogEvents` on those two groups. A new group needs the policy (`app_write_container_logs`) extended.
+
 ## What still needs a host replacement
 
 `cv-redeploy` rolls images and migrations. It does **not** change how a container is configured, because the run arguments are baked into the library the host wrote at boot. These still replace the host (`terraform apply`; the stub embeds the script's SHA-256, so the plan shows `aws_instance.domain_service` replaced):

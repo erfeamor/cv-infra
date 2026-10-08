@@ -29,8 +29,11 @@ locals {
     db_name           = var.db_name
     db_username       = var.db_username
     cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name
-    backup_bucket     = aws_s3_bucket.backup.bucket
-    backup_prefix     = local.mysql_backup_prefix
+    # T-054: the awslogs groups (observability.tf); the names are plan-known.
+    log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+    log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    backup_bucket            = aws_s3_bucket.backup.bucket
+    backup_prefix            = local.mysql_backup_prefix
     # T-018 ruling 2: resolved by volume ID via /dev/disk/by-id, never by
     # device name. See templates/domain-service-provision.sh.
     mysql_volume_id = aws_ebs_volume.mysql_data.id
@@ -76,6 +79,36 @@ resource "aws_iam_role_policy" "app_read_provision_script" {
       Effect   = "Allow"
       Action   = ["s3:GetObject"]
       Resource = "${aws_s3_bucket.ci_artifacts.arn}/${local.app_host_provision_key}"
+    }]
+  })
+}
+
+# T-054: the awslogs driver (run by dockerd on the host, so it uses this role)
+# needs only these two actions, on the two existing groups' streams. No
+# CreateLogGroup (the groups exist), no DescribeLogStreams, no "*". The
+# provider's log-group arn has no trailing ":*", so ":*" is appended once.
+# The actions and resources are named locals so `terraform test` (plan-only)
+# can assert the actions: the group ARNs are unknown until apply, which makes
+# the encoded policy string unknown. scripts/check-static.sh check 22 reads
+# both the policy block and these locals.
+locals {
+  app_container_logs_actions = ["logs:CreateLogStream", "logs:PutLogEvents"]
+  app_container_logs_resources = [
+    "${aws_cloudwatch_log_group.domain_service.arn}:*",
+    "${aws_cloudwatch_log_group.bff_node.arn}:*",
+  ]
+}
+
+resource "aws_iam_role_policy" "app_write_container_logs" {
+  name = "${var.project_name}-app-write-container-logs"
+  role = aws_iam_role.domain_service.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = local.app_container_logs_actions
+      Resource = local.app_container_logs_resources
     }]
   })
 }

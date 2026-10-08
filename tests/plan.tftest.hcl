@@ -2054,17 +2054,19 @@ run "app_host_user_data" {
   # sanity bound; the real user_data wall is guarded on the stub below.
   assert {
     condition = length(templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     })) <= 40000
     error_message = "Rendered domain-service-provision.sh exceeds 40,000 bytes -- it is an S3 object now (T-044), not user_data, but a script this big deserves a split"
   }
@@ -2073,17 +2075,19 @@ run "app_host_user_data" {
   # instance replacement -- was flyway/flyway:10.
   assert {
     condition = length(regexall("flyway/flyway:13\\.7\\.0 migrate", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 1
     error_message = "templates/domain-service-provision.sh must pin flyway/flyway:13.7.0 at the migrate step, not :10"
   }
@@ -2092,17 +2096,19 @@ run "app_host_user_data" {
   # --name bff-node.
   assert {
     condition = length(regexall("docker run -d --name bff-node --restart unless-stopped --network cv", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 1
     error_message = "The BFF docker run must be --name bff-node --restart unless-stopped --network cv"
   }
@@ -2111,17 +2117,19 @@ run "app_host_user_data" {
   # publishes 8080).
   assert {
     condition = length(regexall("-p 3000:3000", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 1
     error_message = "The BFF container must publish port 3000"
   }
@@ -2130,17 +2138,19 @@ run "app_host_user_data" {
   # public EIP -- BFF->domain traffic must not round-trip the internet.
   assert {
     condition = length(regexall("-e DOMAIN_SERVICE_URL=http://domain-service:8080", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 1
     error_message = "The BFF must reach the domain service via http://domain-service:8080 on the cv network, never the public EIP"
   }
@@ -2150,17 +2160,19 @@ run "app_host_user_data" {
   # /bff/api/v1 route would be anonymous, not just the contract's allowlist).
   assert {
     condition = length(regexall("-e AUTH_ENABLED=true", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 2
     error_message = "AUTH_ENABLED=true must be set on both the domain service and the BFF containers"
   }
@@ -2170,17 +2182,19 @@ run "app_host_user_data" {
   # then passed to both containers -- never a literal baked into either).
   assert {
     condition = length(regexall("-e COGNITO_ISSUER_URI=\"\\$COGNITO_ISSUER_URI\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 2
     error_message = "Both the domain service and the BFF must read COGNITO_ISSUER_URI from the same SSM-sourced shell variable, never a literal"
   }
@@ -2194,17 +2208,19 @@ run "app_host_user_data" {
   # assert an absence of.
   assert {
     condition = length(regexall("-e CORS_ALLOWED_ORIGINS=\"https://d1234567890abc\\.cloudfront\\.net\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 1
     error_message = "The BFF's CORS_ALLOWED_ORIGINS must include https://<cloudfront_domain>"
   }
@@ -2215,17 +2231,19 @@ run "app_host_user_data" {
   # templatefile by this point, not the literal "$${bff_image}" placeholder).
   assert {
     condition = length(regexall("until docker pull \"\\$CV_BFF_IMAGE\"; do", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 1
     error_message = "The BFF image pull must retry until the image exists, same pattern as the domain service's own pull loop"
   }
@@ -2239,51 +2257,57 @@ run "app_host_user_data" {
   # half AFTER that split, never in the half before it.
   assert {
     condition = length(split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 2
     error_message = "systemctl enable --now mysql-backup.timer must appear exactly once in the rendered script"
   }
 
   assert {
     condition = length(regexall("(?m)^cv_run_bff_node$", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))[0])) == 0
     error_message = "The BFF start (cv_run_bff_node) must NOT run before the MySQL backup timer is enabled -- a missing BFF image must never block the nightly backup from being installed (T-014 review round 1)"
   }
 
   assert {
     condition = length(regexall("(?m)^cv_run_bff_node$", split("systemctl enable --now mysql-backup.timer", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region        = var.aws_region
-      project_name      = var.project_name
-      environment       = var.environment
-      image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name           = var.db_name
-      db_username       = var.db_username
-      cloudfront_domain = "d1234567890abc.cloudfront.net"
-      backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix     = "mysql-dumps"
-      mysql_volume_id   = "vol-0123456789abcdef0"
+      aws_region               = var.aws_region
+      project_name             = var.project_name
+      environment              = var.environment
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = var.db_name
+      db_username              = var.db_username
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = "/cv-project/cv-domain-service"
+      log_group_bff_node       = "/cv-project/cv-bff-node"
     }))[1])) == 1
     error_message = "The BFF start (cv_run_bff_node) must run AFTER the MySQL backup timer is enabled (T-014 review round 1)"
   }
@@ -2299,17 +2323,19 @@ run "app_host_user_data" {
         "docker run -d --name bff-node ",
         "flyway/flyway:13\\.7\\.0 migrate",
         ] : length(regexall(pat, templatefile("${path.module}/templates/domain-service-provision.sh", {
-          aws_region        = var.aws_region
-          project_name      = var.project_name
-          environment       = var.environment
-          image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-          bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-          db_name           = var.db_name
-          db_username       = var.db_username
-          cloudfront_domain = "d1234567890abc.cloudfront.net"
-          backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-          backup_prefix     = "mysql-dumps"
-          mysql_volume_id   = "vol-0123456789abcdef0"
+          aws_region               = var.aws_region
+          project_name             = var.project_name
+          environment              = var.environment
+          image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+          bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+          db_name                  = var.db_name
+          db_username              = var.db_username
+          cloudfront_domain        = "d1234567890abc.cloudfront.net"
+          backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+          backup_prefix            = "mysql-dumps"
+          mysql_volume_id          = "vol-0123456789abcdef0"
+          log_group_domain_service = "/cv-project/cv-domain-service"
+          log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     ])
     error_message = "docker run for domain-service, bff-node and flyway must each appear exactly once in the provisioning script (inside their cv_run_* function), shared by boot and cv-redeploy (T-044)"
@@ -2319,17 +2345,19 @@ run "app_host_user_data" {
     condition = alltrue([
       for fn in ["cv_run_flyway", "cv_run_domain_service", "cv_run_bff_node"] :
       length(regexall("(?m)^${fn}\\(\\) \\{$", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     ])
     error_message = "cv_run_flyway, cv_run_domain_service and cv_run_bff_node must each be defined exactly once (T-044)"
@@ -2340,17 +2368,19 @@ run "app_host_user_data" {
     condition = alltrue([
       for fn in ["cv_run_flyway", "cv_run_domain_service", "cv_run_bff_node"] :
       length(regexall("(?m)^[ ]*${fn}$", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) >= 1
     ])
     error_message = "the boot flow must call cv_run_flyway, cv_run_domain_service and cv_run_bff_node (T-044)"
@@ -2360,17 +2390,19 @@ run "app_host_user_data" {
   assert {
     condition = alltrue([
       length(regexall("(?s)docker run -d --name mysql .*\ncv_run_flyway\n.*\ncv_run_domain_service\n.*systemctl enable --now mysql-backup\\.timer.*\ncv_run_bff_node\n", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     ])
     error_message = "boot order must be mysql, cv_run_flyway, cv_run_domain_service, backup timer, cv_run_bff_node (T-014 round 1 ordering)"
@@ -2380,30 +2412,34 @@ run "app_host_user_data" {
   assert {
     condition = (
       length(regexall("CV_BFF_IMAGE=\"123456789012\\.dkr\\.ecr\\.eu-west-3\\.amazonaws\\.com/cv-project-bff-node:latest\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1 &&
       length(regexall("CV_DOMAIN_IMAGE=\"123456789012\\.dkr\\.ecr\\.eu-west-3\\.amazonaws\\.com/cv-project-domain-service:latest\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     )
     error_message = "the library must define CV_DOMAIN_IMAGE and CV_BFF_IMAGE from the ECR repo URLs"
@@ -2413,56 +2449,64 @@ run "app_host_user_data" {
   assert {
     condition = (
       length(regexall("chmod 750 /usr/local/bin/cv-redeploy", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1 &&
       length(regexall("(?m)^  migrate\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1 &&
       length(regexall("(?m)^  domain-service\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1 &&
       length(regexall("(?m)^  bff-node\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     )
     error_message = "cv-redeploy must be installed 0750 and handle exactly migrate, domain-service and bff-node (T-044)"
@@ -2670,17 +2714,19 @@ run "bff_service_token" {
         "-e SERVICE_CLIENT_SECRET=\"\\$BFF_CLIENT_SECRET\"",
         "-e SERVICE_TOKEN_SCOPE=\"\\$BFF_TOKEN_SCOPE\"",
         ] : length(regexall(pat, templatefile("${path.module}/templates/domain-service-provision.sh", {
-          aws_region        = var.aws_region
-          project_name      = var.project_name
-          environment       = var.environment
-          image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-          bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-          db_name           = var.db_name
-          db_username       = var.db_username
-          cloudfront_domain = "d1234567890abc.cloudfront.net"
-          backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-          backup_prefix     = "mysql-dumps"
-          mysql_volume_id   = "vol-0123456789abcdef0"
+          aws_region               = var.aws_region
+          project_name             = var.project_name
+          environment              = var.environment
+          image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+          bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+          db_name                  = var.db_name
+          db_username              = var.db_username
+          cloudfront_domain        = "d1234567890abc.cloudfront.net"
+          backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+          backup_prefix            = "mysql-dumps"
+          mysql_volume_id          = "vol-0123456789abcdef0"
+          log_group_domain_service = "/cv-project/cv-domain-service"
+          log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     ])
     error_message = "the BFF docker run (cv_run_bff_node) must pass COGNITO_TOKEN_URL, SERVICE_CLIENT_ID, SERVICE_CLIENT_SECRET, SERVICE_TOKEN_SCOPE from shell variables (T-043)"
@@ -2690,17 +2736,19 @@ run "bff_service_token" {
     condition = alltrue([
       for p in ["bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope"] :
       length(regexall("\\(param ${p}\\)", templatefile("${path.module}/templates/domain-service-provision.sh", {
-        aws_region        = var.aws_region
-        project_name      = var.project_name
-        environment       = var.environment
-        image             = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-        bff_image         = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-        db_name           = var.db_name
-        db_username       = var.db_username
-        cloudfront_domain = "d1234567890abc.cloudfront.net"
-        backup_bucket     = "${var.project_name}-mysql-backup-${var.environment}"
-        backup_prefix     = "mysql-dumps"
-        mysql_volume_id   = "vol-0123456789abcdef0"
+        aws_region               = var.aws_region
+        project_name             = var.project_name
+        environment              = var.environment
+        image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+        bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+        db_name                  = var.db_name
+        db_username              = var.db_username
+        cloudfront_domain        = "d1234567890abc.cloudfront.net"
+        backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+        backup_prefix            = "mysql-dumps"
+        mysql_volume_id          = "vol-0123456789abcdef0"
+        log_group_domain_service = "/cv-project/cv-domain-service"
+        log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     ])
     error_message = "user_data must read each of the four bff/* parameters once via param()"
@@ -3412,5 +3460,121 @@ run "t050_ecr_lifecycle_rules" {
   assert {
     condition     = local.ecr_orphan_headroom >= 2 * local.ecr_children_per_index
     error_message = "orphan headroom must be at least 2 x children per index"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# T-054: container logs to CloudWatch (awslogs). Plan-only, target-scoped to
+# the new policy and the S3 object that carries the rendered provision script.
+# The awslogs driver runs in dockerd on the host, so the grant is on the app
+# host's role: CreateLogStream + PutLogEvents on the two groups' streams, no
+# CreateLogGroup (the groups exist), no DescribeLogStreams, no wildcard.
+# ---------------------------------------------------------------------------
+run "t054_app_container_logs" {
+  command = plan
+
+  plan_options {
+    target = [
+      aws_iam_role_policy.app_write_container_logs,
+      aws_cloudwatch_log_group.domain_service,
+      aws_cloudwatch_log_group.bff_node,
+    ]
+  }
+
+  # The real script's content is unknown-until-apply (cloudfront_domain), so
+  # render with fixtures for the unknowns and the real plan-known group names.
+  # Same pattern as app_host_user_data above.
+  assert {
+    condition     = aws_iam_role_policy.app_write_container_logs.role == aws_iam_role.domain_service.id
+    error_message = "the container-logs grant must attach to the domain_service (app host) role"
+  }
+
+  assert {
+    condition     = local.app_container_logs_actions == ["logs:CreateLogStream", "logs:PutLogEvents"]
+    error_message = "the grant must be exactly logs:CreateLogStream and logs:PutLogEvents (no CreateLogGroup, DescribeLogStreams or wildcard)"
+  }
+
+  # The group ARNs are unknown until apply, so the two stream ARNs themselves
+  # (<group arn>:*, no doubled :*) are guarded by scripts/check-static.sh check 22.
+  assert {
+    condition     = length(local.app_container_logs_resources) == 2
+    error_message = "the grant must cover exactly the two groups' stream ARNs"
+  }
+
+  # The rendered provision script (the S3 object's content) names both groups.
+  assert {
+    condition = length(regexall("--log-opt awslogs-group=\"/cv-project/cv-domain-service\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 1
+    error_message = "the rendered provision script must pass /cv-project/cv-domain-service as the domain-service awslogs group"
+  }
+
+  assert {
+    condition = length(regexall("--log-opt awslogs-group=\"/cv-project/cv-bff-node\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 1
+    error_message = "the rendered provision script must pass /cv-project/cv-bff-node as the bff-node awslogs group"
+  }
+
+  assert {
+    condition = length(regexall("--log-driver awslogs", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 2
+    error_message = "exactly two containers (domain-service, bff-node) use the awslogs driver"
+  }
+
+  assert {
+    condition = length(regexall("--log-opt awslogs-datetime-format='%Y-%m-%dT%H:%M:%S'", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      cloudfront_domain        = "d1234567890abc.cloudfront.net"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 1
+    error_message = "only domain-service sets awslogs-datetime-format (stack traces stay one event)"
   }
 }

@@ -52,6 +52,27 @@ cv_ecr_login() {
     | docker login --username AWS --password-stdin "$(echo "$CV_DOMAIN_IMAGE" | cut -d/ -f1)"
 }
 
+# T-054: the EC2 instance id for the awslogs stream names, from the file
+# cloud-init writes before user_data runs (no network call, so neither boot nor
+# a redeploy gains an IMDS dependency). Fails loudly rather than yielding an
+# empty or malformed stream name. The path is overridable for the test harness.
+cv_instance_id() {
+  local f id
+  f="$${CV_INSTANCE_ID_FILE:-/var/lib/cloud/data/instance-id}"
+  if [ ! -r "$f" ]; then
+    echo "FATAL: cannot read the instance id from $f (awslogs stream name needs it)" >&2
+    return 1
+  fi
+  id=$(head -n 1 "$f" | tr -d '[:space:]')
+  case "$id" in
+    i-?*) printf '%s' "$id" ;;
+    *)
+      echo "FATAL: unexpected instance id in $f: '$id'" >&2
+      return 1
+      ;;
+  esac
+}
+
 # Clone on first use, fast-forward afterwards (a no-op when current).
 cv_sync_database_repo() {
   if [ -d /opt/cv-database/.git ]; then
@@ -81,10 +102,18 @@ cv_run_flyway() {
 
 # Hibernate ddl-auto=validate against the migrated schema.
 cv_run_domain_service() {
-  local DB_PASSWORD COGNITO_ISSUER_URI
+  local DB_PASSWORD COGNITO_ISSUER_URI INSTANCE_ID
+  INSTANCE_ID=$(cv_instance_id) || return 1
   DB_PASSWORD=$(param db/password)
   COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
   docker run -d --name domain-service --restart unless-stopped --network cv \
+    --log-driver awslogs \
+    --log-opt awslogs-region="${aws_region}" \
+    --log-opt awslogs-group="${log_group_domain_service}" \
+    --log-opt awslogs-stream="domain-service-$INSTANCE_ID" \
+    --log-opt awslogs-datetime-format='%Y-%m-%dT%H:%M:%S' \
+    --log-opt mode=non-blocking \
+    --log-opt max-buffer-size=4m \
     -p 8080:8080 \
     -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true&useSSL=false" \
     -e SPRING_DATASOURCE_USERNAME="${db_username}" \
@@ -101,13 +130,20 @@ cv_run_domain_service() {
 # except the contract's own PUBLIC_ROUTES allowlist. T-043: client-credentials
 # identity for the domain service (Cognito).
 cv_run_bff_node() {
-  local COGNITO_ISSUER_URI BFF_CLIENT_ID BFF_CLIENT_SECRET BFF_TOKEN_URL BFF_TOKEN_SCOPE
+  local COGNITO_ISSUER_URI BFF_CLIENT_ID BFF_CLIENT_SECRET BFF_TOKEN_URL BFF_TOKEN_SCOPE INSTANCE_ID
+  INSTANCE_ID=$(cv_instance_id) || return 1
   COGNITO_ISSUER_URI=$(param cognito/issuer-uri)
   BFF_CLIENT_ID=$(param bff/service-client-id)
   BFF_CLIENT_SECRET=$(param bff/service-client-secret)
   BFF_TOKEN_URL=$(param bff/token-url)
   BFF_TOKEN_SCOPE=$(param bff/token-scope)
   docker run -d --name bff-node --restart unless-stopped --network cv \
+    --log-driver awslogs \
+    --log-opt awslogs-region="${aws_region}" \
+    --log-opt awslogs-group="${log_group_bff_node}" \
+    --log-opt awslogs-stream="bff-node-$INSTANCE_ID" \
+    --log-opt mode=non-blocking \
+    --log-opt max-buffer-size=4m \
     -p 3000:3000 \
     -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
     -e AUTH_ENABLED=true \
@@ -144,6 +180,8 @@ roll() {
   docker pull "$image"
   new=$(docker image inspect --format '{{.Id}}' "$image")
   echo "$name image: old=$old new=$new"
+  # T-054: fail BEFORE removing the running container if the id is unreadable.
+  cv_instance_id >/dev/null
   docker rm -f "$name" || true
   "cv_run_$${name//-/_}"
 }

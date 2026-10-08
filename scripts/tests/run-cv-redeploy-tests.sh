@@ -36,6 +36,8 @@ render() {
     -e 's#\${environment}#dev#g' \
     -e 's#\${image}#123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest#g' \
     -e 's#\${bff_image}#123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest#g' \
+    -e 's#\${log_group_domain_service}#/cv-project/cv-domain-service#g' \
+    -e 's#\${log_group_bff_node}#/cv-project/cv-bff-node#g' \
     -e 's#\${db_name}#cvdb#g' \
     -e 's#\${db_username}#cvuser#g' \
     -e 's#\${cloudfront_domain}#d111.cloudfront.net#g' \
@@ -52,10 +54,15 @@ chmod +x "$workdir/cv-redeploy"
 calls="$workdir/calls.log"
 out="$workdir/out.log"
 
-run_redeploy() { # run_redeploy <args...>; sets $rc
+# cv_instance_id reads cloud-init's file (T-054), overridable via CV_INSTANCE_ID_FILE.
+printf 'i-0abc123def4567890\n' >"$workdir/instance-id.ok"
+printf 'not-an-instance-id\n' >"$workdir/instance-id.bad"
+: >"$workdir/instance-id.empty"
+
+run_redeploy() { # run_redeploy <args...>; sets $rc. ID_FILE selects the fixture.
   : >"$calls"; rm -f "$workdir/state/digest"
   set +e
-  env -i PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
+  env -i CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
     bash "$workdir/cv-redeploy" "$@" >"$out" 2>&1
   rc=$?
   set -e
@@ -116,6 +123,54 @@ rc=$?
 set -e
 [ "$rc" -ne 0 ] && ok "non-zero exit on pull failure" || bad "pull failure was swallowed"
 ! grep -q '^docker rm ' "$calls" && ok "the running container was left alone" || bad "removed the container despite a failed pull"
+
+# T-054: the awslogs driver, defined once in cv_run_* and so reached by both the
+# boot flow and cv-redeploy.
+awslogs_check() { # awslogs_check <case> <container> <group>
+  local c="$1" name="$2" group="$3" line
+  line=$(grep "^docker run -d --name $name " "$calls" || true)
+  for want in "--log-driver awslogs" "--log-opt awslogs-region=eu-west-3" \
+    "--log-opt awslogs-group=$group" "--log-opt awslogs-stream=$name-i-0abc123def4567890" \
+    "--log-opt mode=non-blocking" "--log-opt max-buffer-size=4m"; do
+    case "$line" in
+      *" $want "*) ok "$c: $want" ;;
+      *) bad "$c: missing '$want' in the $name run" ;;
+    esac
+  done
+}
+
+echo "case 6: awslogs on domain-service and bff-node (T-054)"
+run_redeploy domain-service
+awslogs_check "case 6a" domain-service /cv-project/cv-domain-service
+grep '^docker run -d --name domain-service ' "$calls" | grep -q -- ' --log-opt awslogs-datetime-format=%Y-%m-%dT%H:%M:%S ' && ok "domain-service: multiline datetime format" || bad "domain-service: no awslogs-datetime-format"
+run_redeploy bff-node
+awslogs_check "case 6b" bff-node /cv-project/cv-bff-node
+! grep '^docker run -d --name bff-node ' "$calls" | grep -q datetime-format && ok "bff-node: no datetime format" || bad "bff-node: has a datetime format"
+
+echo "case 7: mysql and flyway do not use awslogs"
+run_redeploy migrate
+! grep -q 'log-driver\|log-opt' "$calls" && ok "flyway run has no log options" || bad "flyway run carries log options"
+if grep -n 'docker run -d --name mysql' "$tpl" >/dev/null; then
+  mysql_run=$(awk '/docker run -d --name mysql/{c=1} c{print} c&&/performance-schema/{exit}' "$tpl")
+  case "$mysql_run" in
+    *log-driver*|*log-opt*) bad "the mysql run carries log options" ;;
+    *) ok "the mysql run carries no log options" ;;
+  esac
+else
+  bad "could not find the mysql run in the template"
+fi
+
+echo "case 8: a missing/malformed instance-id file aborts instead of producing an empty stream"
+for mode in missing bad empty; do
+  for svc in domain-service bff-node; do
+    if [ "$mode" = missing ]; then f="$workdir/nonexistent"; else f="$workdir/instance-id.$mode"; fi
+    ID_FILE=$f run_redeploy "$svc"
+    [ "$rc" -ne 0 ] && ok "$svc/$mode: non-zero exit" || bad "$svc/$mode: exit 0 despite a bad instance-id file"
+    ! grep -q '^docker run ' "$calls" && ok "$svc/$mode: container not started" || bad "$svc/$mode: container started"
+    ! grep -q '^docker rm ' "$calls" && ok "$svc/$mode: running container left alone" || bad "$svc/$mode: removed the running container"
+    grep -q 'FATAL' "$out" && ok "$svc/$mode: clear error" || bad "$svc/$mode: no FATAL message"
+  done
+done
 
 echo
 echo "cv-redeploy harness: $pass passed, $fail failed"

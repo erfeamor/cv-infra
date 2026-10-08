@@ -2178,25 +2178,31 @@ run "app_host_user_data" {
   }
 
   # Ruling 5: the BFF reads its issuer from SSM exactly as the domain service
-  # does (COGNITO_ISSUER_URI is read once at boot into $COGNITO_ISSUER_URI,
-  # then passed to both containers -- never a literal baked into either).
+  # does (each cv_run_* reads cognito/issuer-uri via cv_need into its own local,
+  # CV_DS_COGNITO_ISSUER_URI / CV_BFF_COGNITO_ISSUER_URI, and passes that to its
+  # container -- never a literal baked into either).
   assert {
-    condition = length(regexall("-e COGNITO_ISSUER_URI=\"\\$CV_(DS|BFF)_COGNITO_ISSUER_URI\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
-      aws_region               = var.aws_region
-      project_name             = var.project_name
-      environment              = var.environment
-      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
-      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
-      db_name                  = var.db_name
-      db_username              = var.db_username
-      cloudfront_domain        = "d1234567890abc.cloudfront.net"
-      backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
-      backup_prefix            = "mysql-dumps"
-      mysql_volume_id          = "vol-0123456789abcdef0"
-      log_group_domain_service = "/cv-project/cv-domain-service"
-      log_group_bff_node       = "/cv-project/cv-bff-node"
-    }))) == 2
-    error_message = "Both the domain service and the BFF must read COGNITO_ISSUER_URI from the same SSM-sourced shell variable, never a literal"
+    condition = alltrue([
+      for pat in [
+        "-e COGNITO_ISSUER_URI=\"\\$CV_DS_COGNITO_ISSUER_URI\"",
+        "-e COGNITO_ISSUER_URI=\"\\$CV_BFF_COGNITO_ISSUER_URI\"",
+        ] : length(regexall(pat, templatefile("${path.module}/templates/domain-service-provision.sh", {
+          aws_region               = var.aws_region
+          project_name             = var.project_name
+          environment              = var.environment
+          image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+          bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+          db_name                  = var.db_name
+          db_username              = var.db_username
+          cloudfront_domain        = "d1234567890abc.cloudfront.net"
+          backup_bucket            = "${var.project_name}-mysql-backup-${var.environment}"
+          backup_prefix            = "mysql-dumps"
+          mysql_volume_id          = "vol-0123456789abcdef0"
+          log_group_domain_service = "/cv-project/cv-domain-service"
+          log_group_bff_node       = "/cv-project/cv-bff-node"
+      }))) == 1
+    ])
+    error_message = "Both the domain service and the BFF must pass COGNITO_ISSUER_URI from its own SSM-sourced local (CV_DS_/CV_BFF_COGNITO_ISSUER_URI), never a literal"
   }
 
   # Ruling 6: CORS_ALLOWED_ORIGINS on the BFF is EXACTLY https://<cloudfront
@@ -2729,7 +2735,7 @@ run "bff_service_token" {
           log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     ])
-    error_message = "the BFF docker run (cv_run_bff_node) must pass COGNITO_TOKEN_URL, SERVICE_CLIENT_ID, SERVICE_CLIENT_SECRET, SERVICE_TOKEN_SCOPE from shell variables (T-043)"
+    error_message = "the BFF docker run (cv_run_bff_node) must pass COGNITO_TOKEN_URL, SERVICE_CLIENT_ID, SERVICE_CLIENT_SECRET, SERVICE_TOKEN_SCOPE from its CV_BFF_* locals (T-043)"
   }
 
   assert {
@@ -2751,7 +2757,7 @@ run "bff_service_token" {
         log_group_bff_node       = "/cv-project/cv-bff-node"
       }))) == 1
     ])
-    error_message = "user_data must read each of the four bff/* parameters once via param()"
+    error_message = "user_data must read each of the four bff/* parameters once via cv_need (into the CV_BFF_* locals of cv_run_bff_node)"
   }
 }
 

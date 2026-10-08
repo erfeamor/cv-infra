@@ -31,13 +31,14 @@ systemctl enable --now docker
 # The ONE place each container's run arguments are written. Sourced by this
 # boot flow and by /usr/local/bin/cv-redeploy, so the two can never diverge.
 # Secrets are read from SSM at call time (instance role) into function-local
-# variables and never echoed. Quoted heredoc: nothing below expands in this
+# variables (cv_need) and never echoed. Quoted heredoc: nothing below expands in this
 # shell; only Terraform's templatefile() substitutions apply.
 mkdir -p /usr/local/lib
 cat > /usr/local/lib/cv-app.sh <<'CV_APP_LIB'
 # Sourced, never executed. Defines param(), cv_ecr_login() and the cv_run_*
-# functions (each = cv_resolve_* then cv_start_*, T-055). Starting a container
-# does not remove an old one first; that is the caller's job (cv-redeploy does `docker rm -f` on exactly one).
+# functions. A cv_run_* STARTS its container; it removes an old one only via the
+# optional pre-start hook its caller passes as arguments, after every input is
+# resolved (T-055). cv-redeploy passes `docker rm -f` of exactly one container.
 CV_DOMAIN_IMAGE="${image}"
 CV_BFF_IMAGE="${bff_image}"
 
@@ -89,7 +90,7 @@ cv_sync_database_repo() {
 # the non-TLS docker network.
 cv_run_flyway() {
   local DB_PASSWORD
-  DB_PASSWORD=$(param db/password)
+  cv_need DB_PASSWORD db/password || return 1
   docker run --rm --network cv \
     -v /opt/cv-database/sql:/flyway/sql:ro \
     -e FLYWAY_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true" \
@@ -100,14 +101,20 @@ cv_run_flyway() {
     flyway/flyway:13.7.0 migrate
 }
 
-# T-055: resolve every input BEFORE anything is removed. cv_resolve_* reads the
-# instance id and every SSM parameter into process-global, NON-exported shell
-# variables (CV_DS_*, CV_BFF_*; `local` would not survive to cv_start_*), and
-# fails -- naming the parameter, never its value -- if any read fails or is
-# empty. cv_start_* then runs `docker run` and unsets the secrets. cv_run_* is
-# the boot flow's resolve-then-start; cv-redeploy calls the halves itself so it
-# can `docker rm -f` between them. Never export these, never echo them.
-# cv_need <VARNAME> <ssm-name>: assign param to VARNAME, or fail without a value.
+# T-055: inputs are resolved BEFORE anything is removed. cv_run_* declares every
+# input `local`, resolves them all (the instance id and each SSM parameter) and
+# only then runs the optional pre-start hook given as its arguments, then
+# `docker run`. A failed or empty read returns 1 naming the parameter, never its
+# value, and neither the hook nor docker run has happened. Boot calls cv_run_*
+# with no arguments; cv-redeploy passes `docker rm -f <name>` so the old
+# container is removed only once every input is in hand. The hook's failure is
+# ignored (as `docker rm -f ... || true` was): there may be nothing to remove,
+# and docker run reports a real name clash. `docker run` is the last command so
+# its exit status is the function's. The secrets live in function locals, are
+# never exported or echoed, and vanish when the function returns.
+# cv_need <VARNAME> <ssm-name>: assign the parameter to the caller's VARNAME
+# (which the caller must already have declared `local`, or global in boot), or
+# fail without printing the value.
 cv_need() {
   local v
   v=$(param "$2") || {
@@ -121,24 +128,13 @@ cv_need() {
   printf -v "$1" '%s' "$v"
 }
 
-cv_clear_domain_service() {
-  unset CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI
-}
-
-cv_clear_bff_node() {
-  unset CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE
-}
-
-cv_resolve_domain_service() {
-  CV_DS_INSTANCE_ID=$(cv_instance_id) || { cv_clear_domain_service; return 1; }
-  cv_need CV_DS_DB_PASSWORD db/password \
-    && cv_need CV_DS_COGNITO_ISSUER_URI cognito/issuer-uri \
-    || { cv_clear_domain_service; return 1; }
-}
-
 # Hibernate ddl-auto=validate against the migrated schema.
-cv_start_domain_service() {
-  local rc=0
+cv_run_domain_service() {
+  local CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI
+  CV_DS_INSTANCE_ID=$(cv_instance_id) || return 1
+  cv_need CV_DS_DB_PASSWORD db/password || return 1
+  cv_need CV_DS_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
+  if [ "$#" -gt 0 ]; then "$@" || true; fi
   docker run -d --name domain-service --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
@@ -154,13 +150,7 @@ cv_start_domain_service() {
     -e COGNITO_ISSUER_URI="$CV_DS_COGNITO_ISSUER_URI" \
     -e AUTH_ENABLED=true \
     -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
-    "$CV_DOMAIN_IMAGE" || rc=$?
-  cv_clear_domain_service
-  return "$rc"
-}
-
-cv_run_domain_service() {
-  cv_resolve_domain_service && cv_start_domain_service
+    "$CV_DOMAIN_IMAGE"
 }
 
 # cv-bff-node (T-014): same box, same `cv` network. DOMAIN_SERVICE_URL is
@@ -168,18 +158,15 @@ cv_run_domain_service() {
 # defaults it off for local dev only): every route under /bff/api/v1 is gated
 # except the contract's own PUBLIC_ROUTES allowlist. T-043: client-credentials
 # identity for the domain service (Cognito).
-cv_resolve_bff_node() {
-  CV_BFF_INSTANCE_ID=$(cv_instance_id) || { cv_clear_bff_node; return 1; }
-  cv_need CV_BFF_COGNITO_ISSUER_URI cognito/issuer-uri \
-    && cv_need CV_BFF_CLIENT_ID bff/service-client-id \
-    && cv_need CV_BFF_CLIENT_SECRET bff/service-client-secret \
-    && cv_need CV_BFF_TOKEN_URL bff/token-url \
-    && cv_need CV_BFF_TOKEN_SCOPE bff/token-scope \
-    || { cv_clear_bff_node; return 1; }
-}
-
-cv_start_bff_node() {
-  local rc=0
+cv_run_bff_node() {
+  local CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE
+  CV_BFF_INSTANCE_ID=$(cv_instance_id) || return 1
+  cv_need CV_BFF_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
+  cv_need CV_BFF_CLIENT_ID bff/service-client-id || return 1
+  cv_need CV_BFF_CLIENT_SECRET bff/service-client-secret || return 1
+  cv_need CV_BFF_TOKEN_URL bff/token-url || return 1
+  cv_need CV_BFF_TOKEN_SCOPE bff/token-scope || return 1
+  if [ "$#" -gt 0 ]; then "$@" || true; fi
   docker run -d --name bff-node --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
@@ -196,13 +183,7 @@ cv_start_bff_node() {
     -e SERVICE_CLIENT_ID="$CV_BFF_CLIENT_ID" \
     -e SERVICE_CLIENT_SECRET="$CV_BFF_CLIENT_SECRET" \
     -e SERVICE_TOKEN_SCOPE="$CV_BFF_TOKEN_SCOPE" \
-    "$CV_BFF_IMAGE" || rc=$?
-  cv_clear_bff_node
-  return "$rc"
-}
-
-cv_run_bff_node() {
-  cv_resolve_bff_node && cv_start_bff_node
+    "$CV_BFF_IMAGE"
 }
 CV_APP_LIB
 chmod 644 /usr/local/lib/cv-app.sh
@@ -223,21 +204,16 @@ usage() {
 
 # Recreate ONLY the named container from a freshly pulled :latest.
 roll() {
-  local name="$1" image="$2" old new fn
+  local name="$1" image="$2" old new
   cv_ecr_login
   old=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || echo none)
   docker pull "$image"
   new=$(docker image inspect --format '{{.Id}}' "$image")
   echo "$name image: old=$old new=$new"
-  # T-055: resolve EVERY input (instance id + SSM) before removing anything, so a
-  # failed read leaves the old container serving.
-  fn="$${name//-/_}"
-  "cv_resolve_$fn" || {
-    echo "FATAL: $name inputs not resolved; the running container was left untouched" >&2
-    return 1
-  }
-  docker rm -f "$name" || true
-  "cv_start_$fn"
+  # T-055: cv_run_* resolves every input (instance id + SSM) first, then runs
+  # its arguments (the rm) and starts the container, so a failed read leaves the
+  # old container serving. No `|| true` here: a resolve failure must propagate.
+  "cv_run_$${name//-/_}" docker rm -f "$name"
 }
 
 case "$1" in
@@ -262,7 +238,7 @@ chmod 750 /usr/local/bin/cv-redeploy
 source /usr/local/lib/cv-app.sh
 # MySQL first-init credentials only; Flyway and the services read their own
 # copy at call time (cv_run_*).
-DB_PASSWORD=$(param db/password)
+cv_need DB_PASSWORD db/password
 
 docker network create cv || true
 

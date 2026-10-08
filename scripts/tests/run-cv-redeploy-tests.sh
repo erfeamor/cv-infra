@@ -62,7 +62,7 @@ printf 'not-an-instance-id\n' >"$workdir/instance-id.bad"
 run_redeploy() { # run_redeploy <args...>; sets $rc. ID_FILE selects the fixture.
   : >"$calls"; rm -f "$workdir/state/digest"
   set +e
-  env -i ${STUB_AWS_FAIL:+STUB_AWS_FAIL="$STUB_AWS_FAIL"} ${STUB_AWS_EMPTY:+STUB_AWS_EMPTY="$STUB_AWS_EMPTY"} ${STUB_ENV_DUMP:+STUB_ENV_DUMP="$STUB_ENV_DUMP"} CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
+  env -i ${STUB_AWS_FAIL:+STUB_AWS_FAIL="$STUB_AWS_FAIL"} ${STUB_AWS_EMPTY:+STUB_AWS_EMPTY="$STUB_AWS_EMPTY"} ${STUB_ENV_DUMP:+STUB_ENV_DUMP="$STUB_ENV_DUMP"} ${STUB_DOCKER_RUN_FAIL:+STUB_DOCKER_RUN_FAIL="$STUB_DOCKER_RUN_FAIL"} CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
     bash "$workdir/cv-redeploy" "$@" >"$out" 2>&1
   rc=$?
   set -e
@@ -124,8 +124,8 @@ set -e
 [ "$rc" -ne 0 ] && ok "non-zero exit on pull failure" || bad "pull failure was swallowed"
 ! grep -q '^docker rm ' "$calls" && ok "the running container was left alone" || bad "removed the container despite a failed pull"
 
-# T-054: the awslogs driver, defined once in cv_run_* and so reached by both the
-# boot flow and cv-redeploy.
+# T-054: the awslogs driver, defined once in cv_run_* (the only place the run
+# arguments are written) and so reached by both the boot flow and cv-redeploy.
 awslogs_check() { # awslogs_check <case> <container> <group>
   local c="$1" name="$2" group="$3" line
   line=$(grep "^docker run -d --name $name " "$calls" || true)
@@ -221,19 +221,63 @@ for svc in domain-service bff-node; do
   no_secrets "case 11 $svc"
 done
 
-echo "case 12: the bootstrap path (cv_run_*) still works, and the secrets do not linger"
-for svc in domain_service bff_node; do
-  : >"$calls"; rm -f "$workdir/state/digest"
+# boot_run <svc: domain_service|bff_node> <snippet run before cv_run_*> [VAR=val ...]
+# Mimics the bootstrap: sources the library and calls cv_run_<svc> with NO
+# arguments, then reports its status and any CV_DS_/CV_BFF_ variable still set.
+boot_run() {
+  local svc="$1" pre="$2"
+  shift 2
+  : >"$calls"; rm -f "$workdir/state/digest" "$env_dump"
   set +e
-  env -i CV_INSTANCE_ID_FILE="$workdir/instance-id.ok" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
-    bash -c "set -euo pipefail; source '$workdir/lib/cv-app.sh'; cv_run_$svc; echo leftover=\"\${CV_DS_DB_PASSWORD:-}\${CV_BFF_CLIENT_SECRET:-}\"" >"$out" 2>&1
-  rc=$?
+  env -i CV_INSTANCE_ID_FILE="$workdir/instance-id.ok" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" STUB_ENV_DUMP="$env_dump" "$@" \
+    bash -c "source '$workdir/lib/cv-app.sh'; $pre; cv_run_$svc; echo \"cv_run_rc=\$?\"; echo \"set-vars=\$(compgen -A variable | grep -E '^CV_(DS|BFF)_(INSTANCE_ID|DB_PASSWORD|COGNITO_ISSUER_URI|CLIENT_ID|CLIENT_SECRET|TOKEN_URL|TOKEN_SCOPE)$' | tr '\\n' ' ')\"" >"$out" 2>&1
   set -e
-  [ "$rc" -eq 0 ] && ok "cv_run_$svc: exit 0" || bad "cv_run_$svc: exit $rc"
+}
+
+echo "case 12: the bootstrap path (cv_run_*, no arguments) works and leaves no secret variable behind"
+for svc in domain_service bff_node; do
+  boot_run "$svc" true
+  grep -qx 'cv_run_rc=0' "$out" && ok "cv_run_$svc: exit 0" || bad "cv_run_$svc: non-zero"
   [ "$(grep -c "^docker run -d --name ${svc//_/-} " "$calls")" -eq 1 ] && ok "cv_run_$svc: one docker run" || bad "cv_run_$svc: wrong docker run count"
-  grep -qx 'leftover=' "$out" && ok "cv_run_$svc: secrets unset after start" || bad "cv_run_$svc: secrets linger"
+  ! grep -q '^docker rm ' "$calls" && ok "cv_run_$svc: no hook, no docker rm" || bad "cv_run_$svc: removed something without a hook"
+  grep -qx 'set-vars=' "$out" && ok "cv_run_$svc: no CV_DS_/CV_BFF_ variable set afterwards" || bad "cv_run_$svc: variables linger: $(grep '^set-vars=' "$out")"
+  ! grep -qE 'SECRET-(DB-PASSWORD-1|BFF-CLIENT-2)' "$env_dump" && ok "cv_run_$svc: secrets not in docker's environment" || bad "cv_run_$svc: secret in docker's environment"
   no_secrets "cv_run_$svc"
 done
+
+echo "case 13: a docker run failure is a non-zero exit (cv-redeploy and boot)"
+for svc in domain-service bff-node; do
+  STUB_DOCKER_RUN_FAIL=125 run_redeploy "$svc"
+  [ "$rc" -ne 0 ] && ok "cv-redeploy $svc: non-zero when docker run fails" || bad "cv-redeploy $svc: swallowed a docker run failure"
+  no_secrets "case 13 $svc"
+  boot_run "${svc//-/_}" true STUB_DOCKER_RUN_FAIL=125
+  ! grep -qx 'cv_run_rc=0' "$out" && ok "cv_run_${svc//-/_}: non-zero when docker run fails" || bad "cv_run_${svc//-/_}: swallowed a docker run failure"
+  grep -qx 'set-vars=' "$out" && ok "cv_run_${svc//-/_}: no variable lingers after a failed run" || bad "cv_run_${svc//-/_}: variables linger after a failed run"
+done
+
+echo "case 14: a resolve that fails AFTER earlier reads succeeded leaves nothing behind and runs nothing"
+for pair in "domain_service cognito/issuer-uri" "bff_node bff/token-scope" "bff_node bff/service-client-secret"; do
+  set -- $pair
+  boot_run "$1" true STUB_AWS_FAIL="$2"
+  ! grep -qx 'cv_run_rc=0' "$out" && ok "cv_run_$1/$2: non-zero" || bad "cv_run_$1/$2: exit 0"
+  ! grep -q '^docker ' "$calls" && ok "cv_run_$1/$2: no docker call" || bad "cv_run_$1/$2: called docker"
+  grep -qx 'set-vars=' "$out" && ok "cv_run_$1/$2: no variable lingers" || bad "cv_run_$1/$2: variables linger"
+  no_secrets "cv_run_$1/$2"
+done
+
+echo "case 15: the hook runs after resolve, and a pre-exported variable of the same name is never the one used"
+boot_run domain_service 'export CV_DS_DB_PASSWORD=EVIL-PRESET' 
+grep -q '^docker run .*SPRING_DATASOURCE_PASSWORD=SECRET-DB-PASSWORD-1 ' "$calls" && ok "domain-service: used the SSM value, not the preset" || bad "domain-service: the preset leaked into the run"
+! grep -q EVIL-PRESET "$calls" && ok "domain-service: preset not passed on" || bad "domain-service: preset reached docker"
+boot_run bff_node 'export CV_BFF_CLIENT_SECRET=EVIL-PRESET'
+grep -q '^docker run .*SERVICE_CLIENT_SECRET=SECRET-BFF-CLIENT-2 ' "$calls" && ok "bff-node: used the SSM value, not the preset" || bad "bff-node: the preset leaked into the run"
+# hook: failure ignored, runs before docker run, not at all if resolve fails
+: >"$calls"
+set +e
+env -i CV_INSTANCE_ID_FILE="$workdir/instance-id.ok" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
+  bash -c "source '$workdir/lib/cv-app.sh'; cv_run_bff_node false; echo rc=\$?" >"$out" 2>&1
+set -e
+grep -qx 'rc=0' "$out" && grep -q '^docker run ' "$calls" && ok "a failing hook is ignored and docker run still happens" || bad "a failing hook blocked the run"
 
 echo
 echo "cv-redeploy harness: $pass passed, $fail failed"

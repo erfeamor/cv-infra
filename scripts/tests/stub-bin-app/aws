@@ -20,7 +20,8 @@ case "$1 $2" in
       */db/password) echo "SECRET-DB-PASSWORD-1" ;;
       */bff/service-client-secret) echo "SECRET-BFF-CLIENT-2" ;;
       */cognito/issuer-uri) echo "https://issuer.example/pool" ;;
-      *) echo "plain-value" ;;
+      # unique per parameter, so a swapped parameter->variable mapping is visible
+      *) echo "value-of-${name#/cv-project/dev/}" ;;
     esac
     ;;
   "ecr get-login-password") echo "SECRET-ECR-TOKEN-3" ;;

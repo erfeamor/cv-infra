@@ -10,6 +10,8 @@ case "$1" in
   run)
     # T-055: STUB_ENV_DUMP=<file> records the environment `docker run` inherits.
     [ -z "${STUB_ENV_DUMP:-}" ] || env >"$STUB_ENV_DUMP"
+    # STUB_DOCKER_RUN_FAIL=<code>: make `docker run` fail with that exit status.
+    [ -z "${STUB_DOCKER_RUN_FAIL:-}" ] || { echo "docker: Error response from daemon" >&2; exit "$STUB_DOCKER_RUN_FAIL"; }
     echo "container-id-stub" ;;
 esac
 exit 0

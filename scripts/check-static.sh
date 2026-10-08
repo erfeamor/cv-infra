@@ -813,21 +813,22 @@ else
   ok "the app host role's only logs: actions are CreateLogStream and PutLogEvents (T-054)"
 fi
 
-# --- 23. roll() resolves every input before it removes the container (T-055) ---
-# cv-redeploy's roll() must call cv_resolve_ BEFORE `docker rm`, and cv_start_
-# after it: a failed SSM read must leave the old container serving. The harness
-# (run-cv-redeploy-tests.sh) proves the behaviour; this pins the ordering in
-# the template text so a refactor cannot quietly move the rm back up.
-roll_body=$(awk '/^roll\(\) \{/{c=1} c{print} c&&/^\}/{exit}' templates/domain-service-provision.sh)
-resolve_ln=$(printf '%s\n' "$roll_body" | grep -n 'cv_resolve_' | head -1 | cut -d: -f1 || true)
-rm_ln=$(printf '%s\n' "$roll_body" | grep -n 'docker rm' | head -1 | cut -d: -f1 || true)
-start_ln=$(printf '%s\n' "$roll_body" | grep -n 'cv_start_' | head -1 | cut -d: -f1 || true)
-if [ -z "$roll_body" ] || [ -z "$resolve_ln" ] || [ -z "$rm_ln" ] || [ -z "$start_ln" ]; then
-  bad "roll() in domain-service-provision.sh must call cv_resolve_, docker rm and cv_start_ (T-055)"
-elif [ "$resolve_ln" -lt "$rm_ln" ] && [ "$rm_ln" -lt "$start_ln" ]; then
-  ok "roll() resolves inputs (cv_resolve_) before docker rm, then cv_start_ (T-055)"
+# --- 23. roll() hands the rm to cv_run_*, which resolves inputs first (T-055) ---
+# A failed SSM read must leave the old container serving, so roll() must not
+# remove anything itself: its ONLY `docker rm` is the argument list of the
+# cv_run_<svc> call (which runs it after every input is resolved), and that call
+# must not be followed by `||` (a resolve failure has to propagate). Comments
+# are stripped first so a comment cannot satisfy or defeat the check. The
+# harness proves the behaviour; this pins the shape of the template text.
+roll_body=$(awk '/^roll\(\) \{/{c=1} c{print} c&&/^\}/{exit}' templates/domain-service-provision.sh | sed 's/[[:space:]]*#.*$//')
+rm_lines=$(printf '%s\n' "$roll_body" | grep -c 'docker rm' || true)
+call_lines=$(printf '%s\n' "$roll_body" | grep -cE '^[[:space:]]*"cv_run_\$\$\{name//-/_\}" docker rm -f "\$name"[[:space:]]*$' || true)
+if [ -z "$roll_body" ]; then
+  bad "cannot find roll() in domain-service-provision.sh (T-055)"
+elif [ "$rm_lines" -ne 1 ] || [ "$call_lines" -ne 1 ]; then
+  bad "roll() must contain exactly one docker rm, as the arguments of its cv_run_<svc> call (\"cv_run_\$\${name//-/_}\" docker rm -f \"\$name\"), with no || after it (T-055)"
 else
-  bad "roll() must order cv_resolve_ < docker rm < cv_start_ (T-055)"
+  ok "roll() removes the container only as cv_run_<svc>'s pre-start hook, after it resolved every input (T-055)"
 fi
 
 exit $fail

@@ -291,9 +291,16 @@ resource "local_file" "jenkins_provision_script" {
 #   get-command-invocation directly instead, with a timeout sized for a
 #   cold image cache.
 resource "null_resource" "jenkins_provision" {
+  # T-040: the token's SSM version is a trigger too. The script reads
+  # ci/github-pat at run time and Jenkins gets it as GITHUB_PAT in its
+  # container env (part of its config hash), so a rotation reaches Jenkins only
+  # if this re-runs. Without it, an apply updated SSM and Jenkins kept the old
+  # token until it expired. Needs the CI host running (start it with
+  # CIKeepAlive) when the token changes.
   triggers = {
-    script_sha  = sha256(local.jenkins_provision_script)
-    instance_id = aws_instance.drone.id
+    script_sha         = sha256(local.jenkins_provision_script)
+    instance_id        = aws_instance.drone.id
+    github_pat_version = aws_ssm_parameter.github_pat_ci.version
   }
 
   provisioner "local-exec" {

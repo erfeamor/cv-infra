@@ -831,4 +831,18 @@ else
   ok "roll() removes the container only as cv_run_<svc>'s pre-start hook, after it resolved every input (T-055)"
 fi
 
+# --- 24. Jenkins re-provisions when its GitHub token rotates (T-040) -----------
+# jenkins-provision.sh passes ci/github-pat to the Jenkins container as env, so
+# only a re-run of null_resource.jenkins_provision delivers a rotated token.
+# Its triggers must include the parameter's SSM version, or a rotation updates
+# SSM and Jenkins keeps the old token until it expires.
+jp_triggers=$(awk '/^resource "null_resource" "jenkins_provision"/{c=1} c&&/^  triggers = \{/{t=1} t{print} t&&/^  \}/{exit}' ci.tf | sed 's/[[:space:]]*#.*$//')
+if [ -z "$jp_triggers" ]; then
+  bad "cannot find null_resource.jenkins_provision's triggers in ci.tf (T-040)"
+elif ! printf '%s\n' "$jp_triggers" | grep -qE '=[[:space:]]*aws_ssm_parameter\.github_pat_ci\.version[[:space:]]*$'; then
+  bad "null_resource.jenkins_provision must trigger on aws_ssm_parameter.github_pat_ci.version, or a rotated token never reaches Jenkins (T-040)"
+else
+  ok "null_resource.jenkins_provision re-runs when the Jenkins GitHub token's SSM version changes (T-040)"
+fi
+
 exit $fail

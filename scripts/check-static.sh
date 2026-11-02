@@ -831,4 +831,20 @@ else
   ok "roll() removes the container only as cv_run_<svc>'s pre-start hook, after it resolved every input (T-055)"
 fi
 
+# --- 24. Jenkins re-provisions when its GitHub token rotates (T-040) -----------
+# jenkins-provision.sh passes ci/github-pat to the Jenkins container as env, so
+# only a re-run of null_resource.jenkins_provision delivers a rotated token.
+# Its triggers must include the parameter's SSM version, or a rotation updates
+# SSM and Jenkins keeps the old token until it expires.
+jp_triggers=$(awk '/^resource "null_resource" "jenkins_provision"/{c=1} c&&/^resource /&&!/jenkins_provision/{exit} c&&/^[[:space:]]*triggers[[:space:]]*=[[:space:]]*\{/{t=1} t{print} t&&/^[[:space:]]*\}[[:space:]]*$/{exit}' ci.tf \
+  | sed -e 's#/\*.*\*/##g' -e 's/[[:space:]]*\(#\|\/\/\).*$//')
+if [ -z "$jp_triggers" ]; then
+  bad "cannot find null_resource.jenkins_provision's triggers in ci.tf (T-040)"
+elif ! printf '%s\n' "$jp_triggers" | grep -qE '^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*aws_ssm_parameter\.github_pat_ci\.version[[:space:]]*$' \
+  || ! printf '%s\n' "$jp_triggers" | grep -qE '^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*aws_ssm_parameter\.jenkins_admin_password\.version[[:space:]]*$'; then
+  bad "null_resource.jenkins_provision must trigger on the SSM versions of github_pat_ci and jenkins_admin_password, or a rotated value never reaches Jenkins (T-040)"
+else
+  ok "null_resource.jenkins_provision re-runs when Jenkins' GitHub token or admin password rotates in SSM (T-040)"
+fi
+
 exit $fail

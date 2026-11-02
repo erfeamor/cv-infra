@@ -836,13 +836,15 @@ fi
 # only a re-run of null_resource.jenkins_provision delivers a rotated token.
 # Its triggers must include the parameter's SSM version, or a rotation updates
 # SSM and Jenkins keeps the old token until it expires.
-jp_triggers=$(awk '/^resource "null_resource" "jenkins_provision"/{c=1} c&&/^  triggers = \{/{t=1} t{print} t&&/^  \}/{exit}' ci.tf | sed 's/[[:space:]]*#.*$//')
+jp_triggers=$(awk '/^resource "null_resource" "jenkins_provision"/{c=1} c&&/^resource /&&!/jenkins_provision/{exit} c&&/^[[:space:]]*triggers[[:space:]]*=[[:space:]]*\{/{t=1} t{print} t&&/^[[:space:]]*\}[[:space:]]*$/{exit}' ci.tf \
+  | sed -e 's#/\*.*\*/##g' -e 's/[[:space:]]*\(#\|\/\/\).*$//')
 if [ -z "$jp_triggers" ]; then
   bad "cannot find null_resource.jenkins_provision's triggers in ci.tf (T-040)"
-elif ! printf '%s\n' "$jp_triggers" | grep -qE '=[[:space:]]*aws_ssm_parameter\.github_pat_ci\.version[[:space:]]*$'; then
-  bad "null_resource.jenkins_provision must trigger on aws_ssm_parameter.github_pat_ci.version, or a rotated token never reaches Jenkins (T-040)"
+elif ! printf '%s\n' "$jp_triggers" | grep -qE '^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*aws_ssm_parameter\.github_pat_ci\.version[[:space:]]*$' \
+  || ! printf '%s\n' "$jp_triggers" | grep -qE '^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*aws_ssm_parameter\.jenkins_admin_password\.version[[:space:]]*$'; then
+  bad "null_resource.jenkins_provision must trigger on the SSM versions of github_pat_ci and jenkins_admin_password, or a rotated value never reaches Jenkins (T-040)"
 else
-  ok "null_resource.jenkins_provision re-runs when the Jenkins GitHub token's SSM version changes (T-040)"
+  ok "null_resource.jenkins_provision re-runs when Jenkins' GitHub token or admin password rotates in SSM (T-040)"
 fi
 
 exit $fail

@@ -291,8 +291,8 @@ resource "local_file" "jenkins_provision_script" {
 #   get-command-invocation directly instead, with a timeout sized for a
 #   cold image cache.
 resource "null_resource" "jenkins_provision" {
-  # T-040: the token's SSM version is a trigger too. The script reads
-  # ci/github-pat at run time and Jenkins gets it as GITHUB_PAT in its
+  # T-040: the token's (and the admin password's) SSM version is a trigger too.
+  # The script reads ci/github-pat and ci/jenkins-admin-password at run time and Jenkins gets it as GITHUB_PAT in its
   # container env (part of its config hash), so a rotation reaches Jenkins only
   # if this re-runs. Without it, an apply updated SSM and Jenkins kept the old
   # token until it expired. Needs the CI host running (start it with
@@ -301,6 +301,7 @@ resource "null_resource" "jenkins_provision" {
     script_sha         = sha256(local.jenkins_provision_script)
     instance_id        = aws_instance.drone.id
     github_pat_version = aws_ssm_parameter.github_pat_ci.version
+    admin_pw_version   = aws_ssm_parameter.jenkins_admin_password.version
   }
 
   provisioner "local-exec" {
@@ -309,7 +310,19 @@ resource "null_resource" "jenkins_provision" {
       region="${var.aws_region}"
       instance_id="${aws_instance.drone.id}"
 
-      echo "Waiting for the SSM agent to report Online on $instance_id (this apply's own stop/modify/start needs it to re-register)..."
+      # T-040: a token rotation (or the trigger's first apply) re-runs this on
+      # whatever state the reaper left the host in. A stopped host would only
+      # time out below with a misleading agent message, so fail fast instead.
+      host_state=$(aws ec2 describe-instances --region "$region" --instance-ids "$instance_id" \
+        --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo unknown)
+      case "$host_state" in
+        stopped|stopping)
+          echo "CI host $instance_id is $host_state: start it with the CIKeepAlive tag (docs/runbooks/drone.md) and re-apply. SSM already holds the new values; Jenkins only picks them up when this step runs." >&2
+          exit 1
+          ;;
+      esac
+
+      echo "Waiting for the SSM agent to report Online on $instance_id (after a start, a stop/modify/start, or a fresh boot it has to re-register)..."
       agent_elapsed=0
       agent_timeout_s=300
       agent_poll_s=10

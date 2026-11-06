@@ -762,6 +762,90 @@ class TestSkipsDeletedRefsAndNonBuildPrActions(DoorbellTestCase):
         self.assertEqual(response["statusCode"], 403)
 
 
+# --- T-059 (RED): a tag push has nothing to build either. Drone triggers only
+# on push/pull_request (a tag push is Drone's `tag` event) and both Jenkins
+# jobs discover branches only, so a release tag (T-504) must not wake the box.
+
+
+class TestSkipsTagPushes(DoorbellTestCase):
+    def test_tag_push_for_redeliver_repo_is_ignored(self):
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"ref": "refs/tags/M3"})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.assertEqual(response["body"], "ignored: tag push")
+        self.module.lambda_client.invoke.assert_not_called()
+        self.module.ec2.describe_instances.assert_not_called()
+        self.module.ec2.start_instances.assert_not_called()
+
+    def test_tag_push_for_jenkins_repo_is_ignored(self):
+        self.set_instance_state("stopped")
+        event = event_with_body("erfeamor/cv-database", body_extra={"ref": "refs/tags/t059-probe"})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.assertEqual(response["body"], "ignored: tag push")
+        self.module.ec2.describe_instances.assert_not_called()
+        self.module.ec2.start_instances.assert_not_called()
+
+    def test_tag_push_on_running_host_is_not_tagged(self):
+        # T-048's CILastPush would hold the reaper off for a build that never comes.
+        self.set_instance_state("running")
+        self.module.handler(event_with_body("erfeamor/cv-domain-service", body_extra={"ref": "refs/tags/M3"}), None)
+        self.module.ec2.create_tags.assert_not_called()
+
+    # --- Controls -----------------------------------------------------------
+
+    def test_branch_push_control_still_starts(self):
+        self.set_instance_state("stopped")
+        event = event_with_body("erfeamor/cv-database", body_extra={"ref": "refs/heads/master"})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 200)
+        self.module.ec2.start_instances.assert_called_once_with(InstanceIds=[ENV["INSTANCE_ID"]])
+
+    def test_branch_named_like_a_tag_path_still_starts(self):
+        # Only the refs/tags/ namespace is skipped, not a branch whose name mentions it.
+        self.set_instance_state("stopped")
+        event = event_with_body("erfeamor/cv-database", body_extra={"ref": "refs/heads/refs/tags/x"})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 200)
+        self.module.ec2.start_instances.assert_called_once()
+
+    def test_branch_push_control_still_self_invokes_for_redeliver_repo(self):
+        event = event_with_body("erfeamor/cv-admin-react", body_extra={"ref": "refs/heads/feat/x"})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 202)
+        self.assertEqual(response["body"], "accepted")
+        self.module.lambda_client.invoke.assert_called_once()
+
+    def test_pull_request_with_tag_like_ref_field_is_not_skipped(self):
+        # The tag skip is for `push` only; a pull_request has no top-level ref.
+        self.set_instance_state("stopped")
+        event = event_with_body(
+            "erfeamor/cv-admin-react",
+            body_extra={"action": "opened", "ref": "refs/tags/M3"},
+            event_type="pull_request",
+        )
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 200)
+        self.module.ec2.start_instances.assert_called_once()
+
+    def test_bad_signature_still_401_for_a_tag_push(self):
+        event = event_with_body("erfeamor/cv-database", body_extra={"ref": "refs/tags/M3"}, secret="wrong-secret")
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 401)
+        self.module.ec2.describe_instances.assert_not_called()
+
+    def test_unlisted_repo_tag_push_still_403(self):
+        event = event_with_body("erfeamor/some-other-repo", body_extra={"ref": "refs/tags/M3"})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 403)
+
+    def test_non_string_ref_does_not_crash(self):
+        self.set_instance_state("stopped")
+        event = event_with_body("erfeamor/cv-database", body_extra={"ref": 42})
+        response = self.module.handler(event, None)
+        self.assertEqual(response["statusCode"], 200)
+
+
 # --- Case 5: Drone hook discovered by config.url ending in /hook -----------
 
 

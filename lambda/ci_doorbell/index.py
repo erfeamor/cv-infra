@@ -110,6 +110,16 @@ merge-close is already covered by the merge commit's own push to master).
 either wake path (the REDELIVER_REPOS async schedule, and the synchronous
 start), answering 202 without ever calling `_self_invoke`, EC2, or the
 Jenkins-repo start path. Every other event type is unchanged.
+
+--- T-059: a tag push has nothing to build either ------------------------------
+
+A new tag arrives as a `push` whose `ref` is under `refs/tags/`. Nothing builds
+one: cv-admin-react's .drone.yml triggers on `push`/`pull_request` only (a tag
+push is Drone's separate `tag` event), and both Jenkins jobs use branch
+discovery only. Before this, a release tag (T-504's `M2`) woke the box for
+~35 idle minutes. It is skipped in the same place and the same way as T-042's
+two cases. Only `push` is matched: the doorbell's hooks subscribe to `push`
+and `pull_request` only, so GitHub's separate `create` event never arrives.
 """
 
 import base64
@@ -895,8 +905,14 @@ def _handle_webhook(event):
     # path below -- the REDELIVER_REPOS async schedule or the synchronous
     # start -- so this runs before both.
     skip_reason = None
+    ref = payload.get("ref")
     if event_type == "push" and payload.get("deleted") is True:
         skip_reason = "deleted ref"
+    elif event_type == "push" and isinstance(ref, str) and ref.startswith("refs/tags/"):
+        # T-059: a new tag (e.g. a release tag, T-504) carries no build either --
+        # Drone triggers on push/pull_request only, which excludes its `tag`
+        # event, and both Jenkins jobs discover branches only.
+        skip_reason = "tag push"
     elif event_type == "pull_request" and payload.get("action") not in BUILD_PR_ACTIONS:
         skip_reason = f"pull_request action {payload.get('action')!r}"
 

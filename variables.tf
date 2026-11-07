@@ -42,11 +42,11 @@ variable "domain_service_instance_type" {
 
 # T-018, ruling 1: data.aws_subnets.default.ids[0] has no ordering guarantee,
 # so the domain-service instance's AZ could silently move between plans.
-# aws_ebs_volume.mysql_data is AZ-locked (storage.tf), so once that volume
+# aws_ebs_volume.mysql_data_v2 is AZ-locked (storage.tf), so once that volume
 # exists, an AZ move breaks the attachment instead of just being invisible.
 # This variable is the single pinned source: it selects the instance's
 # subnet (via data.aws_subnets.domain_service in network.tf) AND sets
-# aws_ebs_volume.mysql_data.availability_zone directly -- the two must never
+# aws_ebs_volume.mysql_data_v2.availability_zone directly -- the two must never
 # be computed independently.
 variable "availability_zone" {
   description = "AZ pinned for the domain-service instance and its dedicated MySQL EBS volume (T-018 ruling 1) -- both trace to this one variable so they cannot diverge."
@@ -393,6 +393,17 @@ variable "public_domain" {
   validation {
     condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.public_domain))
     error_message = "var.public_domain must be a lowercase apex domain with no trailing dot (e.g. erfeamor.com) -- got \"${var.public_domain}\"."
+  }
+}
+
+variable "mysql_volume_size_gb" {
+  description = "Size in GiB of the EBS volume holding MySQL's datadir (T-066: 2; the data is ~216 MB). gp3 is ~$0.093/GiB-month in eu-west-3. EBS can't shrink: going smaller means a new volume and a restore (docs/runbooks/mysql-volume.md); going larger is in place plus xfs_growfs."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.mysql_volume_size_gb >= 1 && var.mysql_volume_size_gb == floor(var.mysql_volume_size_gb)
+    error_message = "mysql_volume_size_gb must be a whole number of GiB, at least 1 (gp3's minimum)."
   }
 }
 

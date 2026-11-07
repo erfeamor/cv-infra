@@ -30,6 +30,14 @@ data "aws_subnets" "domain_service" {
     name   = "availability-zone"
     values = [var.availability_zone]
   }
+
+  # T-067: only the default subnet of the AZ. The spike (and T-068) add a
+  # private subnet in the same AZ; without this it would be a candidate and
+  # the sorted-first pick could move the app host onto it on the next apply.
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
+  }
 }
 
 # T-022: CloudFront's own origin-facing address ranges, published by AWS as a

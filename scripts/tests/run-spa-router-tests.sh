@@ -63,17 +63,17 @@ check('the apex itself is not redirected', req('/', APEX).statusCode === undefin
 
 // --- /react -> react.<apex> ---------------------------------------------
 const react = 'https://react.' + APEX;
-check('/react redirects', redirectTo(req('/react', APEX), 302) === react);
-check('/react/ redirects', redirectTo(req('/react/', APEX), 302) === react);
-check('/react/deep/link redirects', redirectTo(req('/react/deep/link', APEX), 302) === react);
+check('/react redirects', redirectTo(req('/react', APEX)) === react);
+check('/react/ redirects', redirectTo(req('/react/', APEX)) === react);
+check('/react/deep/link redirects', redirectTo(req('/react/deep/link', APEX)) === react);
 check('/react redirects on the cloudfront.net host too',
-  redirectTo(req('/react', 'dvdlxl0zqepqi.cloudfront.net'), 302) === react);
-check('www + /react is one hop to react.<apex>', redirectTo(req('/react', 'www.' + APEX), 302) === react);
+  redirectTo(req('/react', 'dvdlxl0zqepqi.cloudfront.net')) === react);
+check('www + /react is one hop to react.<apex>', redirectTo(req('/react', 'www.' + APEX)) === react);
 check('/reactor is not /react', req('/reactor', APEX).uri === '/index.html');
 check('/admin/react is not /react', req('/admin/react', APEX).uri === '/admin/index.html');
 check('a file called /react.js passes through', req('/react.js', APEX).uri === '/react.js');
 
-check('/react is a temporary redirect until react.<apex> exists (T-410)', req('/react', APEX).statusDescription === 'Found');
+check('/react is a permanent redirect now that react.<apex> exists (T-410)', req('/react', APEX).statusDescription === 'Moved Permanently');
 
 // --- more www cases ------------------------------------------------------
 check('www + /health redirects (the host is canonical for every path)',

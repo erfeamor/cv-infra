@@ -888,4 +888,41 @@ else
   ok "the custom domain's certificate is us-east-1 and validated before the distribution uses it; CORS comes from SSM (T-061)"
 fi
 
+# --- 26. Cognito's custom domain (T-062) ---------------------------------------
+# What plan-time tests can't see: (a) the domain takes its certificate from the
+# VALIDATION resource, so Cognito never gets an unvalidated one; (b) it waits for
+# the apex alias record (Cognito checks the parent domain resolves); (c) classic
+# managed login (1), because version 2 needs a branding resource or the login
+# page breaks; (d) the BFF token URL is built from the custom domain, not the
+# prefix one; (e) the prefix domain is still declared (the admin build uses it
+# until T-306); (f) auth.<apex> aliases to the distribution COGNITO creates, not
+# the site's.
+sdom=$(strip_hash domain.tf)
+ssm=$(strip_hash ssm.tf)
+t62_block=$(printf '%s\n' "$au" | awk '/^resource "aws_cognito_user_pool_domain" "custom"/ {f=1} f {print} f && /^}/ {exit}')
+t62_problems=""
+printf '%s\n' "$t62_block" | grep -qE 'certificate_arn[[:space:]]*=[[:space:]]*aws_acm_certificate_validation\.site\.certificate_arn' \
+  || t62_problems="$t62_problems; the custom domain's certificate_arn must come from aws_acm_certificate_validation.site"
+printf '%s\n' "$t62_block" | grep -qE 'site_alias\["apex-A"\]' && printf '%s\n' "$t62_block" | grep -qE 'site_alias\["apex-AAAA"\]' \
+  || t62_problems="$t62_problems; the custom domain must depend on the apex alias records"
+printf '%s\n' "$t62_block" | grep -qE 'managed_login_version[[:space:]]*=[[:space:]]*1([^0-9]|$)' \
+  || t62_problems="$t62_problems; the custom domain must pin managed_login_version = 1"
+printf '%s\n' "$ssm" | grep -qE 'value[[:space:]]*=[[:space:]]*"https://\$\{aws_cognito_user_pool_domain\.custom\.domain\}/oauth2/token"' \
+  || t62_problems="$t62_problems; bff/token-url must be built from aws_cognito_user_pool_domain.custom"
+ssm_token_block=$(printf '%s\n' "$ssm" | awk '/^resource "aws_ssm_parameter" "bff_token_url"/ {f=1} f {print} f && /^}/ {exit}')
+printf '%s\n' "$ssm_token_block" | grep -qE 'depends_on[[:space:]]*=[[:space:]]*\[aws_route53_record\.auth_alias\]' \
+  || t62_problems="$t62_problems; bff/token-url must wait for the auth.<apex> alias record"
+printf '%s\n' "$au" | grep -qE '^resource "aws_cognito_user_pool_domain" "cv"' \
+  || t62_problems="$t62_problems; the prefix domain must stay declared until T-306"
+auth_alias=$(printf '%s\n' "$sdom" | awk '/^resource "aws_route53_record" "auth_alias"/ {f=1} f {print} f && /^}/ {exit}')
+printf '%s\n' "$auth_alias" | grep -qE 'name[[:space:]]*=[[:space:]]*aws_cognito_user_pool_domain\.custom\.cloudfront_distribution$' \
+  || t62_problems="$t62_problems; auth.<apex> must alias to the distribution Cognito creates (cloudfront_distribution)"
+printf '%s\n' "$auth_alias" | grep -qE 'zone_id[[:space:]]*=[[:space:]]*aws_cognito_user_pool_domain\.custom\.cloudfront_distribution_zone_id' \
+  || t62_problems="$t62_problems; auth.<apex>'s alias zone_id must be Cognito's cloudfront_distribution_zone_id"
+if [ -n "$t62_problems" ]; then
+  bad "Cognito custom domain wiring (T-062):${t62_problems#;}"
+else
+  ok "Cognito's custom domain uses the validated certificate and the apex alias, pins managed login 1, and feeds the BFF token URL (T-062)"
+fi
+
 exit $fail

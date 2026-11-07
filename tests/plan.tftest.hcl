@@ -47,7 +47,7 @@ mock_provider "aws" {
     defaults = {
       zone_id = "Z0608270B7WND031GVOW"
       arn     = "arn:aws:route53:::hostedzone/Z0608270B7WND031GVOW"
-      name    = "erfeamor.com."
+      name    = "erfeamor.com" # the real data source has no trailing dot (found by the T-061 plan)
     }
   }
 

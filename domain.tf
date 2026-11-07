@@ -36,7 +36,7 @@ resource "aws_acm_certificate" "site" {
     # The records below go in dns.tf's zone, which is a fixed zone ID: a
     # var.public_domain that zone doesn't serve would hang ACM validation.
     precondition {
-      condition     = data.aws_route53_zone.ci.name == "${var.public_domain}."
+      condition     = trimsuffix(data.aws_route53_zone.ci.name, ".") == var.public_domain
       error_message = "var.public_domain (${var.public_domain}) is not the domain of the Route 53 zone in dns.tf (${data.aws_route53_zone.ci.name})."
     }
   }

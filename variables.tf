@@ -395,3 +395,9 @@ variable "public_domain" {
     error_message = "var.public_domain must be a lowercase apex domain with no trailing dot (e.g. erfeamor.com) -- got \"${var.public_domain}\"."
   }
 }
+
+variable "react_cname_target" {
+  description = "CNAME target Vercel shows for react.<public_domain> (Settings -> Domains of cv-public-react). Project-specific, not a secret."
+  type        = string
+  default     = "9385db129d53c7e9.vercel-dns-017.com"
+}

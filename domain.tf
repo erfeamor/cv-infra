@@ -99,6 +99,17 @@ resource "aws_route53_record" "site_alias" {
   }
 }
 
+# react.<apex> -> the Vercel project serving cv-public-react (T-410). The target
+# is the one Vercel shows in Settings -> Domains for this project.
+resource "aws_route53_record" "react" {
+  zone_id         = data.aws_route53_zone.ci.zone_id
+  name            = "react.${var.public_domain}"
+  type            = "CNAME"
+  ttl             = 300
+  records         = [var.react_cname_target]
+  allow_overwrite = true
+}
+
 # Allowed browser origins for the domain service and the BFF. Read at
 # container start through cv_need (templates/domain-service-provision.sh), not
 # baked into the script, so adding an origin is a `cv-redeploy`, not a host

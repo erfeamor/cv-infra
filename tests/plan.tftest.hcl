@@ -123,6 +123,13 @@ run "plan_succeeds" {
     }
   }
 
+  # T-067: the app host's subnet must stay the AZ's default subnet even after
+  # a private subnet exists in the same AZ.
+  assert {
+    condition     = length([for f in data.aws_subnets.domain_service.filter : f if f.name == "default-for-az" && contains(f.values, "true")]) == 1
+    error_message = "data.aws_subnets.domain_service must filter on default-for-az = true so a private subnet in the same AZ can never capture the app host (T-067)"
+  }
+
   # MySQL is self-hosted on the domain-service EC2 (see compute.tf /
   # templates/domain-service-provision.sh) — there is no RDS instance to
   # assert on anymore.

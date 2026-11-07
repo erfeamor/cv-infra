@@ -3609,6 +3609,11 @@ run "t061_custom_domain" {
   command = plan
 
   assert {
+    condition     = aws_route53_record.react.name == "react.erfeamor.com" && aws_route53_record.react.type == "CNAME" && one(aws_route53_record.react.records) == var.react_cname_target
+    error_message = "react.<apex> is a CNAME to the Vercel target (T-410)"
+  }
+
+  assert {
     condition     = aws_acm_certificate.site.domain_name == "erfeamor.com"
     error_message = "the certificate's primary name is the apex"
   }

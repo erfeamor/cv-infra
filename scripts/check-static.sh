@@ -961,4 +961,30 @@ else
   ok "the old MySQL volume is forgotten, not destroyed; the 2 GiB volume is protected and wired; binlogs expire (T-066)"
 fi
 
+# --- 28. Migration SQL through S3 (T-070) -----------------------------------
+# The app host reads one key; the cv-database role writes that same key. Both
+# policies name the key through local.migration_sql_key (never a prefix wildcard
+# or s3:*), and each is attached to the right role.
+t70_problems=""
+iam_src=$(strip_hash iam.tf)
+cid_src=$(strip_hash ci-deploy.tf)
+rd_block=$(printf '%s\n' "$iam_src" | awk '/^resource "aws_iam_role_policy" "app_read_migration_sql"/ {f=1} f {print} f && /^}/ {exit}')
+wr_block=$(printf '%s\n' "$cid_src" | awk '/^resource "aws_iam_role_policy" "database_migrate_publish_sql"/ {f=1} f {print} f && /^}/ {exit}')
+printf '%s\n' "$rd_block" | grep -qE 'role[[:space:]]*=[[:space:]]*aws_iam_role\.domain_service\.id' \
+  || t70_problems="$t70_problems; app_read_migration_sql must attach to the app host role"
+printf '%s\n' "$rd_block" | grep -qE 'Resource[[:space:]]*=[[:space:]]*"\$\{aws_s3_bucket\.backup\.arn\}/\$\{local\.migration_sql_key\}"' \
+  || t70_problems="$t70_problems; the app host's GetObject must name local.migration_sql_key exactly"
+printf '%s\n' "$wr_block" | grep -qE 'role[[:space:]]*=[[:space:]]*aws_iam_role\.database_migrate\.id' \
+  || t70_problems="$t70_problems; database_migrate_publish_sql must attach to the cv-database role"
+printf '%s\n' "$wr_block" | grep -qE 'Resource[[:space:]]*=[[:space:]]*"\$\{aws_s3_bucket\.backup\.arn\}/\$\{local\.migration_sql_key\}"' \
+  || t70_problems="$t70_problems; the cv-database role's PutObject must name local.migration_sql_key exactly"
+if printf '%s\n%s\n' "$rd_block" "$wr_block" | grep -qE 's3:\*|"\*"|/\*"'; then
+  t70_problems="$t70_problems; no s3:* and no wildcard resources in the migration SQL grants"
+fi
+if [ -n "$t70_problems" ]; then
+  bad "migration SQL through S3 (T-070):${t70_problems#;}"
+else
+  ok "the migration SQL is one S3 key: read by the app host, written by the cv-database role, no wildcards (T-070)"
+fi
+
 exit $fail

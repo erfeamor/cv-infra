@@ -74,13 +74,53 @@ cv_instance_id() {
   esac
 }
 
-# Clone on first use, fast-forward afterwards (a no-op when current).
+# T-070: the migration SQL comes from S3, where cv-database's migrate workflow
+# publishes the sql/ tree (T-071), because a host with no public IPv4 cannot
+# reach github.com (no IPv6). Sets CV_SQL_DIR for cv_run_flyway. The git clone
+# stays as a fallback for ONE case: the object does not exist yet (404). Any
+# other failure (denied, throttled, corrupt archive) is fatal, so a broken S3
+# path never silently applies whatever git happens to have. T-068 removes the
+# fallback together with the public IP.
+CV_SQL_KEY="migrations/cv-database-sql.tgz"
+CV_SQL_ROOT="$${CV_SQL_ROOT:-/opt/cv-database-sql}" # overridable for the test harness
 cv_sync_database_repo() {
-  if [ -d /opt/cv-database/.git ]; then
-    git -C /opt/cv-database pull --ff-only
-  else
-    git clone --depth 1 https://github.com/erfeamor/cv-database.git /opt/cv-database
+  local tmp
+  tmp=$(mktemp -d "$${TMPDIR:-/var/tmp}/cv-sql.XXXXXX") || return 1
+  if aws s3 cp --region "${aws_region}" "s3://${backup_bucket}/$CV_SQL_KEY" "$tmp/sql.tgz" 2>"$tmp/err"; then
+    mkdir "$tmp/x" && tar -xzf "$tmp/sql.tgz" -C "$tmp/x" || {
+      echo "FATAL: cannot unpack $CV_SQL_KEY" >&2
+      rm -rf "$tmp"
+      return 1
+    }
+    if [ ! -d "$tmp/x/sql/migrations" ]; then
+      echo "FATAL: $CV_SQL_KEY has no sql/migrations" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    rm -rf "$CV_SQL_ROOT"
+    mkdir -p "$CV_SQL_ROOT" && mv "$tmp/x/sql" "$CV_SQL_ROOT/sql" || {
+      rm -rf "$tmp"
+      return 1
+    }
+    CV_SQL_DIR="$CV_SQL_ROOT/sql"
+    rm -rf "$tmp"
+    echo "migration SQL: s3://${backup_bucket}/$CV_SQL_KEY"
+    return 0
   fi
+  if grep -qE '\(404\)|NoSuchKey|Not Found' "$tmp/err"; then
+    echo "migration SQL: $CV_SQL_KEY not published yet, falling back to the git clone" >&2
+    rm -rf "$tmp"
+    if [ -d /opt/cv-database/.git ]; then
+      git -C /opt/cv-database pull --ff-only || return 1
+    else
+      git clone --depth 1 https://github.com/erfeamor/cv-database.git /opt/cv-database || return 1
+    fi
+    CV_SQL_DIR=/opt/cv-database/sql
+    return 0
+  fi
+  echo "FATAL: cannot read s3://${backup_bucket}/$CV_SQL_KEY: $(head -c 300 "$tmp/err")" >&2
+  rm -rf "$tmp"
+  return 1
 }
 
 # Flyway (schema only): production applies migrations ONLY -- the dev-seeds
@@ -92,7 +132,7 @@ cv_run_flyway() {
   local +x DB_PASSWORD
   cv_need DB_PASSWORD db/password || return 1
   docker run --rm --network cv \
-    -v /opt/cv-database/sql:/flyway/sql:ro \
+    -v "$${CV_SQL_DIR:?run cv_sync_database_repo first}":/flyway/sql:ro \
     -e FLYWAY_URL="jdbc:mysql://mysql:3306/${db_name}?allowPublicKeyRetrieval=true" \
     -e FLYWAY_USER="${db_username}" \
     -e FLYWAY_PASSWORD="$DB_PASSWORD" \

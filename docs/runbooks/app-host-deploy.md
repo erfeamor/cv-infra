@@ -3,7 +3,7 @@
 The app host (`aws_instance.domain_service`, tag `Name=cv-project-domain-service`) runs MySQL, the domain service and the BFF as containers. Since T-044 a new image or a new migration reaches it **without replacing the host**, through `/usr/local/bin/cv-redeploy` (root only, 0750), which the provisioning script writes at boot.
 
 ```
-cv-redeploy migrate          # refresh /opt/cv-database (git pull --ff-only), run Flyway exactly as boot does
+cv-redeploy migrate          # fetch the sql/ tarball from S3 (migrations/cv-database-sql.tgz; git clone only while the object does not exist, T-070), run Flyway exactly as boot does
 cv-redeploy domain-service   # ECR login, pull :latest, print old/new image ids, recreate ONLY this container
 cv-redeploy bff-node         # same, for the BFF
 ```
@@ -70,6 +70,8 @@ Hibernate validates the schema at startup, so the order is fixed: **migrate firs
 1. Merge the migration to `cv-database` master (the host pulls master).
 2. `cv-redeploy migrate`. It is a no-op when the schema is current (Flyway reports "Schema is up to date").
 3. Push the new domain-service image, `cv-redeploy domain-service`.
+
+**Where the SQL comes from (T-070).** `cv-redeploy migrate` downloads `s3://<backup bucket>/migrations/cv-database-sql.tgz` (output `migration_sql_bucket`; published by cv-database's migrate workflow, T-071) and unpacks it to `/opt/cv-database-sql/sql`. A 404 falls back to the old git clone; any other S3 error (denied, corrupt or hollow archive) fails the run before Flyway. The fallback goes away with the public IPv4 (T-068): **the object must exist before that host replacement**, since a new host runs Flyway at first boot.
 
 Migrations are forward-only; there is no `migrate` rollback. A failed Flyway run leaves the running containers untouched (migrate never touches containers).
 

@@ -551,12 +551,12 @@ run "plan_succeeds" {
 
   assert {
     condition     = aws_ebs_volume.mysql_data_v2.size == 2 && aws_ebs_volume.mysql_data_v2.type == "gp3"
-    error_message = "aws_ebs_volume.mysql_data should be a 2 GiB gp3 volume (T-066) -- a size/class bump is cost drift and needs an explicit, recorded decision (CLAUDE.md review guidance)"
+    error_message = "aws_ebs_volume.mysql_data_v2 should be a 2 GiB gp3 volume (T-066) -- a size/class bump is cost drift and needs an explicit, recorded decision (CLAUDE.md review guidance)"
   }
 
   assert {
     condition     = aws_ebs_volume.mysql_data_v2.encrypted == true
-    error_message = "aws_ebs_volume.mysql_data must be encrypted at rest"
+    error_message = "aws_ebs_volume.mysql_data_v2 must be encrypted at rest"
   }
 
   # aws_volume_attachment.mysql_data.volume_id/.instance_id and
@@ -3803,7 +3803,7 @@ run "t066_small_mysql_volume" {
   }
 }
 
-run "t066_volume_size_must_hold_the_data" {
+run "t066_volume_size_is_a_whole_number_of_gib_at_least_1" {
   command = plan
 
   variables {

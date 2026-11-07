@@ -3720,3 +3720,15 @@ run "t061_custom_domain" {
     error_message = "bff-node reads its CORS origins from SSM through cv_need"
   }
 }
+
+# T-061 review: dns.tf's zone is a fixed zone ID, so a public_domain that the
+# zone doesn't serve must fail at plan time, not hang ACM validation.
+run "t061_domain_must_match_the_zone" {
+  command = plan
+
+  variables {
+    public_domain = "other.example.com"
+  }
+
+  expect_failures = [aws_acm_certificate.site]
+}

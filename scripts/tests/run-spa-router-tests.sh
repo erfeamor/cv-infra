@@ -31,8 +31,8 @@ function req(uri, host, qs) {
   if (host !== undefined) request.headers.host = { value: host };
   return handler({ request });
 }
-function redirectTo(r) {
-  return r.statusCode === 301 && r.headers && r.headers.location ? r.headers.location.value : null;
+function redirectTo(r, code) {
+  return r.statusCode === (code || 301) && r.headers && r.headers.location ? r.headers.location.value : null;
 }
 
 // --- routing that existed before T-061 must not change -------------------
@@ -63,15 +63,48 @@ check('the apex itself is not redirected', req('/', APEX).statusCode === undefin
 
 // --- /react -> react.<apex> ---------------------------------------------
 const react = 'https://react.' + APEX;
-check('/react redirects', redirectTo(req('/react', APEX)) === react);
-check('/react/ redirects', redirectTo(req('/react/', APEX)) === react);
-check('/react/deep/link redirects', redirectTo(req('/react/deep/link', APEX)) === react);
+check('/react redirects', redirectTo(req('/react', APEX), 302) === react);
+check('/react/ redirects', redirectTo(req('/react/', APEX), 302) === react);
+check('/react/deep/link redirects', redirectTo(req('/react/deep/link', APEX), 302) === react);
 check('/react redirects on the cloudfront.net host too',
-  redirectTo(req('/react', 'dvdlxl0zqepqi.cloudfront.net')) === react);
-check('www + /react is one hop to react.<apex>', redirectTo(req('/react', 'www.' + APEX)) === react);
+  redirectTo(req('/react', 'dvdlxl0zqepqi.cloudfront.net'), 302) === react);
+check('www + /react is one hop to react.<apex>', redirectTo(req('/react', 'www.' + APEX), 302) === react);
 check('/reactor is not /react', req('/reactor', APEX).uri === '/index.html');
 check('/admin/react is not /react', req('/admin/react', APEX).uri === '/admin/index.html');
 check('a file called /react.js passes through', req('/react.js', APEX).uri === '/react.js');
+
+check('/react is a temporary redirect until react.<apex> exists (T-410)', req('/react', APEX).statusDescription === 'Found');
+
+// --- more www cases ------------------------------------------------------
+check('www + /health redirects (the host is canonical for every path)',
+  redirectTo(req('/health', 'www.' + APEX)) === 'https://' + APEX + '/health');
+check('www + /metrics redirects',
+  redirectTo(req('/metrics', 'www.' + APEX)) === 'https://' + APEX + '/metrics');
+check('the Host comparison ignores case', redirectTo(req('/', 'WWW.' + APEX.toUpperCase())) === 'https://' + APEX + '/');
+check('a valueless query parameter stays valueless',
+  redirectTo(req('/x', 'www.' + APEX, { flag: { value: '' } })) === 'https://' + APEX + '/x?flag');
+check('already-encoded values are not encoded twice',
+  redirectTo(req('/x', 'www.' + APEX, { a: { value: 'a%20b' }, b: { value: 'x%26y' } })) ===
+    'https://' + APEX + '/x?a=a%20b&b=x%26y');
+check('decoded special characters are encoded',
+  redirectTo(req('/x', 'www.' + APEX, { q: { value: 'x&y=z#w' } })) === 'https://' + APEX + '/x?q=x%26y%3Dz%23w');
+check('a lone % is encoded', redirectTo(req('/x', 'www.' + APEX, { p: { value: '100%' } })) === 'https://' + APEX + '/x?p=100%25');
+check('non-ASCII is encoded', redirectTo(req('/x', 'www.' + APEX, { n: { value: 'caf\u00e9' } })) === 'https://' + APEX + '/x?n=caf%C3%A9');
+check('a lone surrogate does not throw', (function () {
+  try { return redirectTo(req('/x', 'www.' + APEX, { n: { value: '\ud800' } })) !== null; } catch (e) { return false; }
+})());
+
+// --- the Location never leaves the site (open redirect) --------------------
+[
+  ['//evil.test', 'www.' + APEX], ['/\\evil.test', 'www.' + APEX], ['/%0d%0aSet-Cookie:x=1', 'www.' + APEX],
+  ['/@evil.test', 'www.' + APEX], ['/react', 'evil.test'], ['/react', undefined], ['/x', 'www.' + APEX + ':443'],
+].forEach(function (c) {
+  const r = req(c[0], c[1]);
+  const loc = r.headers && r.headers.location ? r.headers.location.value : null;
+  check('the Location stays on-site for ' + JSON.stringify(c),
+    loc === null || loc.indexOf('https://' + APEX + '/') === 0 || loc === 'https://react.' + APEX,
+    String(loc));
+});
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

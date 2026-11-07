@@ -903,12 +903,15 @@ t62_block=$(printf '%s\n' "$au" | awk '/^resource "aws_cognito_user_pool_domain"
 t62_problems=""
 printf '%s\n' "$t62_block" | grep -qE 'certificate_arn[[:space:]]*=[[:space:]]*aws_acm_certificate_validation\.site\.certificate_arn' \
   || t62_problems="$t62_problems; the custom domain's certificate_arn must come from aws_acm_certificate_validation.site"
-printf '%s\n' "$t62_block" | grep -qE 'depends_on[[:space:]]*=[[:space:]]*\[aws_route53_record\.site_alias\]' \
-  || t62_problems="$t62_problems; the custom domain must depend on the apex alias record"
+printf '%s\n' "$t62_block" | grep -qE 'site_alias\["apex-A"\]' && printf '%s\n' "$t62_block" | grep -qE 'site_alias\["apex-AAAA"\]' \
+  || t62_problems="$t62_problems; the custom domain must depend on the apex alias records"
 printf '%s\n' "$t62_block" | grep -qE 'managed_login_version[[:space:]]*=[[:space:]]*1([^0-9]|$)' \
   || t62_problems="$t62_problems; the custom domain must pin managed_login_version = 1"
 printf '%s\n' "$ssm" | grep -qE 'value[[:space:]]*=[[:space:]]*"https://\$\{aws_cognito_user_pool_domain\.custom\.domain\}/oauth2/token"' \
   || t62_problems="$t62_problems; bff/token-url must be built from aws_cognito_user_pool_domain.custom"
+ssm_token_block=$(printf '%s\n' "$ssm" | awk '/^resource "aws_ssm_parameter" "bff_token_url"/ {f=1} f {print} f && /^}/ {exit}')
+printf '%s\n' "$ssm_token_block" | grep -qE 'depends_on[[:space:]]*=[[:space:]]*\[aws_route53_record\.auth_alias\]' \
+  || t62_problems="$t62_problems; bff/token-url must wait for the auth.<apex> alias record"
 printf '%s\n' "$au" | grep -qE '^resource "aws_cognito_user_pool_domain" "cv"' \
   || t62_problems="$t62_problems; the prefix domain must stay declared until T-306"
 auth_alias=$(printf '%s\n' "$sdom" | awk '/^resource "aws_route53_record" "auth_alias"/ {f=1} f {print} f && /^}/ {exit}')

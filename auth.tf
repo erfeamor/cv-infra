@@ -81,7 +81,7 @@ resource "aws_cognito_user_pool_domain" "cv" {
 # fronts a custom domain with its own CloudFront distribution, which wants (a) a
 # us-east-1 certificate covering the name (domain.tf's, validated before this is
 # created) and (b) the parent domain to resolve, which the apex alias record
-# gives it. A pool can hold this beside the prefix domain above; that one stays
+# gives it (only the apex ones, not www). A pool can hold this beside the prefix domain above; that one stays
 # until T-306 has moved the admin build off it. Classic managed login (1)
 # matches the prefix domain; version 2 would need a branding resource first or
 # the login page breaks.
@@ -91,5 +91,5 @@ resource "aws_cognito_user_pool_domain" "custom" {
   certificate_arn       = aws_acm_certificate_validation.site.certificate_arn
   managed_login_version = 1
 
-  depends_on = [aws_route53_record.site_alias]
+  depends_on = [aws_route53_record.site_alias["apex-A"], aws_route53_record.site_alias["apex-AAAA"]]
 }

@@ -212,6 +212,11 @@ resource "aws_ssm_parameter" "bff_token_url" {
   type  = "String"
   value = "https://${aws_cognito_user_pool_domain.custom.domain}/oauth2/token"
 
+  # The URL is known as soon as the Cognito domain exists, but the name only
+  # resolves once the alias to Cognito's distribution is in DNS; without this a
+  # cv-redeploy in that window would point the BFF at nothing (T-062).
+  depends_on = [aws_route53_record.auth_alias]
+
   tags = {
     Project = var.project_name
   }

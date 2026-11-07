@@ -5,11 +5,10 @@
 #
 #   erfeamor.com       -> cv-public-vanilla (/) and cv-admin-react (/admin/)
 #   www.erfeamor.com   -> 301 to the apex (functions/spa-router.js)
-#   react.erfeamor.com -> Vercel (a CNAME that T-410 adds once Vercel gives
-#                         the target); erfeamor.com/react redirects to it
-#   auth.erfeamor.com  -> Cognito's hosted UI (T-062); only its certificate
-#                         name is here, so T-062 never replaces a certificate
-#                         that is already attached to a live distribution.
+#   react.erfeamor.com -> Vercel (a CNAME, T-410); erfeamor.com/react 301s to it
+#   auth.erfeamor.com  -> Cognito's hosted UI and token endpoint (T-062): the
+#                         certificate is here, the domain is in auth.tf, and
+#                         its alias record is auth_alias below.
 
 locals {
   public_apex = var.public_domain
@@ -104,10 +103,9 @@ resource "aws_route53_record" "site_alias" {
 resource "aws_route53_record" "auth_alias" {
   for_each = toset(["A", "AAAA"])
 
-  zone_id         = data.aws_route53_zone.ci.zone_id
-  name            = local.public_auth
-  type            = each.key
-  allow_overwrite = true
+  zone_id = data.aws_route53_zone.ci.zone_id
+  name    = local.public_auth
+  type    = each.key
 
   alias {
     name                   = aws_cognito_user_pool_domain.custom.cloudfront_distribution

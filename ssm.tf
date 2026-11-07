@@ -210,7 +210,7 @@ resource "aws_ssm_parameter" "bff_service_client_secret" {
 resource "aws_ssm_parameter" "bff_token_url" {
   name  = "/${var.project_name}/${var.environment}/bff/token-url"
   type  = "String"
-  value = "https://${aws_cognito_user_pool_domain.cv.domain}.auth.${var.aws_region}.amazoncognito.com/oauth2/token"
+  value = "https://${aws_cognito_user_pool_domain.custom.domain}/oauth2/token"
 
   tags = {
     Project = var.project_name

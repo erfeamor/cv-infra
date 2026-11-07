@@ -38,7 +38,9 @@ output "cognito_user_pool_id" {
 }
 
 output "cognito_hosted_ui_domain" {
-  value = aws_cognito_user_pool_domain.cv.domain
+  # T-062: the custom domain. The prefix domain (aws_cognito_user_pool_domain.cv)
+  # is still attached until T-306 moves the admin build.
+  value = aws_cognito_user_pool_domain.custom.domain
 }
 
 output "ci_doorbell_url" {

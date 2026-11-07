@@ -2712,7 +2712,7 @@ run "bff_service_token" {
       aws_ssm_parameter.bff_token_url.name == "/${var.project_name}/${var.environment}/bff/token-url" &&
       aws_ssm_parameter.bff_token_scope.name == "/${var.project_name}/${var.environment}/bff/token-scope" &&
       aws_ssm_parameter.bff_token_scope.value == "cv-domain/read" &&
-      aws_ssm_parameter.bff_token_url.value == "https://${var.project_name}-${var.environment}.auth.${var.aws_region}.amazoncognito.com/oauth2/token"
+      aws_ssm_parameter.bff_token_url.value == "https://auth.erfeamor.com/oauth2/token"
     )
     error_message = "BFF SSM parameter names/values under /<project>/<env>/bff/ are wrong"
   }
@@ -3736,4 +3736,39 @@ run "t061_domain_must_match_the_zone" {
   }
 
   expect_failures = [aws_acm_certificate.site]
+}
+
+# T-062: Cognito serves its hosted UI and token endpoint from auth.<apex>. The
+# prefix domain stays beside it until T-306 moves the admin build (a pool can
+# hold both).
+run "t062_cognito_custom_domain" {
+  command = plan
+
+  assert {
+    condition = (
+      aws_cognito_user_pool_domain.custom.domain == "auth.erfeamor.com" &&
+      aws_cognito_user_pool_domain.custom.managed_login_version == 1
+    )
+    error_message = "the custom domain is auth.<apex>, on classic managed login (version 1)"
+  }
+
+  assert {
+    condition     = aws_cognito_user_pool_domain.cv.domain == "${var.project_name}-${var.environment}"
+    error_message = "the prefix domain stays until T-306 moves the admin build"
+  }
+
+  assert {
+    condition = (
+      aws_route53_record.auth_alias["A"].name == "auth.erfeamor.com" &&
+      aws_route53_record.auth_alias["AAAA"].name == "auth.erfeamor.com" &&
+      aws_route53_record.auth_alias["A"].type == "A" &&
+      aws_route53_record.auth_alias["AAAA"].type == "AAAA"
+    )
+    error_message = "auth.<apex> has an A and an AAAA alias"
+  }
+
+  assert {
+    condition     = output.cognito_hosted_ui_domain == "auth.erfeamor.com"
+    error_message = "the hosted UI output names the custom domain"
+  }
 }

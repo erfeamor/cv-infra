@@ -99,6 +99,23 @@ resource "aws_route53_record" "site_alias" {
   }
 }
 
+# auth.<apex> -> the CloudFront distribution Cognito creates for its custom
+# domain (T-062). Not the site's distribution: Cognito owns this one.
+resource "aws_route53_record" "auth_alias" {
+  for_each = toset(["A", "AAAA"])
+
+  zone_id         = data.aws_route53_zone.ci.zone_id
+  name            = local.public_auth
+  type            = each.key
+  allow_overwrite = true
+
+  alias {
+    name                   = aws_cognito_user_pool_domain.custom.cloudfront_distribution
+    zone_id                = aws_cognito_user_pool_domain.custom.cloudfront_distribution_zone_id
+    evaluate_target_health = false
+  }
+}
+
 # react.<apex> -> the Vercel project serving cv-public-react (T-410). The target
 # is the one Vercel shows in Settings -> Domains for this project.
 resource "aws_route53_record" "react" {

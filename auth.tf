@@ -76,3 +76,20 @@ resource "aws_cognito_user_pool_domain" "cv" {
   domain       = "${var.project_name}-${var.environment}"
   user_pool_id = aws_cognito_user_pool.cv.id
 }
+
+# T-062: the hosted UI and the OAuth token endpoint at auth.<apex>. Cognito
+# fronts a custom domain with its own CloudFront distribution, which wants (a) a
+# us-east-1 certificate covering the name (domain.tf's, validated before this is
+# created) and (b) the parent domain to resolve, which the apex alias record
+# gives it. A pool can hold this beside the prefix domain above; that one stays
+# until T-306 has moved the admin build off it. Classic managed login (1)
+# matches the prefix domain; version 2 would need a branding resource first or
+# the login page breaks.
+resource "aws_cognito_user_pool_domain" "custom" {
+  domain                = local.public_auth
+  user_pool_id          = aws_cognito_user_pool.cv.id
+  certificate_arn       = aws_acm_certificate_validation.site.certificate_arn
+  managed_login_version = 1
+
+  depends_on = [aws_route53_record.site_alias]
+}

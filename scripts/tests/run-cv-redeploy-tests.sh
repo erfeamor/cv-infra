@@ -40,7 +40,6 @@ render() {
     -e 's#\${log_group_bff_node}#/cv-project/cv-bff-node#g' \
     -e 's#\${db_name}#cvdb#g' \
     -e 's#\${db_username}#cvuser#g' \
-    -e 's#\${cloudfront_domain}#d111.cloudfront.net#g' \
     -e 's#\$\${#${#g' \
     -e "s#/usr/local/lib/cv-app.sh#$workdir/lib/cv-app.sh#g"
 }
@@ -179,8 +178,8 @@ env_dump="$workdir/env.dump"
 echo "case 9: a failing or empty SSM read aborts before docker rm / docker run (T-055)"
 # parameter substring that each service reads, incl. the secret ones
 for svc in domain-service bff-node; do
-  if [ "$svc" = domain-service ]; then params="db/password cognito/issuer-uri"
-  else params="cognito/issuer-uri bff/service-client-id bff/service-client-secret bff/token-url bff/token-scope"; fi
+  if [ "$svc" = domain-service ]; then params="db/password cognito/issuer-uri app/cors-allowed-origins"
+  else params="cognito/issuer-uri bff/service-client-id bff/service-client-secret bff/token-url bff/token-scope app/cors-allowed-origins"; fi
   for p in $params; do
     for mode in FAIL EMPTY; do
       env_assign="STUB_AWS_$mode=$p"
@@ -230,7 +229,7 @@ boot_run() {
   : >"$calls"; rm -f "$workdir/state/digest" "$env_dump"
   set +e
   env -i CV_INSTANCE_ID_FILE="$workdir/instance-id.ok" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" STUB_ENV_DUMP="$env_dump" "$@" \
-    bash -c "source '$workdir/lib/cv-app.sh'; $pre; cv_run_$svc; echo \"cv_run_rc=\$?\"; echo \"set-vars=\$(compgen -A variable | grep -E '^CV_(DS|BFF)_(INSTANCE_ID|DB_PASSWORD|COGNITO_ISSUER_URI|CLIENT_ID|CLIENT_SECRET|TOKEN_URL|TOKEN_SCOPE)$' | tr '\\n' ' ')\"" >"$out" 2>&1
+    bash -c "source '$workdir/lib/cv-app.sh'; $pre; cv_run_$svc; echo \"cv_run_rc=\$?\"; echo \"set-vars=\$(compgen -A variable | grep -E '^CV_(DS|BFF)_(INSTANCE_ID|DB_PASSWORD|COGNITO_ISSUER_URI|CLIENT_ID|CLIENT_SECRET|TOKEN_URL|TOKEN_SCOPE|CORS_ORIGINS)$' | tr '\\n' ' ')\"" >"$out" 2>&1
   set -e
 }
 

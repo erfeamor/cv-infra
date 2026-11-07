@@ -60,6 +60,7 @@ locals {
     aws_ssm_parameter.bff_service_client_secret.name,
     aws_ssm_parameter.bff_token_url.name,
     aws_ssm_parameter.bff_token_scope.name,
+    aws_ssm_parameter.cors_allowed_origins.name,
   ]
   # Parameter names start with "/", which an ARN's resource part also does
   # not repeat after "parameter".

@@ -378,3 +378,20 @@ variable "ci_hostname" {
     error_message = "var.ci_hostname must be a lowercase hostname with no trailing dot, at least two labels (e.g. ci.erfeamor.com) -- got \"${var.ci_hostname}\"."
   }
 }
+
+# T-061 ---------------------------------------------------------------------
+
+variable "public_domain" {
+  # The ONE place the public domain is spelled out: domain.tf (certificate,
+  # records), frontend.tf (aliases, the router function's redirects) and
+  # auth.tf (Cognito callbacks) all read it from here. The zone itself is the
+  # data source in dns.tf, which the human owns outside Terraform.
+  description = "The apex of the public site (cv-public-vanilla at /, cv-admin-react at /admin/). www, react and auth subdomains hang off it."
+  type        = string
+  default     = "erfeamor.com"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.public_domain))
+    error_message = "var.public_domain must be a lowercase apex domain with no trailing dot (e.g. erfeamor.com) -- got \"${var.public_domain}\"."
+  }
+}

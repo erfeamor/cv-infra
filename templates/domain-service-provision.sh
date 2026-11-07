@@ -132,10 +132,12 @@ cv_need() {
 
 # Hibernate ddl-auto=validate against the migrated schema.
 cv_run_domain_service() {
-  local +x CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI
+  local +x CV_DS_INSTANCE_ID CV_DS_DB_PASSWORD CV_DS_COGNITO_ISSUER_URI CV_DS_CORS_ORIGINS
   CV_DS_INSTANCE_ID=$(cv_instance_id) || return 1
   cv_need CV_DS_DB_PASSWORD db/password || return 1
   cv_need CV_DS_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
+  # T-061: the browser origins live in SSM, so a new one is a cv-redeploy.
+  cv_need CV_DS_CORS_ORIGINS app/cors-allowed-origins || return 1
   if [ "$#" -gt 0 ]; then "$@" || true; fi
   docker run -d --name domain-service --restart unless-stopped --network cv \
     --log-driver awslogs \
@@ -151,7 +153,7 @@ cv_run_domain_service() {
     -e SPRING_DATASOURCE_PASSWORD="$CV_DS_DB_PASSWORD" \
     -e COGNITO_ISSUER_URI="$CV_DS_COGNITO_ISSUER_URI" \
     -e AUTH_ENABLED=true \
-    -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain},http://localhost:5173,http://localhost:4173" \
+    -e CORS_ALLOWED_ORIGINS="$CV_DS_CORS_ORIGINS,http://localhost:5173,http://localhost:4173" \
     "$CV_DOMAIN_IMAGE"
 }
 
@@ -161,13 +163,14 @@ cv_run_domain_service() {
 # except the contract's own PUBLIC_ROUTES allowlist. T-043: client-credentials
 # identity for the domain service (Cognito).
 cv_run_bff_node() {
-  local +x CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE
+  local +x CV_BFF_INSTANCE_ID CV_BFF_COGNITO_ISSUER_URI CV_BFF_CLIENT_ID CV_BFF_CLIENT_SECRET CV_BFF_TOKEN_URL CV_BFF_TOKEN_SCOPE CV_BFF_CORS_ORIGINS
   CV_BFF_INSTANCE_ID=$(cv_instance_id) || return 1
   cv_need CV_BFF_COGNITO_ISSUER_URI cognito/issuer-uri || return 1
   cv_need CV_BFF_CLIENT_ID bff/service-client-id || return 1
   cv_need CV_BFF_CLIENT_SECRET bff/service-client-secret || return 1
   cv_need CV_BFF_TOKEN_URL bff/token-url || return 1
   cv_need CV_BFF_TOKEN_SCOPE bff/token-scope || return 1
+  cv_need CV_BFF_CORS_ORIGINS app/cors-allowed-origins || return 1
   if [ "$#" -gt 0 ]; then "$@" || true; fi
   docker run -d --name bff-node --restart unless-stopped --network cv \
     --log-driver awslogs \
@@ -180,7 +183,7 @@ cv_run_bff_node() {
     -e DOMAIN_SERVICE_URL=http://domain-service:8080 \
     -e AUTH_ENABLED=true \
     -e COGNITO_ISSUER_URI="$CV_BFF_COGNITO_ISSUER_URI" \
-    -e CORS_ALLOWED_ORIGINS="https://${cloudfront_domain}" \
+    -e CORS_ALLOWED_ORIGINS="$CV_BFF_CORS_ORIGINS" \
     -e COGNITO_TOKEN_URL="$CV_BFF_TOKEN_URL" \
     -e SERVICE_CLIENT_ID="$CV_BFF_CLIENT_ID" \
     -e SERVICE_CLIENT_SECRET="$CV_BFF_CLIENT_SECRET" \

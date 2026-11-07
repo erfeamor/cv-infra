@@ -62,3 +62,10 @@ terraform {
 provider "aws" {
   region = var.aws_region
 }
+
+# T-061: CloudFront only accepts ACM certificates issued in us-east-1, so the
+# certificate and its validation (domain.tf) use this alias. Nothing else does.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}

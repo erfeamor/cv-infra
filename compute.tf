@@ -104,6 +104,7 @@ resource "aws_instance" "domain_service" {
     aws_ssm_parameter.bff_service_client_secret,
     aws_ssm_parameter.bff_token_url,
     aws_ssm_parameter.bff_token_scope,
+    aws_ssm_parameter.cors_allowed_origins,
     # T-044: the stub downloads and verifies these at first boot.
     aws_s3_object.app_host_provision,
     aws_ssm_parameter.app_host_provision_sha256,

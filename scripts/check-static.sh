@@ -847,4 +847,45 @@ else
   ok "null_resource.jenkins_provision re-runs when Jenkins' GitHub token or admin password rotates in SSM (T-040)"
 fi
 
+# --- 25. The custom domain's wiring (T-061) -----------------------------------
+# What plan-time tests can't see, because ARNs and validation records are
+# unknown until apply: (a) the certificate and its validation use the
+# us-east-1 provider (CloudFront reads certificates from nowhere else); (b) the
+# distribution takes its certificate ARN from the VALIDATION resource, so it
+# isn't updated before ACM has validated the names; (c) the CORS parameter
+# carries both the custom domain and the cloudfront.net origin; (d) the
+# provision script reads CORS from SSM and bakes no origin in; (e) the Cognito
+# admin client accepts the custom domain.
+strip_hash() { sed -e 's/[[:space:]]*#.*$//' "$@"; }
+dom=$(strip_hash domain.tf)
+fe=$(strip_hash frontend.tf)
+au=$(strip_hash auth.tf)
+tpl=$(strip_hash templates/domain-service-provision.sh)
+t61_problems=""
+for res in aws_acm_certificate.site aws_acm_certificate_validation.site; do
+  type=${res%%.*}; name=${res#*.}
+  region_ok=$(printf '%s\n' "$dom" | awk -v t="$type" -v n="$name" '$0 ~ "^resource \""t"\" \""n"\"" {f=1} f && /provider[ \t]*=[ \t]*aws\.us_east_1/ {print "yes"; exit} f && /^}/ {exit}')
+  [ "$region_ok" = yes ] || t61_problems="$t61_problems; $res is not on provider aws.us_east_1"
+done
+printf '%s\n' "$fe" | grep -qE 'acm_certificate_arn[[:space:]]*=[[:space:]]*aws_acm_certificate_validation\.site\.certificate_arn' \
+  || t61_problems="$t61_problems; the distribution's acm_certificate_arn must come from aws_acm_certificate_validation.site"
+printf '%s\n' "$fe" | grep -qE 'aliases[[:space:]]*=[[:space:]]*\[local\.public_apex,[[:space:]]*local\.public_www\]' \
+  || t61_problems="$t61_problems; the distribution's aliases must be exactly [local.public_apex, local.public_www]"
+printf '%s\n' "$dom" | grep -qE 'value[[:space:]]*=[[:space:]]*"https://\$\{local\.public_apex\},https://\$\{aws_cloudfront_distribution\.frontend\.domain_name\}"' \
+  || t61_problems="$t61_problems; app/cors-allowed-origins must be https://<apex>,https://<cloudfront domain>"
+if printf '%s\n' "$tpl" | grep -E 'CORS_ALLOWED_ORIGINS=' | grep -qE 'https://'; then
+  t61_problems="$t61_problems; the provision script bakes a CORS origin in instead of reading app/cors-allowed-origins"
+fi
+printf '%s\n' "$tpl" | grep -qE 'CORS_ALLOWED_ORIGINS="\$CV_DS_CORS_ORIGINS,' \
+  || t61_problems="$t61_problems; domain-service's CORS_ALLOWED_ORIGINS must start from \$CV_DS_CORS_ORIGINS"
+printf '%s\n' "$tpl" | grep -qE 'CORS_ALLOWED_ORIGINS="\$CV_BFF_CORS_ORIGINS"' \
+  || t61_problems="$t61_problems; bff-node's CORS_ALLOWED_ORIGINS must be exactly \$CV_BFF_CORS_ORIGINS"
+[ "$(printf '%s\n' "$au" | grep -cE '"https://\$\{local\.public_apex\}/admin/"')" -eq 2 ] \
+  || t61_problems="$t61_problems; the admin Cognito client needs https://<apex>/admin/ as both callback and logout URL"
+if [ -n "$t61_problems" ]; then
+  bad "custom domain wiring (T-061):${t61_problems#;}"
+else
+  ok "the custom domain's certificate is us-east-1 and validated before the distribution uses it; CORS comes from SSM (T-061)"
+fi
+
 exit $fail

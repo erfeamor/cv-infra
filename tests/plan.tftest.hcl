@@ -2,6 +2,13 @@
 # Uses a mocked AWS provider so the plan runs without credentials or network
 # access — data sources return the mock defaults below.
 
+# T-061: CloudFront only accepts ACM certificates from us-east-1, so the root
+# module declares a second, aliased provider; the tests need a matching mock
+# or they would reach for real credentials.
+mock_provider "aws" {
+  alias = "us_east_1"
+}
+
 mock_provider "aws" {
   mock_data "aws_vpc" {
     defaults = {
@@ -40,7 +47,7 @@ mock_provider "aws" {
     defaults = {
       zone_id = "Z0608270B7WND031GVOW"
       arn     = "arn:aws:route53:::hostedzone/Z0608270B7WND031GVOW"
-      name    = "erfeamor.com."
+      name    = "erfeamor.com" # the real data source has no trailing dot (found by the T-061 plan)
     }
   }
 
@@ -1762,7 +1769,7 @@ run "drone_deploy_credentials" {
       for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
       s.Resource if s.Effect == "Allow"
       ])) == toset([
-      for p in ["app/provision-sha256", "db/password", "cognito/issuer-uri", "bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope"] :
+      for p in ["app/provision-sha256", "db/password", "cognito/issuer-uri", "bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope", "app/cors-allowed-origins"] :
       "arn:aws:ssm:${var.aws_region}:123456789012:parameter/${var.project_name}/${var.environment}/${p}"
     ])
     error_message = "read_parameters must Allow exactly the 7 parameters the app host reads, by full ARN (T-005)"
@@ -1797,7 +1804,7 @@ run "drone_deploy_credentials" {
       s.Effect == "Deny" && try(s.Resource, null) == null &&
       toset(s.Action) == toset(["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory"]) &&
       toset(flatten([try(s.NotResource, [])])) == toset([
-        for p in ["app/provision-sha256", "db/password", "cognito/issuer-uri", "bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope"] :
+        for p in ["app/provision-sha256", "db/password", "cognito/issuer-uri", "bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope", "app/cors-allowed-origins"] :
         "arn:aws:ssm:${var.aws_region}:123456789012:parameter/${var.project_name}/${var.environment}/${p}"
       ])
     ])
@@ -2205,15 +2212,15 @@ run "app_host_user_data" {
     error_message = "Both the domain service and the BFF must pass COGNITO_ISSUER_URI from its own SSM-sourced local (CV_DS_/CV_BFF_COGNITO_ISSUER_URI), never a literal"
   }
 
-  # Ruling 6: CORS_ALLOWED_ORIGINS on the BFF is EXACTLY https://<cloudfront
-  # domain> -- closing quote right after the domain discriminates this from
-  # the domain service's own (longer, comma-separated) CORS value, so this
-  # also proves the BFF does NOT inherit the localhost dev origins.
+  # Ruling 6 (T-061: the origins now come from SSM): CORS_ALLOWED_ORIGINS on
+  # the BFF is EXACTLY the SSM value -- closing quote right after the variable
+  # discriminates this from the domain service's own value, which appends the
+  # localhost dev origins, so this also proves the BFF does NOT inherit them.
   # cv-public-react needs no entry -- it fetches server-side under ISR, so
   # CORS never applies to it; not asserted here since there's nothing to
   # assert an absence of.
   assert {
-    condition = length(regexall("-e CORS_ALLOWED_ORIGINS=\"https://d1234567890abc\\.cloudfront\\.net\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
+    condition = length(regexall("-e CORS_ALLOWED_ORIGINS=\"\\$CV_BFF_CORS_ORIGINS\"", templatefile("${path.module}/templates/domain-service-provision.sh", {
       aws_region               = var.aws_region
       project_name             = var.project_name
       environment              = var.environment
@@ -2228,7 +2235,7 @@ run "app_host_user_data" {
       log_group_domain_service = "/cv-project/cv-domain-service"
       log_group_bff_node       = "/cv-project/cv-bff-node"
     }))) == 1
-    error_message = "The BFF's CORS_ALLOWED_ORIGINS must include https://<cloudfront_domain>"
+    error_message = "The BFF's CORS_ALLOWED_ORIGINS must be exactly the SSM value (no localhost origins)"
   }
 
   # Scope 2: the same retry-until-the-image-exists pattern as the domain
@@ -2789,6 +2796,15 @@ run "github_oidc_public_vanilla_deploy" {
     target = aws_cloudfront_function.spa_router
     values = {
       arn = "arn:aws:cloudfront::123456789012:function/spa-router"
+    }
+  }
+
+  # T-061: the distribution's viewer_certificate reads the certificate ARN, and
+  # the provider validates its format; a mock apply would invent a bare string.
+  override_resource {
+    target = aws_acm_certificate.site
+    values = {
+      arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
     }
   }
 
@@ -3583,4 +3599,136 @@ run "t054_app_container_logs" {
     }))) == 1
     error_message = "only domain-service sets awslogs-datetime-format (stack traces stay one event)"
   }
+}
+
+# --- T-061: erfeamor.com on CloudFront -------------------------------------
+# Plan-time facts only: ARNs, the distribution's domain and validation
+# records are unknown until apply, so their wiring (certificate -> validation
+# -> viewer_certificate, the CORS value) is pinned by check-static.sh check 25.
+run "t061_custom_domain" {
+  command = plan
+
+  assert {
+    condition     = aws_acm_certificate.site.domain_name == "erfeamor.com"
+    error_message = "the certificate's primary name is the apex"
+  }
+
+  assert {
+    condition = (
+      length(aws_acm_certificate.site.subject_alternative_names) == 2 &&
+      contains(aws_acm_certificate.site.subject_alternative_names, "www.erfeamor.com") &&
+      contains(aws_acm_certificate.site.subject_alternative_names, "auth.erfeamor.com")
+    )
+    error_message = "the certificate covers www and auth.erfeamor.com (auth is included now so T-062 never replaces an attached certificate)"
+  }
+
+  assert {
+    condition     = aws_acm_certificate.site.validation_method == "DNS"
+    error_message = "the certificate validates through DNS in the Route 53 zone"
+  }
+
+  assert {
+    condition     = toset(keys(aws_route53_record.site_cert_validation)) == toset(["erfeamor.com", "www.erfeamor.com", "auth.erfeamor.com"])
+    error_message = "one validation record per certificate name"
+  }
+
+  assert {
+    condition     = aws_cloudfront_distribution.frontend.aliases == toset(["erfeamor.com", "www.erfeamor.com"])
+    error_message = "the distribution answers to the apex and www only (auth.erfeamor.com is Cognito's own CloudFront)"
+  }
+
+  assert {
+    condition     = aws_cloudfront_distribution.frontend.is_ipv6_enabled
+    error_message = "IPv6 is enabled on the distribution"
+  }
+
+  assert {
+    condition = (
+      aws_cloudfront_distribution.frontend.viewer_certificate[0].ssl_support_method == "sni-only" &&
+      aws_cloudfront_distribution.frontend.viewer_certificate[0].minimum_protocol_version == "TLSv1.2_2021" &&
+      coalesce(aws_cloudfront_distribution.frontend.viewer_certificate[0].cloudfront_default_certificate, false) == false
+    )
+    error_message = "the custom certificate is served over SNI (no dedicated-IP fee) with TLS 1.2 or newer"
+  }
+
+  assert {
+    condition = toset([for k, r in aws_route53_record.site_alias : "${r.name}/${r.type}"]) == toset([
+      "erfeamor.com/A", "erfeamor.com/AAAA", "www.erfeamor.com/A", "www.erfeamor.com/AAAA",
+    ])
+    error_message = "the apex and www each get an A and an AAAA alias to the distribution"
+  }
+
+  assert {
+    condition     = contains(local.app_host_ssm_parameter_names, aws_ssm_parameter.cors_allowed_origins.name)
+    error_message = "the app host role may read app/cors-allowed-origins"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.cors_allowed_origins.name == "/cv-project/dev/app/cors-allowed-origins"
+    error_message = "the CORS parameter lives under app/ like provision-sha256"
+  }
+
+  assert {
+    condition     = aws_cloudfront_function.spa_router.runtime == "cloudfront-js-2.0"
+    error_message = "the router function keeps the JS 2.0 runtime (startsWith)"
+  }
+
+  assert {
+    condition = (
+      length(regexall("https://react\\.erfeamor\\.com", aws_cloudfront_function.spa_router.code)) >= 1 &&
+      length(regexall("www\\.erfeamor\\.com", aws_cloudfront_function.spa_router.code)) >= 1 &&
+      length(regexall("\\$\\{apex\\}", aws_cloudfront_function.spa_router.code)) == 0
+    )
+    error_message = "templatefile filled the router function's $${apex} placeholders"
+  }
+
+  # The CORS origins are no longer baked into the provision script: they are
+  # read from SSM, so a new origin is a cv-redeploy, not a host replacement.
+  assert {
+    condition = length(regexall("cv_need CV_DS_CORS_ORIGINS app/cors-allowed-origins", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 1
+    error_message = "domain-service reads its CORS origins from SSM through cv_need"
+  }
+
+  assert {
+    condition = length(regexall("cv_need CV_BFF_CORS_ORIGINS app/cors-allowed-origins", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 1
+    error_message = "bff-node reads its CORS origins from SSM through cv_need"
+  }
+}
+
+# T-061 review: dns.tf's zone is a fixed zone ID, so a public_domain that the
+# zone doesn't serve must fail at plan time, not hang ACM validation.
+run "t061_domain_must_match_the_zone" {
+  command = plan
+
+  variables {
+    public_domain = "other.example.com"
+  }
+
+  expect_failures = [aws_acm_certificate.site]
 }

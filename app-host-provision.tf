@@ -21,14 +21,13 @@ locals {
   app_host_provision_key = "app-host/provision.sh"
 
   app_host_provision_script = templatefile("${path.module}/templates/domain-service-provision.sh", {
-    aws_region        = var.aws_region
-    project_name      = var.project_name
-    environment       = var.environment
-    image             = "${aws_ecr_repository.domain_service.repository_url}:latest"
-    bff_image         = "${aws_ecr_repository.bff_node.repository_url}:latest"
-    db_name           = var.db_name
-    db_username       = var.db_username
-    cloudfront_domain = aws_cloudfront_distribution.frontend.domain_name
+    aws_region   = var.aws_region
+    project_name = var.project_name
+    environment  = var.environment
+    image        = "${aws_ecr_repository.domain_service.repository_url}:latest"
+    bff_image    = "${aws_ecr_repository.bff_node.repository_url}:latest"
+    db_name      = var.db_name
+    db_username  = var.db_username
     # T-054: the awslogs groups (observability.tf); the names are plan-known.
     log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
     log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name

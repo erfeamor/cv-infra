@@ -24,13 +24,17 @@ resource "aws_cognito_user_pool_client" "admin_react" {
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
+  # T-061: the custom domain joins the cloudfront.net URL, which stays until
+  # T-306 has moved the admin's build and login to auth.<domain>.
   callback_urls = [
     "http://localhost:5173/admin/",
     "https://${aws_cloudfront_distribution.frontend.domain_name}/admin/",
+    "https://${local.public_apex}/admin/",
   ]
   logout_urls = [
     "http://localhost:5173/admin/",
     "https://${aws_cloudfront_distribution.frontend.domain_name}/admin/",
+    "https://${local.public_apex}/admin/",
   ]
   supported_identity_providers = ["COGNITO"]
 }

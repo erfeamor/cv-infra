@@ -62,12 +62,17 @@ resource "aws_cloudfront_function" "spa_router" {
   name    = "${var.project_name}-spa-router"
   runtime = "cloudfront-js-2.0"
   publish = true
-  code    = file("${path.module}/functions/spa-router.js")
+  code    = templatefile("${path.module}/functions/spa-router.js", { apex = local.public_apex })
 }
 
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
+  is_ipv6_enabled     = true
   default_root_object = "index.html"
+
+  # T-061: the apex and www (functions/spa-router.js redirects www to the
+  # apex). The *.cloudfront.net name keeps working.
+  aliases = [local.public_apex, local.public_www]
 
   origin {
     domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
@@ -182,8 +187,13 @@ resource "aws_cloudfront_distribution" "frontend" {
     }
   }
 
+  # The ARN comes from the validation resource, so the distribution waits
+  # for ACM to validate the names. SNI-only: a dedicated IP would cost $600
+  # a month.
   viewer_certificate {
-    cloudfront_default_certificate = true
+    acm_certificate_arn      = aws_acm_certificate_validation.site.certificate_arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
   }
 
   tags = {

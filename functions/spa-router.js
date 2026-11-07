@@ -6,9 +6,8 @@
 // T-061: two redirects for the custom domain. `${apex}` is filled in by
 // Terraform's templatefile() (frontend.tf); scripts/tests/run-spa-router-
 // tests.sh substitutes a test domain and runs this file under node.
-//   - /react and /react/* -> https://react.${apex}, a 302 until T-410 makes
-//     that name exist (cv-public-react lives on Vercel under its own
-//     subdomain; no proxy in front of Vercel).
+//   - /react and /react/* -> https://react.${apex}, a 301 (cv-public-react lives
+//     on Vercel under its own subdomain; no proxy in front of Vercel).
 //   - www.${apex} -> https://${apex}, path and query string kept.
 // /react is checked first, so www.${apex}/react is one hop, not two.
 //
@@ -71,11 +70,10 @@ function handler(event) {
   var uri = request.uri;
   var host = request.headers.host ? request.headers.host.value.toLowerCase() : '';
 
-  // /react goes first, so www.${apex}/react is one hop. It is a 302 until
-  // react.${apex} exists (T-410 flips it to 301): a browser caches a 301 for
-  // good.
+  // /react goes first, so www.${apex}/react is one hop. A 301 since T-410:
+  // react.${apex} exists and serves the site.
   if (uri === '/react' || uri.startsWith('/react/')) {
-    return redirect('https://react.${apex}', true);
+    return redirect('https://react.${apex}', false);
   }
 
   // Before the probe exclusion below, so www is canonical for every path.

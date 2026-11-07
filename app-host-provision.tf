@@ -35,7 +35,7 @@ locals {
     backup_prefix            = local.mysql_backup_prefix
     # T-018 ruling 2: resolved by volume ID via /dev/disk/by-id, never by
     # device name. See templates/domain-service-provision.sh.
-    mysql_volume_id = aws_ebs_volume.mysql_data.id
+    mysql_volume_id = aws_ebs_volume.mysql_data_v2.id
   })
 
   app_host_provision_sha256 = sha256(local.app_host_provision_script)

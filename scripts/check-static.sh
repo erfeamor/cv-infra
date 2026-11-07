@@ -925,4 +925,40 @@ else
   ok "Cognito's custom domain uses the validated certificate and the apex alias, pins managed login 1, and feeds the BFF token URL (T-062)"
 fi
 
+# --- 27. The MySQL volume swap (T-066) ------------------------------------------
+# What plan-time tests can't see: (a) the old 8 GiB volume is FORGOTTEN
+# (removed {destroy = false}), never destroyed -- losing that block turns the
+# swap into the destruction of the only copy until the restore is verified;
+# (b) the new volume keeps prevent_destroy, takes its size from the variable and
+# is the one the attachment and the provision script use; (c) nothing still
+# declares the old volume as a managed resource (it would fight the removed
+# block); (d) the mysql container expires binlogs, because 2 GiB is small.
+stor=$(strip_hash storage.tf)
+aph=$(strip_hash app-host-provision.tf)
+t66_problems=""
+removed_block=$(printf '%s\n' "$stor" | awk '/^removed \{/ {f=1} f {print} f && /^}/ {exit}')
+printf '%s\n' "$removed_block" | grep -qE 'from[[:space:]]*=[[:space:]]*aws_ebs_volume\.mysql_data$' \
+  || t66_problems="$t66_problems; storage.tf needs a removed block for aws_ebs_volume.mysql_data"
+printf '%s\n' "$removed_block" | grep -qE 'destroy[[:space:]]*=[[:space:]]*false' \
+  || t66_problems="$t66_problems; the removed block must set destroy = false (forget the old volume, never destroy it)"
+if printf '%s\n' "$stor" | grep -qE '^resource "aws_ebs_volume" "mysql_data"'; then
+  t66_problems="$t66_problems; aws_ebs_volume.mysql_data is declared again beside its removed block"
+fi
+v2_block=$(printf '%s\n' "$stor" | awk '/^resource "aws_ebs_volume" "mysql_data_v2"/ {f=1} f {print} f && /^}/ {exit}')
+printf '%s\n' "$v2_block" | grep -qE 'prevent_destroy[[:space:]]*=[[:space:]]*true' \
+  || t66_problems="$t66_problems; mysql_data_v2 must keep prevent_destroy = true"
+printf '%s\n' "$v2_block" | grep -qE 'size[[:space:]]*=[[:space:]]*var\.mysql_volume_size_gb' \
+  || t66_problems="$t66_problems; mysql_data_v2's size must come from var.mysql_volume_size_gb"
+printf '%s\n' "$stor" | grep -qE 'volume_id[[:space:]]*=[[:space:]]*aws_ebs_volume\.mysql_data_v2\.id' \
+  || t66_problems="$t66_problems; the attachment must use aws_ebs_volume.mysql_data_v2"
+printf '%s\n' "$aph" | grep -qE 'mysql_volume_id[[:space:]]*=[[:space:]]*aws_ebs_volume\.mysql_data_v2\.id' \
+  || t66_problems="$t66_problems; the provision script must be given aws_ebs_volume.mysql_data_v2's id"
+printf '%s\n' "$tpl" | grep -qE -- '--binlog-expire-logs-seconds=[0-9]+' \
+  || t66_problems="$t66_problems; the mysql container must set --binlog-expire-logs-seconds (the volume is 2 GiB)"
+if [ -n "$t66_problems" ]; then
+  bad "MySQL volume swap (T-066):${t66_problems#;}"
+else
+  ok "the old MySQL volume is forgotten, not destroyed; the 2 GiB volume is protected and wired; binlogs expire (T-066)"
+fi
+
 exit $fail

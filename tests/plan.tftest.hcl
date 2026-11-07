@@ -526,8 +526,8 @@ run "plan_succeeds" {
   # to the SAME pinned source (var.availability_zone) so they can never
   # diverge -- an EBS volume is AZ-locked.
   assert {
-    condition     = aws_ebs_volume.mysql_data.availability_zone == var.availability_zone
-    error_message = "aws_ebs_volume.mysql_data.availability_zone must come from var.availability_zone -- the same pinned source that selects aws_instance.domain_service's subnet, never a separately-computed AZ"
+    condition     = aws_ebs_volume.mysql_data_v2.availability_zone == var.availability_zone
+    error_message = "aws_ebs_volume.mysql_data_v2.availability_zone must come from var.availability_zone -- the same pinned source that selects aws_instance.domain_service's subnet, never a separately-computed AZ"
   }
 
   # Proves the instance's subnet is actually wired from the new pinned data
@@ -550,17 +550,17 @@ run "plan_succeeds" {
   }
 
   assert {
-    condition     = aws_ebs_volume.mysql_data.size == 8 && aws_ebs_volume.mysql_data.type == "gp3"
-    error_message = "aws_ebs_volume.mysql_data should stay an 8 GiB gp3 volume -- a size/class bump is cost drift and needs an explicit, recorded decision (CLAUDE.md review guidance)"
+    condition     = aws_ebs_volume.mysql_data_v2.size == 2 && aws_ebs_volume.mysql_data_v2.type == "gp3"
+    error_message = "aws_ebs_volume.mysql_data should be a 2 GiB gp3 volume (T-066) -- a size/class bump is cost drift and needs an explicit, recorded decision (CLAUDE.md review guidance)"
   }
 
   assert {
-    condition     = aws_ebs_volume.mysql_data.encrypted == true
+    condition     = aws_ebs_volume.mysql_data_v2.encrypted == true
     error_message = "aws_ebs_volume.mysql_data must be encrypted at rest"
   }
 
   # aws_volume_attachment.mysql_data.volume_id/.instance_id and
-  # aws_ebs_volume.mysql_data.id are unknown-until-apply under `command =
+  # aws_ebs_volume.mysql_data_v2.id are unknown-until-apply under `command =
   # plan` (same documented limitation as aws_s3_bucket.backup.arn and
   # aws_eip.drone.public_ip above), and targeting them for a `command =
   # apply` run pulls in aws_instance.domain_service -> its user_data ->
@@ -3771,4 +3771,44 @@ run "t062_cognito_custom_domain" {
     condition     = output.cognito_hosted_ui_domain == "auth.${var.public_domain}"
     error_message = "the hosted UI output names the custom domain"
   }
+}
+
+# T-066: the MySQL data volume is 2 GiB (the data is ~216 MB), set through
+# var.mysql_volume_size_gb so growing it later is a one-line, in-place change.
+# A 2 GiB disk is why binlogs expire after 7 days instead of MySQL's default 30.
+run "t066_small_mysql_volume" {
+  command = plan
+
+  assert {
+    condition     = var.mysql_volume_size_gb == 2 && aws_ebs_volume.mysql_data_v2.size == var.mysql_volume_size_gb
+    error_message = "the MySQL volume size comes from var.mysql_volume_size_gb, which defaults to 2"
+  }
+
+  assert {
+    condition = length(regexall("--binlog-expire-logs-seconds=604800", templatefile("${path.module}/templates/domain-service-provision.sh", {
+      aws_region               = "eu-west-3"
+      project_name             = "cv-project"
+      environment              = "dev"
+      image                    = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service:latest"
+      bff_image                = "123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest"
+      db_name                  = "cvdb"
+      db_username              = "cvuser"
+      backup_bucket            = "cv-project-mysql-backup-dev"
+      backup_prefix            = "mysql-dumps"
+      mysql_volume_id          = "vol-0123456789abcdef0"
+      log_group_domain_service = aws_cloudwatch_log_group.domain_service.name
+      log_group_bff_node       = aws_cloudwatch_log_group.bff_node.name
+    }))) == 1
+    error_message = "the mysql container expires binlogs after 7 days so they can't fill the 2 GiB volume"
+  }
+}
+
+run "t066_volume_size_must_hold_the_data" {
+  command = plan
+
+  variables {
+    mysql_volume_size_gb = 0
+  }
+
+  expect_failures = [var.mysql_volume_size_gb]
 }

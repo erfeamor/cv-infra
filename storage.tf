@@ -4,7 +4,13 @@
 # instance and, until this task, destroyed the database along with it. This
 # file gives MySQL a volume whose lifecycle is independent of the instance.
 
-resource "aws_ebs_volume" "mysql_data" {
+# T-066: this is the SECOND data volume. EBS can't shrink, and the provider plans
+# a size change as an in-place modify that AWS rejects at apply time (half-way
+# through a host swap), so the 2 GiB volume is a new resource and the original
+# 8 GiB `mysql_data` is forgotten below, not destroyed. See
+# docs/runbooks/mysql-volume.md. A later size change here can only GROW in
+# place (then `xfs_growfs`); going smaller again means another _vN.
+resource "aws_ebs_volume" "mysql_data_v2" {
   # Ruling 1: pinned from the SAME source that selects
   # aws_instance.domain_service's subnet (data.aws_subnets.domain_service in
   # network.tf, filtered on this same variable) -- never computed
@@ -17,7 +23,11 @@ resource "aws_ebs_volume" "mysql_data" {
   # (see CLAUDE.md's "No RDS" decision), not production volume. gp3 is the
   # default type at this size and doesn't need provisioned IOPS/throughput
   # above the gp3 baseline for this workload.
-  size = 8
+  #
+  # T-066: 2 GiB. The data is ~216 MB (305 MB with the filesystem), ~8x
+  # headroom; the binlogs that could grow it expire after 7 days (the mysql
+  # container's flags, domain-service-provision.sh).
+  size = var.mysql_volume_size_gb
   type = "gp3"
 
   # At-rest encryption, no cost or performance impact for gp3 -- no reason
@@ -30,14 +40,10 @@ resource "aws_ebs_volume" "mysql_data" {
   # the class of loss this task exists to prevent.
   final_snapshot = true
 
-  # Cost (recorded against the credit runway, T-012): an 8 GiB gp3 volume in
-  # eu-west-3 is on the order of $1/month at AWS list pricing -- negligible
-  # against current burn, which is ~$0.68/day (~$21/month) as measured
-  # 2026-08-19 with the CI host stopped between builds (T-020; CLAUDE.md
-  # carries the full model). This note previously said the figure in
-  # CLAUDE.md was stale and needed T-020 -- that has since happened.
+  # Cost: gp3 in eu-west-3 is ~$0.093 per GiB-month, so 2 GiB is ~$0.19/month
+  # (the 8 GiB volume was ~$0.74). CLAUDE.md carries the full model.
   tags = {
-    Name    = "${var.project_name}-mysql-data"
+    Name    = "${var.project_name}-mysql-data-v2"
     Project = var.project_name
   }
 
@@ -56,6 +62,19 @@ resource "aws_ebs_volume" "mysql_data" {
   }
 }
 
+# The original 8 GiB volume (T-018). Forgotten, not destroyed: it stays in AWS,
+# detached, as the rollback until the human has checked the restore and
+# snapshots + deletes it (runbook). Without this block Terraform would plan to
+# destroy it (its prevent_destroy went away with its resource block). Delete
+# this block once the old volume is gone.
+removed {
+  from = aws_ebs_volume.mysql_data
+
+  lifecycle {
+    destroy = false
+  }
+}
+
 resource "aws_volume_attachment" "mysql_data" {
   # Ruling 2: device_name is the label Terraform/the EC2 API use for the
   # attachment request -- it is NOT what the guest kernel exposes. These are
@@ -66,7 +85,7 @@ resource "aws_volume_attachment" "mysql_data" {
   # instead (see templates/domain-service-provision.sh). This just has to be
   # a syntactically valid, stable /dev/sd* name for the API call.
   device_name = "/dev/sdf"
-  volume_id   = aws_ebs_volume.mysql_data.id
+  volume_id   = aws_ebs_volume.mysql_data_v2.id
   instance_id = aws_instance.domain_service.id
 
   # Review round 1, finding 1 -- corrects a wrong assumption in the

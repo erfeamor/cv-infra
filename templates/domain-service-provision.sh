@@ -341,6 +341,9 @@ fi
 mount /var/lib/cv-mysql
 
 # --- Self-hosted MySQL 8.4, tuned for a small box ---
+# T-066: the data volume is 2 GiB, so binlogs expire after 7 days (MySQL's
+# default is 30) and can't fill it. Nothing reads them: there are no replicas
+# and recovery is the nightly mysqldump.
 # innodb-buffer-pool-size low + performance_schema off keep the memory
 # footprint modest. Data now lives on the dedicated EBS volume mounted
 # above (T-018), so it survives instance replacement -- ruling 5: this
@@ -378,7 +381,8 @@ docker run -d --name mysql --restart unless-stopped --network cv \
   -e MYSQL_PASSWORD="$DB_PASSWORD" \
   -v /var/lib/cv-mysql:/var/lib/mysql \
   mysql:8.4 \
-  --innodb-buffer-pool-size=128M --performance-schema=OFF
+  --innodb-buffer-pool-size=128M --performance-schema=OFF \
+  --binlog-expire-logs-seconds=604800
 
 # --- Flyway migrations (schema only; arguments in cv_run_flyway) ---
 cv_sync_database_repo

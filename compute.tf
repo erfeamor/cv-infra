@@ -66,7 +66,7 @@ resource "aws_instance" "domain_service" {
   }
   # T-018 ruling 1: pinned via data.aws_subnets.domain_service, which is
   # itself filtered on var.availability_zone -- the SAME variable that sets
-  # aws_ebs_volume.mysql_data.availability_zone in storage.tf, so the
+  # aws_ebs_volume.mysql_data_v2.availability_zone in storage.tf, so the
   # instance and its EBS volume can never land in different AZs. sort()
   # keeps the pick deterministic even if the default VPC ever has more than
   # one subnet in that AZ (list position off an unordered API result is

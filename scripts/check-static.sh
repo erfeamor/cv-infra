@@ -1042,6 +1042,16 @@ fi
 if [ "$(printf '%s\n' "$prov_src" | grep -cF 'export AWS_USE_DUALSTACK_ENDPOINT=true')" -lt 3 ]; then
   t68_problems="$t68_problems; AWS_USE_DUALSTACK_ENDPOINT=true must be exported in the script, cv-app.sh and the backup script"
 fi
+# Containers need IPv6 egress too (found live after the first apply): Docker
+# IPv6 + NAT66, accept_ra=2 so IPv6 forwarding does not drop the host's only
+# default route, the cv network created with an IPv6 subnet, and the JVM
+# preferring IPv6 (it tries IPv4 first, a blackhole here).
+for needle in \
+  '"ipv6": true' '"ip6tables": true' 'net.ipv6.conf.all.accept_ra = 2' \
+  'docker network create --ipv6 --subnet' \
+  '-e JAVA_TOOL_OPTIONS=-Djava.net.preferIPv6Addresses=true'; do
+  printf '%s\n' "$prov_src" | grep -qF -- "$needle" || t68_problems="$t68_problems; the host script lost container IPv6 egress: $needle"
+done
 # The public-vanilla OIDC policy (T-045), moved here from the apply-only run.
 for needle in \
   'Action   = ["s3:ListBucket"]' \

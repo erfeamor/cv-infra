@@ -35,6 +35,26 @@ mkdir -p /etc/amazon/ssm
 printf '%s\n' '{"Agent":{"UseDualStackEndpoint":true}}' > /etc/amazon/ssm/amazon-ssm-agent.json
 systemctl restart amazon-ssm-agent
 
+# T-068 (found live after the first apply): the CONTAINERS need IPv6 egress too.
+# Docker's default network is IPv4 only, and this host has no IPv4 route out,
+# so a container that resolves a name to an A and an AAAA record (Cognito,
+# cognito-idp) tried IPv4 first and hung. Enable Docker IPv6 with NAT66 behind
+# the host's own IPv6 address. Two traps, both hit live:
+#  - Docker turns IPv6 forwarding on, and with forwarding on the kernel stops
+#    accepting router advertisements, which is how this host learns its only
+#    default route; accept_ra=2 keeps accepting them.
+#  - ip6tables support is experimental in the docker 25 that AL2023 ships.
+cat > /etc/sysctl.d/90-cv-ipv6.conf <<'SYSCTL'
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
+SYSCTL
+sysctl --system > /dev/null
+for f in /proc/sys/net/ipv6/conf/*/accept_ra; do echo 2 > "$f"; done
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<'DOCKERD'
+{"ipv6": true, "fixed-cidr-v6": "fd00:db8:a::/64", "ip6tables": true, "experimental": true}
+DOCKERD
+
 dnf install -y docker xfsprogs
 systemctl enable --now docker
 
@@ -215,6 +235,7 @@ cv_run_domain_service() {
     -e SPRING_DATASOURCE_PASSWORD="$CV_DS_DB_PASSWORD" \
     -e COGNITO_ISSUER_URI="$CV_DS_COGNITO_ISSUER_URI" \
     -e AUTH_ENABLED=true \
+    -e JAVA_TOOL_OPTIONS=-Djava.net.preferIPv6Addresses=true \
     -e CORS_ALLOWED_ORIGINS="$CV_DS_CORS_ORIGINS,http://localhost:5173,http://localhost:4173" \
     "$CV_DOMAIN_IMAGE"
 }
@@ -308,7 +329,7 @@ source /usr/local/lib/cv-app.sh
 # copy at call time (cv_run_*).
 cv_need DB_PASSWORD db/password
 
-docker network create cv || true
+docker network create --ipv6 --subnet fd00:db8:b::/64 cv || true
 
 # --- Mount the dedicated MySQL EBS volume (T-018) ---
 # This runs before the MySQL container starts (ruling 4) so /var/lib/cv-mysql

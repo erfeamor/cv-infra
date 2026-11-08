@@ -67,15 +67,20 @@ resource "aws_cloudfront_function" "spa_router" {
 
 # T-068: CloudFront reaches the app host privately, through VPC origins (the
 # host has no public IPv4). One per port: the port belongs to the origin. Each
-# takes ~10 minutes to deploy and to delete. The instance ARN is the target, so
-# a host replacement re-creates them.
+# takes ~10 minutes to deploy and to delete. The instance ARN is the target.
+# AWS refuses to update or delete a VPC origin while a distribution uses it
+# (409 CannotUpdateEntityWhileInUse), and the provider plans a new target as an
+# in-place update, so a host replacement would fail half-applied. Instead each
+# origin is REPLACED when the instance is (replace_triggered_by), create-before-
+# destroy: the new origin (a new name, so the two can coexist) is made, the
+# distribution is repointed at it, and only then is the old one deleted.
 locals {
   app_host_origin_domain = "${aws_instance.domain_service.id}.${var.aws_region}.compute.amazonaws.com"
 }
 
 resource "aws_cloudfront_vpc_origin" "domain_service_api" {
   vpc_origin_endpoint_config {
-    name                   = "${var.project_name}-domain-service-api"
+    name                   = "${var.project_name}-domain-service-api-${substr(aws_instance.domain_service.id, 2, 8)}"
     arn                    = aws_instance.domain_service.arn
     http_port              = 8080
     https_port             = 443
@@ -90,11 +95,16 @@ resource "aws_cloudfront_vpc_origin" "domain_service_api" {
   tags = {
     Project = var.project_name
   }
+
+  lifecycle {
+    create_before_destroy = true
+    replace_triggered_by  = [aws_instance.domain_service.id]
+  }
 }
 
 resource "aws_cloudfront_vpc_origin" "bff_node" {
   vpc_origin_endpoint_config {
-    name                   = "${var.project_name}-bff-node"
+    name                   = "${var.project_name}-bff-node-${substr(aws_instance.domain_service.id, 2, 8)}"
     arn                    = aws_instance.domain_service.arn
     http_port              = 3000
     https_port             = 443
@@ -108,6 +118,11 @@ resource "aws_cloudfront_vpc_origin" "bff_node" {
 
   tags = {
     Project = var.project_name
+  }
+
+  lifecycle {
+    create_before_destroy = true
+    replace_triggered_by  = [aws_instance.domain_service.id]
   }
 }
 

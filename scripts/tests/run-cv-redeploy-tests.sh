@@ -57,6 +57,8 @@ echo "select 1;" >"$workdir/src/sql/migrations/V1__x.sql"
 tar -czf "$workdir/sql-ok.tgz" -C "$workdir/src" sql
 tar -czf "$workdir/sql-hollow.tgz" -C "$workdir/hollow" sql
 echo "not a tarball" >"$workdir/sql-bad.tgz"
+mkdir -p "$workdir/link/real/migrations" && ln -s real "$workdir/link/sql" && tar -czf "$workdir/sql-link.tgz" -C "$workdir/link" sql
+mkdir -p "$workdir/inner/sql/migrations" && ln -s /etc/passwd "$workdir/inner/sql/migrations/evil.sql" && tar -czf "$workdir/sql-innerlink.tgz" -C "$workdir/inner" sql
 
 calls="$workdir/calls.log"
 out="$workdir/out.log"
@@ -131,6 +133,17 @@ STUB_S3_FILE="$workdir/sql-bad.tgz" run_redeploy migrate
 [ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "corrupt archive: fails, no flyway" || bad "corrupt archive accepted"
 STUB_S3_FILE="$workdir/sql-hollow.tgz" run_redeploy migrate
 [ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "archive without sql/migrations: fails, no flyway" || bad "hollow archive accepted"
+
+STUB_S3_FILE="$workdir/sql-link.tgz" run_redeploy migrate
+[ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "a symlinked sql/ is refused" || bad "symlinked sql/ accepted"
+STUB_S3_FILE="$workdir/sql-innerlink.tgz" run_redeploy migrate
+[ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "a symlink member is refused" || bad "symlink member accepted"
+
+echo "case 3e: a second sync replaces the previous tree and leaves no scraps (T-070)"
+echo "stale" >"$workdir/sqlroot/sql/migrations/V0__stale.sql"
+run_redeploy migrate
+[ "$rc" -eq 0 ] && [ ! -e "$workdir/sqlroot/sql/migrations/V0__stale.sql" ] && [ -f "$workdir/sqlroot/sql/migrations/V1__x.sql" ] && ok "old tree replaced by the new one" || bad "stale file survived or sync failed"
+[ ! -e "$workdir/sqlroot/sql.old" ] && [ ! -e "$workdir/sqlroot/sql.new" ] && ok "no sql.old/sql.new left behind" || bad "scraps left in the SQL root"
 
 echo "case 4: bad or missing arguments exit 2 with usage"
 for args in "bogus" "" "migrate extra" "mysql"; do

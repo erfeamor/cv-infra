@@ -87,21 +87,33 @@ cv_sync_database_repo() {
   local tmp
   tmp=$(mktemp -d "$${TMPDIR:-/var/tmp}/cv-sql.XXXXXX") || return 1
   if aws s3 cp --region "${aws_region}" "s3://${backup_bucket}/$CV_SQL_KEY" "$tmp/sql.tgz" 2>"$tmp/err"; then
-    mkdir "$tmp/x" && tar -xzf "$tmp/sql.tgz" -C "$tmp/x" || {
+    # Root extracts this: ignore the archive's owners and modes, and refuse any
+    # link member (a symlinked sql/ would pass the -d test and mount its target).
+    mkdir "$tmp/x" && tar --no-same-owner --no-same-permissions -xzf "$tmp/sql.tgz" -C "$tmp/x" || {
       echo "FATAL: cannot unpack $CV_SQL_KEY" >&2
       rm -rf "$tmp"
       return 1
     }
+    if [ -n "$(find "$tmp/x" -type l -o -type b -o -type c -o -type p -o -type s)" ]; then
+      echo "FATAL: $CV_SQL_KEY contains links or special files" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
     if [ ! -d "$tmp/x/sql/migrations" ]; then
       echo "FATAL: $CV_SQL_KEY has no sql/migrations" >&2
       rm -rf "$tmp"
       return 1
     fi
-    rm -rf "$CV_SQL_ROOT"
-    mkdir -p "$CV_SQL_ROOT" && mv "$tmp/x/sql" "$CV_SQL_ROOT/sql" || {
+    # Swap by renames, so the live tree is only ever missing between two mv's
+    # and a failure leaves the previous tree (or none, which fails safe).
+    mkdir -p "$CV_SQL_ROOT" && mv "$tmp/x/sql" "$CV_SQL_ROOT/sql.new" || {
       rm -rf "$tmp"
       return 1
     }
+    rm -rf "$CV_SQL_ROOT/sql.old"
+    if [ -e "$CV_SQL_ROOT/sql" ]; then mv "$CV_SQL_ROOT/sql" "$CV_SQL_ROOT/sql.old" || { rm -rf "$tmp"; return 1; }; fi
+    mv "$CV_SQL_ROOT/sql.new" "$CV_SQL_ROOT/sql" || { rm -rf "$tmp"; return 1; }
+    rm -rf "$CV_SQL_ROOT/sql.old"
     CV_SQL_DIR="$CV_SQL_ROOT/sql"
     rm -rf "$tmp"
     echo "migration SQL: s3://${backup_bucket}/$CV_SQL_KEY"

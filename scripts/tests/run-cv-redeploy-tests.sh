@@ -116,11 +116,18 @@ grep -q '^docker run --rm --network cv .*flyway/flyway:13.7.0 migrate$' "$calls"
 ! grep -qE '^docker (rm|pull)|^docker .*--name ' "$calls" && ok "no container removed or recreated" || bad "migrate touched a container"
 no_secrets "case 3"
 
-echo "case 3b: object missing (404) -> git fallback, flyway on the clone path (T-070)"
+echo "case 3b: object missing (404) is fatal, no git fallback, nothing runs (T-068)"
 STUB_S3=missing run_redeploy migrate
-[ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc"
-grep -qE '^git (clone|-C /opt/cv-database pull --ff-only)' "$calls" && ok "fell back to git" || bad "no git fallback on 404"
-grep -q "^docker run --rm --network cv -v /opt/cv-database/sql:/flyway/sql:ro " "$calls" && ok "flyway on the clone" || bad "flyway not on the clone"
+[ "$rc" -ne 0 ] && ok "non-zero exit on 404" || bad "a missing object was swallowed"
+! grep -qE '^git |^docker ' "$calls" && ok "no git, no flyway after a 404" || bad "ran something after a 404"
+grep -q 'does not exist; run cv-database' "$out" && ok "says how to fix it" || bad "silent failure"
+
+echo "case 3b2: every aws call carries the dual-stack flag (T-068, no public IPv4)"
+for sub in migrate domain-service bff-node; do
+  run_redeploy "$sub"
+  [ "$rc" -eq 0 ] && ok "$sub: exit 0" || bad "$sub: exit $rc"
+  ! grep -q '^NODUALSTACK' "$calls" && ok "$sub: all aws calls dual-stack" || bad "$sub: an aws call lacked AWS_USE_DUALSTACK_ENDPOINT=true"
+done
 
 echo "case 3c: any other S3 failure is fatal and runs nothing (T-070)"
 STUB_S3=denied run_redeploy migrate

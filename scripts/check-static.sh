@@ -986,5 +986,76 @@ if [ -n "$t70_problems" ]; then
 else
   ok "the migration SQL is one S3 key: read by the app host, written by the cv-database role, no wildcards (T-070)"
 fi
+# --- 29. The app host is private (T-068) -----------------------------------
+# No EIP and no public IPv4; the only ingress is a standalone rule per port from
+# CloudFront's managed VPC-origin group; the shared groups have no inline
+# ingress; origins are VPC origins; the host script has no git fallback and
+# carries the dual-stack settings. Also the public-vanilla OIDC policy contents
+# that run "github_oidc_public_vanilla_deploy" used to assert (apply-only).
+t68_problems=""
+net_src=$(strip_hash network.tf)
+cmp_src=$(strip_hash compute.tf)
+fe_src=$(strip_hash frontend.tf)
+oidc_src=$(strip_hash github-oidc.tf)
+prov_src=$(strip_hash templates/domain-service-provision.sh)
+if grep -rqE '^[[:space:]]*resource[[:space:]]+"aws_eip(_association)?"[[:space:]]+"domain_service"' --include='*.tf' .; then
+  t68_problems="$t68_problems; aws_eip/aws_eip_association domain_service must stay gone"
+fi
+printf '%s\n' "$cmp_src" | grep -qE 'associate_public_ip_address[[:space:]]*=[[:space:]]*false' \
+  || t68_problems="$t68_problems; the app host must set associate_public_ip_address = false"
+for sg in domain_service bff_node; do
+  sg_block=$(printf '%s\n' "$net_src" | awk -v n="$sg" '$0 ~ "^resource \"aws_security_group\" \""n"\"" {f=1} f {print} f && /^}/ {exit}')
+  if printf '%s\n' "$sg_block" | grep -qE '^[[:space:]]*ingress[[:space:]]*\{'; then
+    t68_problems="$t68_problems; aws_security_group.$sg must have no inline ingress (a cycle, and it hides rules from Terraform)"
+  fi
+  if ! printf '%s\n' "$sg_block" | grep -qE 'ipv6_cidr_blocks[[:space:]]*=[[:space:]]*\["::/0"\]'; then
+    t68_problems="$t68_problems; aws_security_group.$sg needs IPv6 egress"
+  fi
+done
+for r in domain_service_api bff_node; do
+  r_block=$(printf '%s\n' "$net_src" | awk -v n="$r" '$0 ~ "^resource \"aws_vpc_security_group_ingress_rule\" \""n"\"" {f=1} f {print} f && /^}/ {exit}')
+  printf '%s\n' "$r_block" | grep -qE 'referenced_security_group_id[[:space:]]*=[[:space:]]*data\.aws_security_group\.cloudfront_vpc_origins\.id' \
+    || t68_problems="$t68_problems; ingress rule $r must take the CloudFront VPC-origin group as its only source"
+  if printf '%s\n' "$r_block" | grep -qE 'cidr_ipv[46]|prefix_list_id'; then
+    t68_problems="$t68_problems; ingress rule $r must not carry a CIDR or prefix list"
+  fi
+done
+if printf '%s\n' "$net_src" | grep -qE 'aws_ec2_managed_prefix_list'; then
+  t68_problems="$t68_problems; the CloudFront prefix list must no longer be used"
+fi
+printf '%s\n' "$net_src" | grep -qE 'name[[:space:]]*=[[:space:]]*"CloudFront-VPCOrigins-Service-SG"' \
+  || t68_problems="$t68_problems; the managed group must be looked up by its exact name"
+if printf '%s\n' "$fe_src" | grep -qE 'custom_origin_config|aws_eip'; then
+  t68_problems="$t68_problems; frontend.tf origins must be VPC origins (no custom_origin_config)"
+fi
+if [ "$(printf '%s\n' "$fe_src" | grep -cE '^[[:space:]]*vpc_origin_config[[:space:]]*\{')" -ne 2 ]; then
+  t68_problems="$t68_problems; exactly two vpc_origin_config blocks expected (domain service, BFF)"
+fi
+if printf '%s\n' "$prov_src" | grep -qE 'git (clone|-C)|github\.com'; then
+  t68_problems="$t68_problems; the host script must not reach github.com (no IPv6)"
+fi
+printf '%s\n' "$prov_src" | grep -qF '{"Agent":{"UseDualStackEndpoint":true}}' \
+  || t68_problems="$t68_problems; the SSM agent dual-stack config is missing"
+if [ "$(printf '%s\n' "$prov_src" | grep -cF 'awslogs-endpoint="https://logs.')" -ne 2 ]; then
+  t68_problems="$t68_problems; both containers need the dual-stack awslogs-endpoint"
+fi
+if [ "$(printf '%s\n' "$prov_src" | grep -cF 'export AWS_USE_DUALSTACK_ENDPOINT=true')" -lt 3 ]; then
+  t68_problems="$t68_problems; AWS_USE_DUALSTACK_ENDPOINT=true must be exported in the script, cv-app.sh and the backup script"
+fi
+# The public-vanilla OIDC policy (T-045), moved here from the apply-only run.
+for needle in \
+  'Action   = ["s3:ListBucket"]' \
+  'Action   = ["s3:PutObject", "s3:DeleteObject"]' \
+  'Action   = ["cloudfront:CreateInvalidation"]' \
+  'Resource = aws_cloudfront_distribution.frontend.arn' \
+  'Resource = "${aws_s3_bucket.frontend.arn}/admin/*"' \
+  'Resource = "${aws_s3_bucket.frontend.arn}/*"'; do
+  printf '%s\n' "$oidc_src" | grep -qF "$needle" || t68_problems="$t68_problems; github-oidc.tf lost: $needle"
+done
+if [ -n "$t68_problems" ]; then
+  bad "private app host (T-068):${t68_problems#;}"
+else
+  ok "the app host is private: no EIP, no public IPv4, ingress only from CloudFront's VPC-origin group, VPC origins, dual-stack config, no git (T-068)"
+fi
 
 exit $fail

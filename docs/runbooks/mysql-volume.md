@@ -14,7 +14,7 @@ After the PR is merged and `master` pulled, `terraform plan` must show:
 
 - `aws_ebs_volume.mysql_data will no longer be managed by Terraform, but will not be destroyed` (and **no** `destroy` line for it);
 - `aws_ebs_volume.mysql_data_v2 will be created` (size 2);
-- the instance, its EIP association and the volume attachment replaced; the S3 provision object and its SHA-256 parameter updated.
+- the instance and the volume attachment replaced; the S3 provision object and its SHA-256 parameter updated.
 
 If the plan says the old volume will be **destroyed**, stop: the `removed` block is missing.
 

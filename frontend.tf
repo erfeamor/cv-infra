@@ -65,6 +65,52 @@ resource "aws_cloudfront_function" "spa_router" {
   code    = templatefile("${path.module}/functions/spa-router.js", { apex = local.public_apex })
 }
 
+# T-068: CloudFront reaches the app host privately, through VPC origins (the
+# host has no public IPv4). One per port: the port belongs to the origin. Each
+# takes ~10 minutes to deploy and to delete. The instance ARN is the target, so
+# a host replacement re-creates them.
+locals {
+  app_host_origin_domain = "${aws_instance.domain_service.id}.${var.aws_region}.compute.amazonaws.com"
+}
+
+resource "aws_cloudfront_vpc_origin" "domain_service_api" {
+  vpc_origin_endpoint_config {
+    name                   = "${var.project_name}-domain-service-api"
+    arn                    = aws_instance.domain_service.arn
+    http_port              = 8080
+    https_port             = 443
+    origin_protocol_policy = "http-only"
+
+    origin_ssl_protocols {
+      items    = ["TLSv1.2"]
+      quantity = 1
+    }
+  }
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+resource "aws_cloudfront_vpc_origin" "bff_node" {
+  vpc_origin_endpoint_config {
+    name                   = "${var.project_name}-bff-node"
+    arn                    = aws_instance.domain_service.arn
+    http_port              = 3000
+    https_port             = 443
+    origin_protocol_policy = "http-only"
+
+    origin_ssl_protocols {
+      items    = ["TLSv1.2"]
+      quantity = 1
+    }
+  }
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
   is_ipv6_enabled     = true
@@ -85,30 +131,26 @@ resource "aws_cloudfront_distribution" "frontend" {
   # distribution keeps the browser on HTTPS (and same-origin, so no CORS);
   # CloudFront talks HTTP to the instance edge-to-origin.
   origin {
-    domain_name = aws_eip.domain_service.public_dns
+    # T-068: a VPC origin (no public address). domain_name is the instance's
+    # resource-based hostname; CloudFront only uses it for the Host header
+    # and reaches the instance through the VPC origin's own endpoint.
+    domain_name = local.app_host_origin_domain
     origin_id   = "domain-service-api"
 
-    custom_origin_config {
-      http_port              = 8080
-      https_port             = 443
-      origin_protocol_policy = "http-only"
-      origin_ssl_protocols   = ["TLSv1.2"]
+    vpc_origin_config {
+      vpc_origin_id = aws_cloudfront_vpc_origin.domain_service_api.id
     }
   }
 
-  # The BFF (T-014): same instance, different port -- see compute.tf's new
-  # bff-node container and network.tf's dedicated security group (its own
-  # ingress rule, kept off aws_security_group.domain_service by the
-  # prefix-list quota). Same EIP, no new EIP/NAT (watch-outs).
+  # The BFF (T-014): same instance, different port -- see compute.tf's
+  # bff-node container and network.tf's dedicated security group.
   origin {
-    domain_name = aws_eip.domain_service.public_dns
+    # T-068: the second VPC origin, for port 3000 (the port belongs to the origin).
+    domain_name = local.app_host_origin_domain
     origin_id   = "bff-node"
 
-    custom_origin_config {
-      http_port              = 3000
-      https_port             = 443
-      origin_protocol_policy = "http-only"
-      origin_ssl_protocols   = ["TLSv1.2"]
+    vpc_origin_config {
+      vpc_origin_id = aws_cloudfront_vpc_origin.bff_node.id
     }
   }
 

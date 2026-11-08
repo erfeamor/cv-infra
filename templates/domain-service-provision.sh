@@ -24,7 +24,18 @@ mkswap /swapfile
 swapon /swapfile
 echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
-dnf install -y docker git xfsprogs
+# T-068: this host has NO public IPv4 and reaches AWS over IPv6 only (T-067
+# verified what works). The default AWS endpoints are IPv4-only, so every
+# aws CLI call needs the dual-stack flag (also exported by cv-app.sh and the
+# backup script, which run without this shell), and the SSM agent must be told
+# to use its dual-stack endpoints or the instance never registers. The agent is
+# restarted so it re-reads the file if it started first.
+export AWS_USE_DUALSTACK_ENDPOINT=true
+mkdir -p /etc/amazon/ssm
+printf '%s\n' '{"Agent":{"UseDualStackEndpoint":true}}' > /etc/amazon/ssm/amazon-ssm-agent.json
+systemctl restart amazon-ssm-agent
+
+dnf install -y docker xfsprogs
 systemctl enable --now docker
 
 # --- Shared container definitions (T-044) ---
@@ -41,6 +52,11 @@ cat > /usr/local/lib/cv-app.sh <<'CV_APP_LIB'
 # resolved (T-055). cv-redeploy passes `docker rm -f` of exactly one container.
 CV_DOMAIN_IMAGE="${image}"
 CV_BFF_IMAGE="${bff_image}"
+
+# T-068: no public IPv4, so AWS calls (SSM Parameter Store, S3, ECR) use the
+# dual-stack endpoints, and the awslogs driver is pointed at CloudWatch Logs'
+# dual-stack endpoint in each cv_run_* (its default endpoint is IPv4-only).
+export AWS_USE_DUALSTACK_ENDPOINT=true
 
 param() {
   aws ssm get-parameter --with-decryption --region "${aws_region}" \
@@ -76,11 +92,10 @@ cv_instance_id() {
 
 # T-070: the migration SQL comes from S3, where cv-database's migrate workflow
 # publishes the sql/ tree (T-071), because a host with no public IPv4 cannot
-# reach github.com (no IPv6). Sets CV_SQL_DIR for cv_run_flyway. The git clone
-# stays as a fallback for ONE case: the object does not exist yet (404). Any
-# other failure (denied, throttled, corrupt archive) is fatal, so a broken S3
-# path never silently applies whatever git happens to have. T-068 removes the
-# fallback together with the public IP.
+# reach github.com (no IPv6). Sets CV_SQL_DIR for cv_run_flyway. Every failure
+# is fatal (missing object, denied, throttled, corrupt archive): there is no
+# fallback to git since T-068, so a broken S3 path never silently applies
+# anything else.
 CV_SQL_KEY="migrations/cv-database-sql.tgz"
 CV_SQL_ROOT="$${CV_SQL_ROOT:-/opt/cv-database-sql}" # overridable for the test harness
 cv_sync_database_repo() {
@@ -120,15 +135,9 @@ cv_sync_database_repo() {
     return 0
   fi
   if grep -qE '\(404\)|NoSuchKey|Not Found' "$tmp/err"; then
-    echo "migration SQL: $CV_SQL_KEY not published yet, falling back to the git clone" >&2
+    echo "FATAL: s3://${backup_bucket}/$CV_SQL_KEY does not exist; run cv-database's migrate workflow (T-071) to publish it" >&2
     rm -rf "$tmp"
-    if [ -d /opt/cv-database/.git ]; then
-      git -C /opt/cv-database pull --ff-only || return 1
-    else
-      git clone --depth 1 https://github.com/erfeamor/cv-database.git /opt/cv-database || return 1
-    fi
-    CV_SQL_DIR=/opt/cv-database/sql
-    return 0
+    return 1
   fi
   echo "FATAL: cannot read s3://${backup_bucket}/$CV_SQL_KEY: $(head -c 300 "$tmp/err")" >&2
   rm -rf "$tmp"
@@ -194,6 +203,7 @@ cv_run_domain_service() {
   docker run -d --name domain-service --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
+    --log-opt awslogs-endpoint="https://logs.${aws_region}.api.aws" \
     --log-opt awslogs-group="${log_group_domain_service}" \
     --log-opt awslogs-stream="domain-service-$CV_DS_INSTANCE_ID" \
     --log-opt awslogs-datetime-format='%Y-%m-%dT%H:%M:%S' \
@@ -227,6 +237,7 @@ cv_run_bff_node() {
   docker run -d --name bff-node --restart unless-stopped --network cv \
     --log-driver awslogs \
     --log-opt awslogs-region="${aws_region}" \
+    --log-opt awslogs-endpoint="https://logs.${aws_region}.api.aws" \
     --log-opt awslogs-group="${log_group_bff_node}" \
     --log-opt awslogs-stream="bff-node-$CV_BFF_INSTANCE_ID" \
     --log-opt mode=non-blocking \
@@ -461,6 +472,9 @@ cv_run_domain_service
 cat > /usr/local/bin/mysql-backup.sh <<'BACKUP_SCRIPT'
 #!/bin/bash
 set -euo pipefail
+
+# T-068: no public IPv4; AWS calls go over the dual-stack endpoints.
+export AWS_USE_DUALSTACK_ENDPOINT=true
 
 # The dump is the entire database, so it must never be readable outside root
 # while it sits on local disk. Root's default umask here is 022, which would

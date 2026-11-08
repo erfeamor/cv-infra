@@ -12,7 +12,16 @@ mock_provider "aws" {
 mock_provider "aws" {
   mock_data "aws_vpc" {
     defaults = {
-      id = "vpc-00000000000000000"
+      id         = "vpc-00000000000000000"
+      cidr_block = "172.31.0.0/16" # the default VPC's real range (T-068 carves a /24 out of it)
+    }
+  }
+
+  # T-068: CloudFront's managed VPC-origin security group (exists once a VPC
+  # origin does); read at apply time, mocked here.
+  mock_data "aws_security_group" {
+    defaults = {
+      id = "sg-0000000000000cf01"
     }
   }
 
@@ -48,6 +57,21 @@ mock_provider "aws" {
       zone_id = "Z0608270B7WND031GVOW"
       arn     = "arn:aws:route53:::hostedzone/Z0608270B7WND031GVOW"
       name    = "erfeamor.com" # the real data source has no trailing dot (found by the T-061 plan)
+    }
+  }
+
+  # T-068: aws_cloudfront_vpc_origin validates its target as an ARN, and the
+  # mock's random string is not one.
+  mock_resource "aws_instance" {
+    defaults = {
+      arn = "arn:aws:ec2:eu-west-3:123456789012:instance/i-0123456789abcdef0"
+    }
+  }
+
+  # T-068: the IPv6 block AWS assigns to the default VPC (a /56).
+  mock_resource "aws_vpc_ipv6_cidr_block_association" {
+    defaults = {
+      ipv6_cidr_block = "2600:1f23:1234:5600::/56"
     }
   }
 
@@ -106,29 +130,6 @@ variables {
 
 run "plan_succeeds" {
   command = plan
-
-  # Review round 1, finding 4: mock_data "aws_subnets" applies one
-  # `defaults` block to EVERY aws_subnets data source, so without this
-  # override, data.aws_subnets.default.ids and
-  # data.aws_subnets.domain_service.ids are the identical, already-sorted
-  # list under test -- the subnet regression guard below would pass just as
-  # well if compute.tf were reverted to data.aws_subnets.default.ids[0]
-  # (the reviewer proved this empirically). Give the pinned data source its
-  # own, distinct value so that assertion actually distinguishes "wired
-  # from the pinned source" from "wired from the old unordered one".
-  override_data {
-    target = data.aws_subnets.domain_service
-    values = {
-      ids = ["subnet-00000000000000009"]
-    }
-  }
-
-  # T-067: the app host's subnet must stay the AZ's default subnet even after
-  # a private subnet exists in the same AZ.
-  assert {
-    condition     = length([for f in data.aws_subnets.domain_service.filter : f if f.name == "default-for-az" && contains(f.values, "true")]) == 1
-    error_message = "data.aws_subnets.domain_service must filter on default-for-az = true so a private subnet in the same AZ can never capture the app host (T-067)"
-  }
 
   # MySQL is self-hosted on the domain-service EC2 (see compute.tf /
   # templates/domain-service-provision.sh) — there is no RDS instance to
@@ -535,15 +536,6 @@ run "plan_succeeds" {
   assert {
     condition     = aws_ebs_volume.mysql_data_v2.availability_zone == var.availability_zone
     error_message = "aws_ebs_volume.mysql_data_v2.availability_zone must come from var.availability_zone -- the same pinned source that selects aws_instance.domain_service's subnet, never a separately-computed AZ"
-  }
-
-  # Proves the instance's subnet is actually wired from the new pinned data
-  # source (network.tf), not still off data.aws_subnets.default's unordered
-  # list -- a regression here would silently reintroduce the AZ-drift risk
-  # ruling 1 exists to close.
-  assert {
-    condition     = aws_instance.domain_service.subnet_id == sort(data.aws_subnets.domain_service.ids)[0]
-    error_message = "aws_instance.domain_service.subnet_id must come from data.aws_subnets.domain_service (filtered on var.availability_zone), not data.aws_subnets.default"
   }
 
   # Regression guard, mirrored from the equivalent Drone assertion but with
@@ -1862,57 +1854,104 @@ run "drone_deploy_credentials" {
   # set, effects and frontend-only resources.
 }
 
-# T-022: the domain service used to answer the whole internet on 8080, which
-# made CloudFront optional as an entry point and served /v3/api-docs
-# unauthenticated. These assertions pin the fix so a later edit cannot quietly
-# widen it back -- the failure they guard against reads as a working plan.
+# T-022 scoped 8080 to CloudFront's prefix list; T-068 removes the public
+# address altogether and admits only CloudFront's VPC origins. These assertions
+# pin that so a later edit cannot quietly widen it -- the failure they guard
+# against reads as a working plan.
 run "domain_service_ingress_scoped_to_cloudfront" {
   command = plan
 
-  # The rule must reference the managed prefix list, and it must be THE
-  # CloudFront one -- asserting "some prefix list" would pass against any list.
+  # The only way in is a standalone rule whose source is the managed
+  # VPC-origin security group. That group is read at apply time (it exists
+  # only once the origins do), so its id can't be compared here; check-static
+  # pins the wiring.
+  assert {
+    condition = (
+      aws_vpc_security_group_ingress_rule.domain_service_api.from_port == 8080 &&
+      aws_vpc_security_group_ingress_rule.domain_service_api.to_port == 8080 &&
+      aws_vpc_security_group_ingress_rule.domain_service_api.ip_protocol == "tcp"
+    )
+    error_message = "The 8080 ingress must be tcp/8080 (its source, CloudFront's VPC-origin group, is unknown at plan time; scripts/check-static.sh pins it)"
+  }
+
+  assert {
+    condition     = data.aws_security_group.cloudfront_vpc_origins.name == "CloudFront-VPCOrigins-Service-SG"
+    error_message = "The source must be CloudFront's managed VPC-origin security group"
+  }
+
+  # No CIDR or prefix list on either rule, so a public path can't reappear.
   assert {
     condition = alltrue([
-      for rule in aws_security_group.domain_service.ingress :
-      contains(coalesce(rule.prefix_list_ids, []), data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id)
-      if rule.from_port == 8080
+      for r in [
+        aws_vpc_security_group_ingress_rule.domain_service_api,
+        aws_vpc_security_group_ingress_rule.bff_node,
+      ] : r.cidr_ipv4 == null && r.cidr_ipv6 == null && r.prefix_list_id == null
     ])
-    error_message = "The 8080 ingress must be scoped to the CloudFront origin-facing prefix list, not to a CIDR"
+    error_message = "The ingress rules may reference only the CloudFront VPC-origin security group (no CIDR, no prefix list)"
   }
 
-  assert {
-    condition     = data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.name == "com.amazonaws.global.cloudfront.origin-facing"
-    error_message = "The prefix list must be CloudFront's origin-facing list -- any other list would scope 8080 to the wrong senders"
-  }
-
-  # The point of the task: no open CIDR survives anywhere on this group's
-  # ingress. Checked across every rule, not just the 8080 one, so re-adding an
-  # open rule on another port also fails here.
+  # IPv6 egress is how the host reaches AWS now.
   assert {
     condition = alltrue([
-      for rule in aws_security_group.domain_service.ingress :
-      !contains(coalesce(rule.cidr_blocks, []), "0.0.0.0/0")
+      for g in [aws_security_group.domain_service, aws_security_group.bff_node] :
+      anytrue([for e in g.egress : contains(coalesce(e.ipv6_cidr_blocks, []), "::/0")])
     ])
-    error_message = "No ingress rule on the domain-service security group may be open to 0.0.0.0/0 -- T-022 closed the direct-to-origin path and this is what keeps it closed"
+    error_message = "The app host security groups must allow IPv6 egress (the host has no IPv4 route out)"
+  }
+}
+
+# T-068: the host is private. No EIP anywhere, no public IPv4, IPv6 only out.
+run "t068_app_host_has_no_public_ipv4" {
+  command = plan
+
+  assert {
+    condition     = aws_instance.domain_service.associate_public_ip_address == false
+    error_message = "The app host must not get a public IPv4 address"
   }
 
-  # DoR §3 / network.tf: description is ForceNew on a group with no
-  # create_before_destroy, so changing it destroys a group still attached to
-  # the live instance. Pinning the exact string makes that an explicit
-  # decision rather than an accident during unrelated tidying.
   assert {
-    condition     = aws_security_group.domain_service.description == "Allows inbound HTTP(S) and SSH to the domain service EC2 instance"
-    error_message = "Do not edit aws_security_group.domain_service.description -- it is ForceNew and would replace a group attached to the running instance (see the comment in network.tf)"
+    condition     = aws_instance.domain_service.ipv6_address_count == 1
+    error_message = "The app host needs an IPv6 address"
   }
 
-  # Port 22 has never been open here and must not arrive by accident: shell
-  # access is SSM Session Manager (CLAUDE.md, "No SSH anywhere").
   assert {
-    condition = alltrue([
-      for rule in aws_security_group.domain_service.ingress :
-      rule.from_port != 22 && rule.to_port != 22
-    ])
-    error_message = "No port-22 ingress: shell access is SSM Session Manager"
+    condition     = aws_instance.domain_service.metadata_options[0].http_protocol_ipv6 == "enabled"
+    error_message = "IMDS must be reachable over IPv6"
+  }
+
+  assert {
+    condition     = aws_subnet.app_private.map_public_ip_on_launch == false && aws_subnet.app_private.assign_ipv6_address_on_creation == true
+    error_message = "The app subnet must hand out no public IPv4 and an IPv6 address"
+  }
+
+  assert {
+    condition     = aws_subnet.app_private.availability_zone == var.availability_zone && aws_ebs_volume.mysql_data_v2.availability_zone == aws_subnet.app_private.availability_zone
+    error_message = "The subnet and the data volume must be in the same AZ"
+  }
+
+  # Private: ::/0 goes out through the egress-only gateway, and there is no
+  # IPv4 default route at all.
+  assert {
+    condition     = length(aws_route_table.app_private.route) == 1 && one(aws_route_table.app_private.route).ipv6_cidr_block == "::/0"
+    error_message = "The app subnet's route table must have the single ::/0 route (egress-only), nothing else"
+  }
+
+  # Two VPC origins, one per port, both targeting the instance.
+  assert {
+    condition = (
+      aws_cloudfront_vpc_origin.domain_service_api.vpc_origin_endpoint_config[0].http_port == 8080 &&
+      aws_cloudfront_vpc_origin.bff_node.vpc_origin_endpoint_config[0].http_port == 3000 &&
+      aws_cloudfront_vpc_origin.domain_service_api.vpc_origin_endpoint_config[0].origin_protocol_policy == "http-only" &&
+      aws_cloudfront_vpc_origin.bff_node.vpc_origin_endpoint_config[0].origin_protocol_policy == "http-only"
+    )
+    error_message = "The VPC origins must be http-only on 8080 (domain service) and 3000 (BFF)"
+  }
+
+  # The host pulls images through the dual-stack ECR hostname (the classic one
+  # is IPv4-only).
+  assert {
+    condition     = local.app_host_ecr_registry == "123456789012.dkr-ecr.${var.aws_region}.on.aws"
+    error_message = "The host must use the dual-stack ECR registry hostname"
   }
 }
 
@@ -1939,46 +1978,16 @@ run "bff_node_registry_and_edge" {
 
   # Lifecycle rules: see run "t050_ecr_lifecycle_rules".
 
-  # Ruling 1, the crux: port 3000 gets its OWN security group -- never a
-  # second rule on aws_security_group.domain_service (prefix-list quota, see
-  # network.tf). Scoped to the CloudFront origin-facing prefix list, not a
-  # CIDR, and definitely not 0.0.0.0/0.
+  # Ruling 1, the crux: port 3000 gets its OWN security group (kept since
+  # T-068, when the quota reason went away but the separation did not).
+  # Its only way in is the standalone rule from CloudFront's VPC-origin group.
   assert {
-    condition = alltrue([
-      for rule in aws_security_group.bff_node.ingress :
-      contains(coalesce(rule.prefix_list_ids, []), data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id)
-      if rule.from_port == 3000
-    ])
-    error_message = "The BFF's 3000 ingress must be scoped to the CloudFront origin-facing prefix list, not a CIDR"
-  }
-
-  assert {
-    condition = alltrue([
-      for rule in aws_security_group.bff_node.ingress :
-      !contains(coalesce(rule.cidr_blocks, []), "0.0.0.0/0")
-    ])
-    error_message = "No ingress rule on the BFF security group may be open to 0.0.0.0/0"
-  }
-
-  assert {
-    condition = alltrue([
-      for rule in aws_security_group.bff_node.ingress :
-      rule.from_port != 22 && rule.to_port != 22
-    ])
-    error_message = "No port-22 ingress on the BFF security group: shell access is SSM Session Manager"
-  }
-
-  assert {
-    condition     = length(aws_security_group.bff_node.ingress) == 1
-    error_message = "The BFF security group should expose exactly one ingress rule (port 3000) -- anything more is unreviewed scope creep"
-  }
-
-  # The quota reason ruling 1 exists for: the pre-existing group must NOT
-  # gain a second prefix-list rule (46 + 46 entries would exceed the
-  # 60-rule-per-SG quota and fail the apply).
-  assert {
-    condition     = length(aws_security_group.domain_service.ingress) == 1
-    error_message = "aws_security_group.domain_service must NOT gain a second ingress rule for port 3000 -- the BFF needs its own security group (prefix-list quota, T-014 ruling 1)"
+    condition = (
+      aws_vpc_security_group_ingress_rule.bff_node.from_port == 3000 &&
+      aws_vpc_security_group_ingress_rule.bff_node.to_port == 3000 &&
+      aws_vpc_security_group_ingress_rule.bff_node.ip_protocol == "tcp"
+    )
+    error_message = "The BFF's 3000 ingress must be tcp/3000 (source pinned by scripts/check-static.sh)"
   }
 
   # Not asserted here, deliberately: that aws_instance.domain_service's
@@ -2006,24 +2015,16 @@ run "bff_node_registry_and_edge" {
     error_message = "Exactly one CloudFront origin with origin_id = \"bff-node\" is expected"
   }
 
-  # domain_name is NOT compared to aws_eip.domain_service.public_dns here --
-  # that attribute is itself unknown-until-apply (same documented limitation
-  # as aws_eip.drone.public_ip elsewhere in this file), confirmed
-  # empirically. Code review covers that the origin block literally reuses
-  # aws_eip.domain_service.public_dns (frontend.tf), exactly like the
-  # pre-existing domain-service-api origin does -- no new EIP is created,
-  # which IS checkable (there is no second aws_eip resource anywhere in this
-  # module).
+  # T-068: the origin is a VPC origin (no public address), not a custom
+  # origin on the EIP's DNS name.
   assert {
     condition = alltrue([
       for o in aws_cloudfront_distribution.frontend.origin :
-      o.custom_origin_config[0].http_port == 3000 &&
-      o.custom_origin_config[0].origin_protocol_policy == "http-only"
-      if o.origin_id == "bff-node"
+      length(o.custom_origin_config) == 0 && length(o.vpc_origin_config) == 1
+      if o.origin_id == "bff-node" || o.origin_id == "domain-service-api"
     ])
-    error_message = "The bff-node CloudFront origin must be port 3000, http-only"
+    error_message = "The bff-node and domain-service-api origins must be VPC origins"
   }
-
 
   # The /bff/* behavior: routes to the new origin, no-cache (mirrors /api/*'s
   # TTLs-0 posture -- the aggregate is revalidated by ISR upstream), and
@@ -2789,15 +2790,15 @@ run "bff_service_token" {
 # provider/trust (T-045's live simulate-principal-policy criterion covers it).
 # ---------------------------------------------------------------------------
 run "github_oidc_public_vanilla_deploy" {
-  command = apply
-
-  plan_options {
-    target = [
-      aws_iam_role_policy.public_vanilla_deploy,
-      aws_iam_role.public_vanilla_deploy,
-      output.public_vanilla_deploy_role_arn,
-    ]
-  }
+  # T-068: this was a targeted apply run asserting the decoded role and policy
+  # documents. The distribution now reaches the app host through VPC origins,
+  # so applying it, even targeted, created the host and the MySQL volume in
+  # the test state, and the volume's prevent_destroy fails the teardown. As a
+  # plan run, the documents embed ARNs that are unknown until apply, so only
+  # the plan-known facts are asserted here; the trust, the exact actions and
+  # resources, the admin/* Deny and the absence of wildcards are pinned by
+  # scripts/check-static.sh check 2b instead.
+  command = plan
 
   override_resource {
     target = aws_cloudfront_function.spa_router
@@ -2824,93 +2825,9 @@ run "github_oidc_public_vanilla_deploy" {
     error_message = "the GitHub OIDC provider must be token.actions.githubusercontent.com with the single client id sts.amazonaws.com (T-045)"
   }
 
-  # Trust: one statement, federated principal = our provider, web-identity
-  # only, exact aud and exact master-only sub (StringEquals, no wildcard).
-  assert {
-    condition = (
-      length(jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement) == 1 &&
-      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Effect == "Allow" &&
-      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" &&
-      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Principal == {
-        Federated = aws_iam_openid_connect_provider.github_actions.arn
-      }
-    )
-    error_message = "the deploy role must trust only sts:AssumeRoleWithWebIdentity from the GitHub OIDC provider (T-045)"
-  }
-
-  assert {
-    condition = (
-      jsondecode(aws_iam_role.public_vanilla_deploy.assume_role_policy).Statement[0].Condition == {
-        StringEquals = {
-          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:erfeamor/cv-public-vanilla:ref:refs/heads/master"
-        }
-      }
-    )
-    error_message = "the trust condition must be exactly StringEquals aud=sts.amazonaws.com and sub=repo:erfeamor/cv-public-vanilla:ref:refs/heads/master, nothing else (T-045)"
-  }
-
   assert {
     condition     = aws_iam_role.public_vanilla_deploy.max_session_duration == 3600
     error_message = "the deploy role keeps the default 1 h session (T-045)"
-  }
-
-  # Permissions.
-  assert {
-    condition = (
-      length(jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement) == 4 &&
-      length([for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement : s if s.Effect == "Allow"]) == 3 &&
-      length([for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement : s if s.Effect == "Deny"]) == 1
-    )
-    error_message = "the deploy policy must be exactly three Allow statements and one Deny (T-045)"
-  }
-
-  assert {
-    condition = contains([
-      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
-      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
-    ], jsonencode({ Effect = "Allow", Action = ["s3:ListBucket"], Resource = [aws_s3_bucket.frontend.arn] }))
-    error_message = "must Allow s3:ListBucket on the frontend bucket ARN only (T-045)"
-  }
-
-  assert {
-    condition = contains([
-      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
-      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
-    ], jsonencode({ Effect = "Allow", Action = ["s3:DeleteObject", "s3:PutObject"], Resource = ["${aws_s3_bucket.frontend.arn}/*"] }))
-    error_message = "must Allow s3:PutObject and s3:DeleteObject on <frontend bucket>/* only (T-045)"
-  }
-
-  assert {
-    condition = contains([
-      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
-      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
-    ], jsonencode({ Effect = "Allow", Action = ["cloudfront:CreateInvalidation"], Resource = [aws_cloudfront_distribution.frontend.arn] }))
-    error_message = "must Allow cloudfront:CreateInvalidation on the frontend distribution ARN only (T-045)"
-  }
-
-  # The live admin shares the bucket; the site deploys to the root.
-  assert {
-    condition = contains([
-      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
-      jsonencode({ Effect = s.Effect, Action = sort(tolist(flatten([s.Action]))), Resource = sort(tolist(flatten([s.Resource]))) })
-    ], jsonencode({ Effect = "Deny", Action = ["s3:DeleteObject", "s3:PutObject"], Resource = ["${aws_s3_bucket.frontend.arn}/admin/*"] }))
-    error_message = "must explicitly Deny s3:PutObject and s3:DeleteObject on <frontend bucket>/admin/* (T-045)"
-  }
-
-  assert {
-    condition = alltrue([
-      for s in jsondecode(aws_iam_role_policy.public_vanilla_deploy.policy).Statement :
-      alltrue([for a in flatten([s.Action]) : a != "*" && !endswith(a, ":*")]) &&
-      alltrue([for r in flatten([s.Resource]) : r != "*"]) &&
-      !contains(keys(s), "NotAction") && !contains(keys(s), "NotResource")
-    ])
-    error_message = "the deploy policy must have no wildcard action, no bare \"*\" resource, and no NotAction/NotResource (T-045)"
-  }
-
-  assert {
-    condition     = output.public_vanilla_deploy_role_arn == aws_iam_role.public_vanilla_deploy.arn
-    error_message = "output public_vanilla_deploy_role_arn must expose the deploy role ARN (T-045)"
   }
 }
 

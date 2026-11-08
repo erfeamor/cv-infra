@@ -2,6 +2,8 @@
 # Stub `aws` for run-cv-redeploy-tests.sh. Logs argv (secrets are only ever
 # RETURNED to the caller, never logged) and serves fixed SSM values.
 echo "aws $*" >>"${STUB_CALLS_LOG:?}"
+# T-068: the host has no public IPv4, so every aws call must carry the dual-stack flag.
+[ "${AWS_USE_DUALSTACK_ENDPOINT:-}" = true ] || echo "NODUALSTACK aws $*" >>"$STUB_CALLS_LOG"
 case "$1 $2" in
   "ssm get-parameter")
     name=""

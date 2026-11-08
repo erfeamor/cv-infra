@@ -54,3 +54,8 @@ output "public_vanilla_deploy_role_arn" {
   description = "T-045: role the cv-public-vanilla GitHub workflow assumes via OIDC (master only). Not a secret; set it as a GitHub repo variable for T-403."
   value       = aws_iam_role.public_vanilla_deploy.arn
 }
+
+output "admin_deploy_role_arn" {
+  description = "T-063: role the cv-admin-react GitHub workflow assumes via OIDC (master only, admin/* only). Not a secret; goes in cv-admin-react's repo variable AWS_DEPLOY_ROLE_ARN."
+  value       = aws_iam_role.admin_deploy.arn
+}

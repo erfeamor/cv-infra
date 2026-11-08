@@ -7,6 +7,7 @@ locals {
   github_org = "erfeamor"
   # The claim GitHub puts in the token's `sub` for a workflow run on master.
   github_public_vanilla_sub = "repo:${local.github_org}/cv-public-vanilla:ref:refs/heads/master"
+  github_admin_react_sub    = "repo:${local.github_org}/cv-admin-react:ref:refs/heads/master"
 }
 
 # thumbprint_list is deliberately omitted: it is Optional+Computed in the pinned
@@ -73,6 +74,71 @@ resource "aws_iam_role_policy" "public_vanilla_deploy" {
       },
       {
         Effect   = "Deny"
+        Action   = ["s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.frontend.arn}/admin/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudfront:CreateInvalidation"]
+        Resource = aws_cloudfront_distribution.frontend.arn
+      }
+    ]
+  })
+}
+
+# T-063: the cv-admin-react deploy role, the mirror image of the above. The
+# admin app lives under admin/ in the same bucket, so this role may write
+# ONLY there (no Deny needed: nothing outside admin/* is ever allowed).
+# Replaces Drone's static key (T-008) once T-305 moves the workflow over.
+resource "aws_iam_role" "admin_deploy" {
+  name = "${var.project_name}-admin-deploy"
+
+  max_session_duration = 3600
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Federated = aws_iam_openid_connect_provider.github_actions.arn }
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+            "token.actions.githubusercontent.com:sub" = local.github_admin_react_sub
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+# `aws s3 sync dist/ s3://<bucket>/admin/ --delete` lists with prefix `admin/`,
+# so ListBucket is limited to that prefix (H1 decision). No GetObject: sync
+# uploads need only PutObject.
+resource "aws_iam_role_policy" "admin_deploy" {
+  name = "frontend-admin-deploy"
+  role = aws_iam_role.admin_deploy.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.frontend.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = ["admin/*", "admin/"]
+          }
+        }
+      },
+      {
+        Effect   = "Allow"
         Action   = ["s3:PutObject", "s3:DeleteObject"]
         Resource = "${aws_s3_bucket.frontend.arn}/admin/*"
       },

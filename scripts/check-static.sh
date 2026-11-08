@@ -1096,4 +1096,45 @@ else
   ok "both VPC origins are replaced create-before-destroy with the host, under a new name"
 fi
 
+# --- 32. The cv-admin-react OIDC deploy role writes admin/* only (T-063) -------
+# The role shares the frontend bucket with the public site, so its policy must
+# stay confined to the admin/ prefix: Put/Delete only on ".../admin/*", no
+# bucket-wide object resource, no GetObject, ListBucket carrying the s3:prefix
+# condition, CreateInvalidation on the distribution ARN only, exact trust.
+adm_policy=$(extract_block '^resource[ \t]+"aws_iam_role_policy"[ \t]+"admin_deploy"[ \t]*{' <github-oidc.tf)
+adm_role=$(extract_block '^resource[ \t]+"aws_iam_role"[ \t]+"admin_deploy"[ \t]*{' <github-oidc.tf)
+if [ -z "$adm_policy" ] || [ -z "$adm_role" ]; then
+  bad 'aws_iam_role/aws_iam_role_policy "admin_deploy" not found in github-oidc.tf'
+else
+  problems=""
+  grep -qE 'StringEquals' <<<"$adm_role" || problems="$problems trust-not-StringEquals"
+  grep -qE 'StringLike|ForAnyValue|ForAllValues|\*' <<<"$adm_role" && problems="$problems trust-uses-pattern-or-wildcard"
+  grep -qF 'token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"' <<<"$adm_role" || problems="$problems no-aud"
+  grep -qF 'token.actions.githubusercontent.com:sub" = local.github_admin_react_sub' <<<"$adm_role" || problems="$problems sub-not-admin-local"
+  grep -qE 'github_admin_react_sub[ \t]*=[ \t]*"repo:\$\{local\.github_org\}/cv-admin-react:ref:refs/heads/master"' github-oidc.tf || problems="$problems admin-sub-not-master"
+  grep -qF 'Action   = ["s3:PutObject", "s3:DeleteObject"]' <<<"$adm_policy" || problems="$problems put-delete-actions"
+  grep -qF 'Resource = "${aws_s3_bucket.frontend.arn}/admin/*"' <<<"$adm_policy" || problems="$problems no-admin-prefix-resource"
+  grep -qE '\.arn\}/\*"' <<<"$adm_policy" && problems="$problems bucket-wide-object-resource"
+  grep -qE 'GetObject|s3:\*|"\*"|NotAction|NotResource|Deny|Put[A-Za-z]*(Acl|Policy)|iam:|PassRole' <<<"$adm_policy" && problems="$problems getobject-or-wildcard"
+  grep -qF '"s3:prefix"' <<<"$adm_policy" || problems="$problems listbucket-no-prefix-condition"
+  grep -qF 'StringLike' <<<"$adm_policy" || problems="$problems listbucket-no-StringLike"
+  grep -qF '["admin/*", "admin/"]' <<<"$adm_policy" || problems="$problems prefix-values"
+  grep -qF 'Resource = aws_s3_bucket.frontend.arn' <<<"$adm_policy" || problems="$problems listbucket-resource"
+  grep -qF 'Action   = ["cloudfront:CreateInvalidation"]' <<<"$adm_policy" || problems="$problems no-CreateInvalidation"
+  grep -qF 'Resource = aws_cloudfront_distribution.frontend.arn' <<<"$adm_policy" || problems="$problems invalidation-not-distribution-arn"
+  [ "$(grep -cE '^[ \t]*Effect[ \t]*=' <<<"$adm_policy")" = 3 ] || problems="$problems not-exactly-3-statements"
+  # nothing else may attach to the role besides its one inline policy
+  for tf_file in *.tf; do
+    awk -v me="$tf_file" '
+      /^resource[ \t]+"aws_iam_(role_policy_attachment|policy_attachment|role_policy)"/ { n=$3; f=1 }
+      f && /aws_iam_role\.admin_deploy|-admin-deploy/ && !(me=="github-oidc.tf" && n=="\"admin_deploy\"") { print "x" }
+      /^}/ { f=0 }' "$tf_file" | grep -q x && problems="$problems extra-policy-or-attachment-on-admin_deploy-in-$tf_file"
+  done
+  if [ -z "$problems" ]; then
+    ok "the admin deploy role writes admin/* only (no GetObject, no bucket-wide object resource), lists with the s3:prefix condition, invalidates this distribution, and has an exact master-only StringEquals trust (T-063)"
+  else
+    bad "github-oidc.tf admin_deploy:$problems"
+  fi
+fi
+
 exit $fail

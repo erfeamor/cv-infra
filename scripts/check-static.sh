@@ -1068,4 +1068,16 @@ else
   ok "the app host is private: no EIP, no public IPv4, ingress only from CloudFront's VPC-origin group, VPC origins, dual-stack config, no git (T-068)"
 fi
 
+# --- 30. The CI host stays in a default (public) subnet (T-068 follow-up) ----
+# data.aws_subnets.default feeds aws_instance.drone's ids[0]. It must list only
+# default-for-az subnets, or the private app subnet can capture the CI host.
+# terraform test cannot see data-source filters, hence this check.
+net_src=$(cat network.tf)
+if printf '%s\n' "$net_src" | awk '/^data "aws_subnets" "default"/{f=1} f{print} f&&/^}/{exit}' \
+  | grep -A2 'name *= *"default-for-az"' | grep -qF 'values = ["true"]'; then
+  ok "data.aws_subnets.default is filtered to default-for-az subnets, so the CI host cannot land in the private app subnet"
+else
+  bad "data.aws_subnets.default lost its default-for-az filter: the CI host (ids[0]) could move into the private app subnet"
+fi
+
 exit $fail

@@ -1080,4 +1080,20 @@ else
   bad "data.aws_subnets.default lost its default-for-az filter: the CI host (ids[0]) could move into the private app subnet"
 fi
 
+# --- 31. VPC origins are replaced create-before-destroy with the host (T-068) --
+# AWS rejects updating/deleting a VPC origin that a distribution uses (409), so
+# a host replacement must replace the origins, new one first.
+vo_problems=""
+for r in domain_service_api bff_node; do
+  blk=$(awk -v r="$r" '$0 ~ "^resource \"aws_cloudfront_vpc_origin\" \""r"\"" {f=1} f{print} f&&/^}/{exit}' frontend.tf)
+  printf '%s\n' "$blk" | grep -qF 'create_before_destroy = true' || vo_problems="$vo_problems; $r lacks create_before_destroy"
+  printf '%s\n' "$blk" | grep -qF 'replace_triggered_by  = [aws_instance.domain_service.id]' || vo_problems="$vo_problems; $r lacks replace_triggered_by the instance"
+  printf '%s\n' "$blk" | grep -qF '${substr(aws_instance.domain_service.id, 2, 8)}' || vo_problems="$vo_problems; $r name must change with the instance (old and new coexist)"
+done
+if [ -n "$vo_problems" ]; then
+  bad "VPC origins (T-068):${vo_problems#;}"
+else
+  ok "both VPC origins are replaced create-before-destroy with the host, under a new name"
+fi
+
 exit $fail

@@ -20,12 +20,18 @@ locals {
   # inherit unknown-until-apply values.
   app_host_provision_key = "app-host/provision.sh"
 
+  # T-068: the host has no IPv4, and ECR's classic hostname
+  # (<acct>.dkr.ecr.<region>.amazonaws.com) is IPv4-only. The dual-stack
+  # registry hostname serves the same repositories, so CI keeps pushing to the
+  # classic one and the host pulls from this one (verified in T-067).
+  app_host_ecr_registry = "${data.aws_caller_identity.current.account_id}.dkr-ecr.${var.aws_region}.on.aws"
+
   app_host_provision_script = templatefile("${path.module}/templates/domain-service-provision.sh", {
     aws_region   = var.aws_region
     project_name = var.project_name
     environment  = var.environment
-    image        = "${aws_ecr_repository.domain_service.repository_url}:latest"
-    bff_image    = "${aws_ecr_repository.bff_node.repository_url}:latest"
+    image        = "${local.app_host_ecr_registry}/${aws_ecr_repository.domain_service.name}:latest"
+    bff_image    = "${local.app_host_ecr_registry}/${aws_ecr_repository.bff_node.name}:latest"
     db_name      = var.db_name
     db_username  = var.db_username
     # T-054: the awslogs groups (observability.tf); the names are plan-known.

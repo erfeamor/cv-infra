@@ -12,8 +12,8 @@
 # place (then `xfs_growfs`); going smaller again means another _vN.
 resource "aws_ebs_volume" "mysql_data_v2" {
   # Ruling 1: pinned from the SAME source that selects
-  # aws_instance.domain_service's subnet (data.aws_subnets.domain_service in
-  # network.tf, filtered on this same variable) -- never computed
+  # aws_instance.domain_service's subnet (aws_subnet.app_private in
+  # network.tf, created in this same variable's AZ) -- never computed
   # separately. An EBS volume is AZ-locked, so if the instance and the
   # volume traced to independently-computed AZs, a later plan could move
   # the instance and strand the volume in the wrong zone.

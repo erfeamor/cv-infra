@@ -1,7 +1,3 @@
-output "domain_service_public_ip" {
-  value = aws_eip.domain_service.public_ip
-}
-
 output "domain_service_ecr_repository_url" {
   value = aws_ecr_repository.domain_service.repository_url
 }

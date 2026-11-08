@@ -3,7 +3,7 @@
 The app host (`aws_instance.domain_service`, tag `Name=cv-project-domain-service`) runs MySQL, the domain service and the BFF as containers. Since T-044 a new image or a new migration reaches it **without replacing the host**, through `/usr/local/bin/cv-redeploy` (root only, 0750), which the provisioning script writes at boot.
 
 ```
-cv-redeploy migrate          # fetch the sql/ tarball from S3 (migrations/cv-database-sql.tgz; git clone only while the object does not exist, T-070), run Flyway exactly as boot does
+cv-redeploy migrate          # fetch the sql/ tarball from S3 (migrations/cv-database-sql.tgz; no git fallback since T-068), run Flyway exactly as boot does
 cv-redeploy domain-service   # ECR login, pull :latest, print old/new image ids, recreate ONLY this container
 cv-redeploy bff-node         # same, for the BFF
 ```
@@ -71,7 +71,7 @@ Hibernate validates the schema at startup, so the order is fixed: **migrate firs
 2. `cv-redeploy migrate`. It is a no-op when the schema is current (Flyway reports "Schema is up to date").
 3. Push the new domain-service image, `cv-redeploy domain-service`.
 
-**Where the SQL comes from (T-070).** `cv-redeploy migrate` downloads `s3://<backup bucket>/migrations/cv-database-sql.tgz` (output `migration_sql_bucket`; published by cv-database's migrate workflow, T-071) and unpacks it to `/opt/cv-database-sql/sql`. A 404 falls back to the old git clone; any other S3 error (denied, corrupt or hollow archive) fails the run before Flyway. The fallback goes away with the public IPv4 (T-068): **the object must exist before that host replacement**, since a new host runs Flyway at first boot.
+**Where the SQL comes from (T-070).** `cv-redeploy migrate` downloads `s3://<backup bucket>/migrations/cv-database-sql.tgz` (output `migration_sql_bucket`; published by cv-database's migrate workflow, T-071) and unpacks it to `/opt/cv-database-sql/sql`. Every failure (a missing object, denied, a corrupt or hollow archive) fails the run before Flyway: since T-068 the host has no public IPv4 and cannot reach github.com, so there is no fallback. **The object must exist before a host replacement**, since a new host runs Flyway at first boot (run cv-database's migrate workflow via `workflow_dispatch` if it was ever deleted).
 
 Migrations are forward-only; there is no `migrate` rollback. A failed Flyway run leaves the running containers untouched (migrate never touches containers).
 
@@ -125,3 +125,15 @@ aws logs tail /cv-project/cv-bff-node --since 1h --region eu-west-3
 - AMI or instance-type changes.
 
 MySQL's data lives on its own EBS volume (T-018) and survives a replacement; expect 3 to 5 minutes of downtime. Save the ECR digests before applying, as above. `db_password` must not be rotated (T-021).
+
+## Applying T-068 (private host, VPC origins)
+
+One `terraform apply` replaces the host, creates the network and the two VPC origins, replaces the two security groups and releases the EIP.
+
+Order Terraform follows: IPv6 block, subnet, route table, egress-only gateway, security groups, instance (old one destroyed first, so the **site is down from then**), VPC origins (~10 minutes), distribution update (~10 minutes), standalone ingress rules once the managed CloudFront group exists. Expect 20-30 minutes end to end; the data volume reattaches and Flyway finds schema version 2.
+
+Before the apply: the migration SQL object must exist (`aws s3api head-object --bucket cv-project-mysql-backup-dev --key migrations/cv-database-sql.tgz`), because the new host runs Flyway at boot and there is no git fallback.
+
+After: `aws ec2 describe-addresses` is empty; the instance has no `PublicIpAddress`; `curl -s -o /dev/null -w '%{http_code}' https://erfeamor.com/bff/api/v1/people/1/cv` is 200; `cv-redeploy` of each service and `migrate` succeed over SSM; a backup run (`systemctl start mysql-backup.service`) uploads a dump.
+
+If the host never registers with SSM or never serves: read its console output (`aws ec2 get-console-output --instance-id ... --latest`). The usual suspects are the three dual-stack settings (SSM agent file, `AWS_USE_DUALSTACK_ENDPOINT`, `awslogs-endpoint`), the object missing from S3, or the managed CloudFront group not yet in the VPC. Rolling back means reverting this change and applying again: a public subnet host, a new EIP and the prefix-list rules return, and the data volume reattaches the same way.

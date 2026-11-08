@@ -16,6 +16,9 @@ fail() {
 
 script=/root/domain-service-provision.sh
 
+# T-068: no public IPv4; AWS endpoints over IPv6 (dual-stack).
+export AWS_USE_DUALSTACK_ENDPOINT=true
+
 aws s3 cp "s3://${artifact_bucket}/${artifact_key}" "$script" --region "${aws_region}" \
   || fail "could not download s3://${artifact_bucket}/${artifact_key}"
 

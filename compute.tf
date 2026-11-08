@@ -39,17 +39,6 @@ data "aws_ami" "al2023_arm64" {
   }
 }
 
-# Stable address: CloudFront's /api/* origin points at this EIP's public DNS,
-# so the instance can be replaced without touching the distribution.
-resource "aws_eip" "domain_service" {
-  domain = "vpc"
-
-  tags = {
-    Name    = "${var.project_name}-domain-service"
-    Project = var.project_name
-  }
-}
-
 resource "aws_instance" "domain_service" {
   # T-035: arm64 AMI (the CI host keeps the x86 lookup).
   ami           = data.aws_ami.al2023_arm64.id
@@ -63,17 +52,17 @@ resource "aws_instance" "domain_service" {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
     http_put_response_hop_limit = 1
+    # T-068: with no public IPv4 the host's IMDS client may use IPv6.
+    http_protocol_ipv6 = "enabled"
   }
-  # T-018 ruling 1: pinned via data.aws_subnets.domain_service, which is
-  # itself filtered on var.availability_zone -- the SAME variable that sets
-  # aws_ebs_volume.mysql_data_v2.availability_zone in storage.tf, so the
-  # instance and its EBS volume can never land in different AZs. sort()
-  # keeps the pick deterministic even if the default VPC ever has more than
-  # one subnet in that AZ (list position off an unordered API result is
-  # exactly what this ruling exists to avoid).
-  subnet_id = sort(data.aws_subnets.domain_service.ids)[0]
-  # T-014 ruling 1: the BFF's port 3000 needs its own security group (quota --
-  # see network.tf) rather than a second rule on the existing one, so both
+  # T-068: the private dual-stack subnet in var.availability_zone (network.tf),
+  # the AZ of the EBS volume (T-018 ruling 1). No public IPv4 at all: the
+  # EIP is gone; CloudFront reaches the host through VPC origins and the host
+  # reaches AWS over IPv6.
+  subnet_id                   = aws_subnet.app_private.id
+  associate_public_ip_address = false
+  ipv6_address_count          = 1
+  # T-014 ruling 1: the BFF's port 3000 has its own security group, so both
   # groups attach here.
   vpc_security_group_ids = [aws_security_group.domain_service.id, aws_security_group.bff_node.id]
   iam_instance_profile   = aws_iam_instance_profile.domain_service.name
@@ -97,14 +86,21 @@ resource "aws_instance" "domain_service" {
   user_data_replace_on_change = true
 
   # user_data reads these parameters at first boot, so they must exist first.
+  #
+  # T-068 deliberately leaves out two of them: bff/token-url (it depends on the
+  # Cognito domain, which depends on the apex alias record, which depends on
+  # the distribution) and app/cors-allowed-origins (it embeds the
+  # distribution's domain). The distribution now depends on this instance
+  # (VPC origins target its ARN), so listing them would be a cycle. Both
+  # exist before any replacement of a running host; on a from-scratch account
+  # create them first: terraform apply -target=aws_ssm_parameter.cors_allowed_origins
+  # -target=aws_ssm_parameter.bff_token_url
   depends_on = [
     aws_ssm_parameter.db_password,
     aws_ssm_parameter.cognito_issuer_uri,
     aws_ssm_parameter.bff_service_client_id,
     aws_ssm_parameter.bff_service_client_secret,
-    aws_ssm_parameter.bff_token_url,
     aws_ssm_parameter.bff_token_scope,
-    aws_ssm_parameter.cors_allowed_origins,
     # T-044: the stub downloads and verifies these at first boot.
     aws_s3_object.app_host_provision,
     aws_ssm_parameter.app_host_provision_sha256,
@@ -132,9 +128,4 @@ resource "aws_instance" "domain_service" {
     Name    = "${var.project_name}-domain-service"
     Project = var.project_name
   }
-}
-
-resource "aws_eip_association" "domain_service" {
-  instance_id   = aws_instance.domain_service.id
-  allocation_id = aws_eip.domain_service.id
 }

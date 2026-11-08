@@ -1115,13 +1115,21 @@ else
   grep -qF 'Action   = ["s3:PutObject", "s3:DeleteObject"]' <<<"$adm_policy" || problems="$problems put-delete-actions"
   grep -qF 'Resource = "${aws_s3_bucket.frontend.arn}/admin/*"' <<<"$adm_policy" || problems="$problems no-admin-prefix-resource"
   grep -qE '\.arn\}/\*"' <<<"$adm_policy" && problems="$problems bucket-wide-object-resource"
-  grep -qE 'GetObject|s3:\*|"\*"|NotAction|NotResource|Deny' <<<"$adm_policy" && problems="$problems getobject-or-wildcard"
+  grep -qE 'GetObject|s3:\*|"\*"|NotAction|NotResource|Deny|Put[A-Za-z]*(Acl|Policy)|iam:|PassRole' <<<"$adm_policy" && problems="$problems getobject-or-wildcard"
   grep -qF '"s3:prefix"' <<<"$adm_policy" || problems="$problems listbucket-no-prefix-condition"
   grep -qF 'StringLike' <<<"$adm_policy" || problems="$problems listbucket-no-StringLike"
   grep -qF '["admin/*", "admin/"]' <<<"$adm_policy" || problems="$problems prefix-values"
   grep -qF 'Resource = aws_s3_bucket.frontend.arn' <<<"$adm_policy" || problems="$problems listbucket-resource"
   grep -qF 'Action   = ["cloudfront:CreateInvalidation"]' <<<"$adm_policy" || problems="$problems no-CreateInvalidation"
   grep -qF 'Resource = aws_cloudfront_distribution.frontend.arn' <<<"$adm_policy" || problems="$problems invalidation-not-distribution-arn"
+  [ "$(grep -cE '^[ \t]*Effect[ \t]*=' <<<"$adm_policy")" = 3 ] || problems="$problems not-exactly-3-statements"
+  # nothing else may attach to the role besides its one inline policy
+  for tf_file in *.tf; do
+    awk -v me="$tf_file" '
+      /^resource[ \t]+"aws_iam_(role_policy_attachment|policy_attachment|role_policy)"/ { n=$3; f=1 }
+      f && /aws_iam_role\.admin_deploy|-admin-deploy/ && !(me=="github-oidc.tf" && n=="\"admin_deploy\"") { print "x" }
+      /^}/ { f=0 }' "$tf_file" | grep -q x && problems="$problems extra-policy-or-attachment-on-admin_deploy-in-$tf_file"
+  done
   if [ -z "$problems" ]; then
     ok "the admin deploy role writes admin/* only (no GetObject, no bucket-wide object resource), lists with the s3:prefix condition, invalidates this distribution, and has an exact master-only StringEquals trust (T-063)"
   else

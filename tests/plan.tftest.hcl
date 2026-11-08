@@ -2860,6 +2860,11 @@ run "github_oidc_admin_deploy" {
     condition     = aws_iam_role.admin_deploy.max_session_duration == 3600
     error_message = "the admin deploy role keeps the 1 h session (T-063)"
   }
+
+  assert {
+    condition     = aws_iam_role_policy.admin_deploy.name == "frontend-admin-deploy"
+    error_message = "the admin deploy inline policy is named frontend-admin-deploy (T-063)"
+  }
 }
 
 # --- T-035: app host on Graviton (t4g.micro, arm64 AMI), IMDSv2, safe ECR ---

@@ -127,6 +127,35 @@ resource "aws_iam_role_policy" "mysql_backup_upload" {
   })
 }
 
+# T-070: `cv-redeploy migrate` reads the migration SQL tarball from S3 (once
+# T-068 removes its public IPv4 the host cannot reach github.com). GetObject on
+# that one key. ListBucket on the bucket is what turns a missing key into a 404
+# instead of a 403, and the script falls back to git only on a 404. No s3:prefix
+# condition: a missing-key GET carries no prefix, so one would turn the 404 back
+# into a 403. The bucket holds only dumps and this object. Accepted: the bucket
+# is unversioned and the host does not pin a checksum, so whoever may PutObject
+# the key (only the cv-database master role) controls the SQL run in production.
+resource "aws_iam_role_policy" "app_read_migration_sql" {
+  name = "read-migration-sql"
+  role = aws_iam_role.domain_service.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.backup.arn}/${local.migration_sql_key}"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.backup.arn
+      }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "domain_service" {
   name = "${var.project_name}-domain-service"
   role = aws_iam_role.domain_service.name

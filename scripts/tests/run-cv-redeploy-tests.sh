@@ -38,6 +38,7 @@ render() {
     -e 's#\${bff_image}#123456789012.dkr.ecr.eu-west-3.amazonaws.com/cv-project-bff-node:latest#g' \
     -e 's#\${log_group_domain_service}#/cv-project/cv-domain-service#g' \
     -e 's#\${log_group_bff_node}#/cv-project/cv-bff-node#g' \
+    -e 's#\${backup_bucket}#test-backup-bucket#g' \
     -e 's#\${db_name}#cvdb#g' \
     -e 's#\${db_username}#cvuser#g' \
     -e 's#\$\${#${#g' \
@@ -50,6 +51,15 @@ chmod +x "$workdir/cv-redeploy"
 
 [ -s "$workdir/lib/cv-app.sh" ] && [ -s "$workdir/cv-redeploy" ] || { echo "could not extract the library/cv-redeploy from the template" >&2; exit 1; }
 
+# T-070: fixtures for the migration SQL tarball.
+mkdir -p "$workdir/tmp" "$workdir/src/sql/migrations" "$workdir/hollow/sql"
+echo "select 1;" >"$workdir/src/sql/migrations/V1__x.sql"
+tar -czf "$workdir/sql-ok.tgz" -C "$workdir/src" sql
+tar -czf "$workdir/sql-hollow.tgz" -C "$workdir/hollow" sql
+echo "not a tarball" >"$workdir/sql-bad.tgz"
+mkdir -p "$workdir/link/real/migrations" && ln -s real "$workdir/link/sql" && tar -czf "$workdir/sql-link.tgz" -C "$workdir/link" sql
+mkdir -p "$workdir/inner/sql/migrations" && ln -s /etc/passwd "$workdir/inner/sql/migrations/evil.sql" && tar -czf "$workdir/sql-innerlink.tgz" -C "$workdir/inner" sql
+
 calls="$workdir/calls.log"
 out="$workdir/out.log"
 
@@ -61,7 +71,7 @@ printf 'not-an-instance-id\n' >"$workdir/instance-id.bad"
 run_redeploy() { # run_redeploy <args...>; sets $rc. ID_FILE selects the fixture.
   : >"$calls"; rm -f "$workdir/state/digest"
   set +e
-  env -i ${STUB_AWS_FAIL:+STUB_AWS_FAIL="$STUB_AWS_FAIL"} ${STUB_AWS_EMPTY:+STUB_AWS_EMPTY="$STUB_AWS_EMPTY"} ${STUB_ENV_DUMP:+STUB_ENV_DUMP="$STUB_ENV_DUMP"} ${STUB_DOCKER_RUN_FAIL:+STUB_DOCKER_RUN_FAIL="$STUB_DOCKER_RUN_FAIL"} CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
+  env -i ${STUB_AWS_FAIL:+STUB_AWS_FAIL="$STUB_AWS_FAIL"} ${STUB_AWS_EMPTY:+STUB_AWS_EMPTY="$STUB_AWS_EMPTY"} ${STUB_ENV_DUMP:+STUB_ENV_DUMP="$STUB_ENV_DUMP"} ${STUB_DOCKER_RUN_FAIL:+STUB_DOCKER_RUN_FAIL="$STUB_DOCKER_RUN_FAIL"} ${STUB_S3:+STUB_S3="$STUB_S3"} STUB_S3_FILE="${STUB_S3_FILE:-$workdir/sql-ok.tgz}" CV_SQL_ROOT="$workdir/sqlroot" TMPDIR="$workdir/tmp" CV_INSTANCE_ID_FILE="${ID_FILE:-$workdir/instance-id.ok}" PATH="$here/stub-bin-app:/usr/bin:/bin" STUB_CALLS_LOG="$calls" STUB_STATE_DIR="$workdir/state" \
     bash "$workdir/cv-redeploy" "$@" >"$out" 2>&1
   rc=$?
   set -e
@@ -94,13 +104,46 @@ grep -q '^docker run -d --name bff-node ' "$calls" && ok "recreated bff-node" ||
 ! grep -qE '^docker run .*--name (domain-service|mysql)|flyway' "$calls" && ok "other containers untouched" || bad "touched another container"
 no_secrets "case 2"
 
-echo "case 3: migrate refreshes the clone and runs flyway, nothing else"
+echo "case 3: migrate reads the SQL from S3 and runs flyway, nothing else (T-070)"
 run_redeploy migrate
 [ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc"
-grep -qE '^git (clone|-C /opt/cv-database pull --ff-only)' "$calls" && ok "synced the cv-database clone" || bad "no clone sync"
+grep -q '^aws s3 cp --region eu-west-3 s3://test-backup-bucket/migrations/cv-database-sql.tgz ' "$calls" && ok "read the tarball from the backup bucket" || bad "no S3 read"
+! grep -q '^git ' "$calls" && ok "no git call when the object exists" || bad "git was used although the object exists"
+grep -q "^docker run --rm --network cv -v $workdir/sqlroot/sql:/flyway/sql:ro " "$calls" && ok "flyway mounts the unpacked S3 tree" || bad "flyway does not mount the S3 tree"
+[ -f "$workdir/sqlroot/sql/migrations/V1__x.sql" ] && ok "the tree was unpacked" || bad "tree not unpacked"
+[ -z "$(ls -A "$workdir/tmp")" ] && ok "temp dir cleaned up" || bad "left temp files"
 grep -q '^docker run --rm --network cv .*flyway/flyway:13.7.0 migrate$' "$calls" && ok "ran flyway migrate" || bad "no flyway run"
 ! grep -qE '^docker (rm|pull)|^docker .*--name ' "$calls" && ok "no container removed or recreated" || bad "migrate touched a container"
 no_secrets "case 3"
+
+echo "case 3b: object missing (404) -> git fallback, flyway on the clone path (T-070)"
+STUB_S3=missing run_redeploy migrate
+[ "$rc" -eq 0 ] && ok "exit 0" || bad "exit $rc"
+grep -qE '^git (clone|-C /opt/cv-database pull --ff-only)' "$calls" && ok "fell back to git" || bad "no git fallback on 404"
+grep -q "^docker run --rm --network cv -v /opt/cv-database/sql:/flyway/sql:ro " "$calls" && ok "flyway on the clone" || bad "flyway not on the clone"
+
+echo "case 3c: any other S3 failure is fatal and runs nothing (T-070)"
+STUB_S3=denied run_redeploy migrate
+[ "$rc" -ne 0 ] && ok "non-zero exit on 403" || bad "403 was swallowed"
+! grep -qE '^git |^docker ' "$calls" && ok "no git, no flyway after a 403" || bad "ran something after a 403"
+grep -q 'FATAL: cannot read s3://' "$out" && ok "says why" || bad "silent failure"
+
+echo "case 3d: a corrupt or hollow archive is fatal (T-070)"
+STUB_S3_FILE="$workdir/sql-bad.tgz" run_redeploy migrate
+[ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "corrupt archive: fails, no flyway" || bad "corrupt archive accepted"
+STUB_S3_FILE="$workdir/sql-hollow.tgz" run_redeploy migrate
+[ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "archive without sql/migrations: fails, no flyway" || bad "hollow archive accepted"
+
+STUB_S3_FILE="$workdir/sql-link.tgz" run_redeploy migrate
+[ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "a symlinked sql/ is refused" || bad "symlinked sql/ accepted"
+STUB_S3_FILE="$workdir/sql-innerlink.tgz" run_redeploy migrate
+[ "$rc" -ne 0 ] && ! grep -q '^docker ' "$calls" && ok "a symlink member is refused" || bad "symlink member accepted"
+
+echo "case 3e: a second sync replaces the previous tree and leaves no scraps (T-070)"
+echo "stale" >"$workdir/sqlroot/sql/migrations/V0__stale.sql"
+run_redeploy migrate
+[ "$rc" -eq 0 ] && [ ! -e "$workdir/sqlroot/sql/migrations/V0__stale.sql" ] && [ -f "$workdir/sqlroot/sql/migrations/V1__x.sql" ] && ok "old tree replaced by the new one" || bad "stale file survived or sync failed"
+[ ! -e "$workdir/sqlroot/sql.old" ] && [ ! -e "$workdir/sqlroot/sql.new" ] && ok "no sql.old/sql.new left behind" || bad "scraps left in the SQL root"
 
 echo "case 4: bad or missing arguments exit 2 with usage"
 for args in "bogus" "" "migrate extra" "mysql"; do

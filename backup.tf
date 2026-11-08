@@ -8,6 +8,13 @@ locals {
   # iam.tf can scope s3:PutObject to it exactly, rather than the bucket
   # root.
   mysql_backup_prefix = "mysql-dumps"
+
+  # T-070: the one object cv-database's migrate workflow publishes (the sql/
+  # tree as a tarball) and the app host's `cv-redeploy migrate` reads, because
+  # a host with no public IPv4 cannot clone from github.com. Outside the
+  # mysql-dumps/ prefix, so the 7-day dump expiry never touches it. The bucket
+  # is unversioned, so each publish overwrites it.
+  migration_sql_key = "migrations/cv-database-sql.tgz"
 }
 
 resource "aws_s3_bucket" "backup" {

@@ -3819,3 +3819,42 @@ run "t066_volume_size_is_a_whole_number_of_gib_at_least_1" {
 
   expect_failures = [var.mysql_volume_size_gb]
 }
+
+# T-070: the migration SQL travels through S3. The app host reads one key (and
+# may list the bucket, which turns a missing key into a 404 the script
+# understands); the cv-database role writes that same key and nothing else.
+run "t070_migration_sql_through_s3" {
+  command = plan
+
+  assert {
+    condition     = local.migration_sql_key == "migrations/cv-database-sql.tgz" && !startswith(local.migration_sql_key, "${local.mysql_backup_prefix}/")
+    error_message = "the migration SQL object must be migrations/cv-database-sql.tgz, outside the expiring mysql-dumps/ prefix (T-070)"
+  }
+
+  assert {
+    condition = (
+      aws_iam_role_policy.app_read_migration_sql.role == aws_iam_role.domain_service.id &&
+      jsondecode(aws_iam_role_policy.app_read_migration_sql.policy).Statement[0].Action == ["s3:GetObject"] &&
+      jsondecode(aws_iam_role_policy.app_read_migration_sql.policy).Statement[0].Resource == "${aws_s3_bucket.backup.arn}/${local.migration_sql_key}" &&
+      jsondecode(aws_iam_role_policy.app_read_migration_sql.policy).Statement[1].Action == ["s3:ListBucket"] &&
+      jsondecode(aws_iam_role_policy.app_read_migration_sql.policy).Statement[1].Resource == aws_s3_bucket.backup.arn &&
+      length(jsondecode(aws_iam_role_policy.app_read_migration_sql.policy).Statement) == 2
+    )
+    error_message = "the app host may s3:GetObject the one migration key and s3:ListBucket the bucket, nothing else (T-070)"
+  }
+
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role_policy.database_migrate_publish_sql.policy).Statement) == 1 &&
+      jsondecode(aws_iam_role_policy.database_migrate_publish_sql.policy).Statement[0].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.database_migrate_publish_sql.policy).Statement[0].Action == ["s3:PutObject"] &&
+      jsondecode(aws_iam_role_policy.database_migrate_publish_sql.policy).Statement[0].Resource == "${aws_s3_bucket.backup.arn}/${local.migration_sql_key}"
+    )
+    error_message = "the cv-database role may s3:PutObject exactly the migration key (T-070)"
+  }
+
+  assert {
+    condition     = output.migration_sql_bucket == "${aws_s3_bucket.backup.bucket}/${local.migration_sql_key}"
+    error_message = "the migration_sql_bucket output must name bucket/key for cv-database's repo variable (T-071)"
+  }
+}

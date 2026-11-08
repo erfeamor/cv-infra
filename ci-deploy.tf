@@ -353,6 +353,30 @@ resource "aws_iam_role_policy" "database_migrate" {
   })
 }
 
+# T-070/T-071: the same role publishes the migration SQL the app host reads. One
+# object key, write only. Kept out of database_migrate_known_statements (which
+# the T-049 tests pin to the two ssm: statements).
+resource "aws_iam_role_policy" "database_migrate_publish_sql" {
+  name = "publish-migration-sql"
+  role = aws_iam_role.database_migrate.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "${aws_s3_bucket.backup.arn}/${local.migration_sql_key}"
+      }
+    ]
+  })
+}
+
+output "migration_sql_bucket" {
+  description = "Bucket and key cv-database's migrate workflow publishes the sql/ tarball to (T-071 repo variable)."
+  value       = "${aws_s3_bucket.backup.bucket}/${local.migration_sql_key}"
+}
+
 output "database_migrate_role_arn" {
   description = "T-049: role the cv-database GitHub workflow assumes via OIDC (master only). Not a secret; set as the cv-database repo variable AWS_DEPLOY_ROLE_ARN."
   value       = aws_iam_role.database_migrate.arn

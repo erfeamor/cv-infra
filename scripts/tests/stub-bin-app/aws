@@ -25,6 +25,18 @@ case "$1 $2" in
       *) echo "value-of-${name#/cv-project/dev/}" ;;
     esac
     ;;
+  "s3 cp")
+    # T-070: STUB_S3 selects the outcome of reading the migration SQL object.
+    #   (unset)  copy $STUB_S3_FILE to the destination
+    #   missing  the 404 the AWS CLI prints for a key that does not exist
+    #   denied   a 403 (the role may not read it)
+    dest="${*: -1}"
+    case "${STUB_S3:-ok}" in
+      ok) cp "${STUB_S3_FILE:?}" "$dest" ;;
+      missing) echo "fatal error: An error occurred (404) when calling the HeadObject operation: Key \"migrations/cv-database-sql.tgz\" does not exist" >&2; exit 1 ;;
+      denied) echo "fatal error: An error occurred (403) when calling the HeadObject operation: Forbidden" >&2; exit 1 ;;
+    esac
+    ;;
   "ecr get-login-password") echo "SECRET-ECR-TOKEN-3" ;;
   *) echo "stub aws: unexpected $*" >&2; exit 1 ;;
 esac

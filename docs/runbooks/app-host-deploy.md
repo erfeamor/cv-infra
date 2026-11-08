@@ -132,7 +132,7 @@ One `terraform apply` replaces the host, creates the network and the two VPC ori
 
 Order Terraform follows: IPv6 block, subnet, route table, egress-only gateway, security groups, instance (old one destroyed first, so the **site is down from then**), VPC origins (~10 minutes), distribution update (~10 minutes), standalone ingress rules once the managed CloudFront group exists. Expect 20-30 minutes end to end; the data volume reattaches and Flyway finds schema version 2.
 
-Before the apply: the migration SQL object must exist (`aws s3api head-object --bucket cv-project-mysql-backup-dev --key migrations/cv-database-sql.tgz`), because the new host runs Flyway at boot and there is no git fallback.
+Before the apply (a hard step, not a suggestion: the old host is destroyed first, so a missing object means a failed boot after the site is already down and another 20+ minutes to recover): run `cv-redeploy migrate` on the current host once (it exercises the S3 path end to end) and confirm the migration SQL object exists (`aws s3api head-object --bucket cv-project-mysql-backup-dev --key migrations/cv-database-sql.tgz`), because the new host runs Flyway at boot and there is no git fallback.
 
 After: `aws ec2 describe-addresses` is empty; the instance has no `PublicIpAddress`; `curl -s -o /dev/null -w '%{http_code}' https://erfeamor.com/bff/api/v1/people/1/cv` is 200; `cv-redeploy` of each service and `migrate` succeed over SSM; a backup run (`systemctl start mysql-backup.service`) uploads a dump.
 

@@ -92,9 +92,11 @@ resource "aws_instance" "domain_service" {
   # the distribution) and app/cors-allowed-origins (it embeds the
   # distribution's domain). The distribution now depends on this instance
   # (VPC origins target its ARN), so listing them would be a cycle. Both
-  # exist before any replacement of a running host; on a from-scratch account
-  # create them first: terraform apply -target=aws_ssm_parameter.cors_allowed_origins
-  # -target=aws_ssm_parameter.bff_token_url
+  # exist before any replacement of a running host. A from-scratch account is
+  # NOT covered by a one-line recipe (and this is untested): cors_allowed_origins
+  # embeds the distribution's domain, so `-target` on it drags in the distribution
+  # and the host again. Create both parameters out of band
+  # (aws ssm put-parameter) and `terraform import` them before the first apply.
   depends_on = [
     aws_ssm_parameter.db_password,
     aws_ssm_parameter.cognito_issuer_uri,
@@ -105,6 +107,9 @@ resource "aws_instance" "domain_service" {
     aws_s3_object.app_host_provision,
     aws_ssm_parameter.app_host_provision_sha256,
     aws_iam_role_policy.app_read_provision_script,
+    # T-070: boot reads the migration SQL from S3; without ListBucket a missing
+    # key is a 403, not a 404.
+    aws_iam_role_policy.app_read_migration_sql,
     # T-054: in non-blocking mode a missing grant silently drops every line.
     aws_iam_role_policy.app_write_container_logs,
   ]

@@ -2831,6 +2831,37 @@ run "github_oidc_public_vanilla_deploy" {
   }
 }
 
+# T-063 -- the cv-admin-react deploy role (admin/* only). Plan-known facts only;
+# the trust and policy documents embed ARNs unknown until apply, so
+# check-static.sh check 32 pins them (sub/aud, prefix scope).
+run "github_oidc_admin_deploy" {
+  command = plan
+
+  override_resource {
+    target = aws_cloudfront_function.spa_router
+    values = {
+      arn = "arn:aws:cloudfront::123456789012:function/spa-router"
+    }
+  }
+
+  override_resource {
+    target = aws_acm_certificate.site
+    values = {
+      arn = "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    }
+  }
+
+  assert {
+    condition     = aws_iam_role.admin_deploy.name == "${var.project_name}-admin-deploy"
+    error_message = "the admin deploy role is named <project>-admin-deploy (T-063)"
+  }
+
+  assert {
+    condition     = aws_iam_role.admin_deploy.max_session_duration == 3600
+    error_message = "the admin deploy role keeps the 1 h session (T-063)"
+  }
+}
+
 # --- T-035: app host on Graviton (t4g.micro, arm64 AMI), IMDSv2, safe ECR ---
 run "t035_app_host_graviton" {
   command = plan

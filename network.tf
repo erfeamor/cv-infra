@@ -6,10 +6,18 @@ data "aws_vpc" "default" {
   default = true
 }
 
+# Only the VPC's default subnets (public IPv4 on launch). Without the
+# default-for-az filter this also lists aws_subnet.app_private (T-068), which
+# sorted first and moved the CI host (ci.tf, ids[0]) into a subnet with no
+# IPv4 route: it could not have reached GitHub or Docker Hub.
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
   }
 }
 

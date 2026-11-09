@@ -28,7 +28,7 @@ data "aws_ami" "al2023_arm64" {
 }
 
 resource "aws_instance" "domain_service" {
-  # T-035: arm64 AMI (the CI host keeps the x86 lookup).
+  # T-035: arm64 AMI.
   ami           = data.aws_ami.al2023_arm64.id
   instance_type = var.domain_service_instance_type
 

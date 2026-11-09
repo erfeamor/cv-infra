@@ -128,12 +128,13 @@ resource "aws_route53_record" "react" {
 # Allowed browser origins for the domain service and the BFF. Read at
 # container start through cv_need (templates/domain-service-provision.sh), not
 # baked into the script, so adding an origin is a `cv-redeploy`, not a host
-# replacement. The cloudfront.net origin stays until T-306 removes it. The
+# replacement. Just the apex (T-306 dropped the cloudfront.net origin; that name
+# still serves the site but is not an allowed origin). The
 # domain service appends its two localhost dev origins itself.
 resource "aws_ssm_parameter" "cors_allowed_origins" {
   name  = "/${var.project_name}/${var.environment}/app/cors-allowed-origins"
   type  = "String"
-  value = "https://${local.public_apex},https://${aws_cloudfront_distribution.frontend.domain_name}"
+  value = "https://${local.public_apex}"
 
   tags = {
     Project = var.project_name

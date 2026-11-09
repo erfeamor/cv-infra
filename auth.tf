@@ -24,16 +24,14 @@ resource "aws_cognito_user_pool_client" "admin_react" {
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "email", "profile"]
-  # T-061: the custom domain joins the cloudfront.net URL, which stays until
-  # T-306 has moved the admin's build and login to auth.<domain>.
+  # T-306: localhost for dev and the apex only. The cloudfront.net name still
+  # serves the site but is no longer a callback or logout URL.
   callback_urls = [
     "http://localhost:5173/admin/",
-    "https://${aws_cloudfront_distribution.frontend.domain_name}/admin/",
     "https://${local.public_apex}/admin/",
   ]
   logout_urls = [
     "http://localhost:5173/admin/",
-    "https://${aws_cloudfront_distribution.frontend.domain_name}/admin/",
     "https://${local.public_apex}/admin/",
   ]
   supported_identity_providers = ["COGNITO"]
@@ -72,19 +70,14 @@ resource "aws_cognito_user_pool_client" "bff_service" {
   }
 }
 
-resource "aws_cognito_user_pool_domain" "cv" {
-  domain       = "${var.project_name}-${var.environment}"
-  user_pool_id = aws_cognito_user_pool.cv.id
-}
-
 # T-062: the hosted UI and the OAuth token endpoint at auth.<apex>. Cognito
 # fronts a custom domain with its own CloudFront distribution, which wants (a) a
 # us-east-1 certificate covering the name (domain.tf's, validated before this is
 # created) and (b) the parent domain to resolve, which the apex alias record
-# gives it (only the apex ones, not www). A pool can hold this beside the prefix domain above; that one stays
-# until T-306 has moved the admin build off it. Classic managed login (1)
-# matches the prefix domain; version 2 would need a branding resource first or
-# the login page breaks.
+# gives it (only the apex ones, not www). It is the pool's only domain: T-306
+# deleted the old cv-project-dev prefix domain. Classic managed login (1) is
+# pinned; version 2 would need a branding resource first or the login page
+# breaks.
 resource "aws_cognito_user_pool_domain" "custom" {
   domain                = local.public_auth
   user_pool_id          = aws_cognito_user_pool.cv.id

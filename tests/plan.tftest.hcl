@@ -25,12 +25,6 @@ mock_provider "aws" {
     }
   }
 
-  mock_data "aws_subnets" {
-    defaults = {
-      ids = ["subnet-00000000000000001", "subnet-00000000000000002"]
-    }
-  }
-
   # T-022: the CloudFront origin-facing managed prefix list. Mocked so the
   # 8080 ingress can be asserted offline; the real list is AWS-owned and its
   # id differs per region (pl-75b1541c in eu-west-3).
@@ -85,9 +79,8 @@ mock_provider "aws" {
   }
 }
 
-# T-035: the app host's AMI lookup is a separate data source from the CI
-# host's; the shared mock above defaults to x86_64, so the arm64 one gets its
-# own value (what the real lookup returns for the arm64 name + filter).
+# T-035: the shared AMI mock above defaults to x86_64, so the app host's arm64
+# lookup gets its own value (what the real lookup returns for the arm64 name + filter).
 override_data {
   target = data.aws_ami.al2023_arm64
   values = {
@@ -97,14 +90,7 @@ override_data {
 }
 
 variables {
-  db_password                = "test-password-not-real"
-  drone_rpc_secret           = "test-rpc-secret-not-real"
-  drone_github_client_id     = "test-client-id"
-  drone_github_client_secret = "test-client-secret-not-real"
-  jenkins_admin_password     = "test-jenkins-password-not-real"
-  github_pat_ci              = "test-github-pat-not-real"
-  github_webhook_secret      = "test-webhook-secret-not-real"
-  github_hooks_token         = "test-hooks-token-not-real"
+  db_password = "test-password-not-real"
 
   # T-035: pinned here so a local terraform.tfvars (which `terraform test`
   # also loads) can't change what the plan assertions see.
@@ -142,94 +128,6 @@ run "plan_succeeds" {
   assert {
     condition     = aws_instance.domain_service.iam_instance_profile == aws_iam_instance_profile.domain_service.name
     error_message = "EC2 must carry the instance profile that grants SSM access"
-  }
-
-  assert {
-    condition     = aws_instance.drone.instance_type == var.drone_instance_type
-    error_message = "Drone instance type should come from var.drone_instance_type (Free Tier)"
-  }
-
-  assert {
-    condition     = aws_instance.drone.iam_instance_profile == aws_iam_instance_profile.drone.name
-    error_message = "Drone host must carry the instance profile that grants SSM access"
-  }
-
-  assert {
-    condition     = !contains([for rule in aws_security_group.drone.ingress : rule.from_port], 22)
-    error_message = "No SSH ingress on the Drone host — shell access is SSM Session Manager only"
-  }
-
-  # T-002: Jenkins must never get its own internet-facing ingress rule — it
-  # is reached only via the reverse proxy on the existing 80 rule.
-  assert {
-    condition     = !contains([for rule in aws_security_group.drone.ingress : rule.from_port], 8080)
-    error_message = "No direct ingress rule for the raw Jenkins port — it must stay behind the reverse proxy on 80/443"
-  }
-
-  assert {
-    condition     = length([for rule in aws_security_group.drone.ingress : rule]) == 2
-    error_message = "Drone SG should still expose exactly 80 and 443 — Jenkins must not add a third ingress rule"
-  }
-
-  # H1 decision 2: sizing exception, recorded here and in variables.tf / the PR.
-  assert {
-    condition     = aws_instance.drone.instance_type == "t3.small"
-    error_message = "Drone/Jenkins host must be t3.small per the ratified T-002 Free Tier exception"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.jenkins_admin_password.type == "SecureString"
-    error_message = "Jenkins admin password must be stored as a SecureString"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.github_pat_ci.type == "SecureString"
-    error_message = "The Jenkins GitHub PAT must be stored as a SecureString"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.github_pat_ci.name == "/${var.project_name}/${var.environment}/ci/github-pat"
-    error_message = "The Jenkins GitHub PAT must follow the existing /project/env/ci/... SSM naming convention"
-  }
-
-  # NOT tested here: whether the Jenkins multibranch job configs declare
-  # traits{} (and never gitHubForkDiscovery) lives inside
-  # local.jenkins_provision_script. T-034 phase 2 incidentally RESOLVED the
-  # reason this used to be untestable (it embedded aws_eip.drone.public_ip,
-  # unknown-until-apply for the whole rendered string) -- it now renders from
-  # var.ci_hostname and data.aws_route53_zone.ci.zone_id, both known at plan
-  # time under this file's mocks, so `local.jenkins_provision_script` itself
-  # is a genuinely knowable string here now. Still not asserted against
-  # directly: doing so is an improvement orthogonal to phase 2's own scope,
-  # left for a future task rather than invented here. The "ci_on_demand" run
-  # below (periodicFolderTrigger, the 8 KB wall) already exercises a
-  # PARALLEL re-render with fixture values instead, which is why it still
-  # needs its own separate templatefile() call.
-
-  # Review finding N5: catches a copy-paste that assigns the wrong variable
-  # to a secret parameter -- it would otherwise pass every assertion above.
-  assert {
-    condition     = aws_ssm_parameter.github_pat_ci.value == var.github_pat_ci
-    error_message = "aws_ssm_parameter.github_pat_ci must store var.github_pat_ci, not some other variable"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.jenkins_admin_password.value == var.jenkins_admin_password
-    error_message = "aws_ssm_parameter.jenkins_admin_password must store var.jenkins_admin_password, not some other variable"
-  }
-
-  # Review finding N5: this is the single load-bearing invariant of the
-  # whole out-of-band-provisioning approach (H1 decision 1) -- if this ever
-  # flips to true, aws_instance.drone gets destroyed/recreated on every
-  # user_data edit instead of being provisioned out-of-band, wiping Drone's
-  # SQLite state. Assert it explicitly so a future edit can't reintroduce it
-  # silently.
-  assert {
-    # Left unset in config, this attribute plans as null rather than a
-    # resolved false -- assert it's not explicitly true rather than
-    # requiring exact equality with false.
-    condition     = aws_instance.drone.user_data_replace_on_change != true
-    error_message = "aws_instance.drone must NOT set user_data_replace_on_change -- Jenkins is provisioned out-of-band via SSM specifically so this box is never replaced (H1 decision 1)"
   }
 
   assert {
@@ -327,7 +225,7 @@ run "plan_succeeds" {
   }
 
   # O7 -- NOT tested here, deliberately, same documented limitation as
-  # aws_eip.drone.public_ip above: aws_sns_topic.budget_alerts.arn is
+  # the unknown-until-apply ARNs elsewhere in this file: aws_sns_topic.budget_alerts.arn is
   # unknown-until-apply under `command = plan`, and it feeds
   # subscriber_sns_topic_arns on every notification block, so nothing
   # downstream of that ARN is assertable under mock_provider's plan output
@@ -502,8 +400,8 @@ run "plan_succeeds" {
   # aws_s3_bucket.backup.id/.arn and everything downstream of them (the
   # public access block's own `bucket` link, the IAM policy's rendered JSON,
   # aws_instance.domain_service.user_data) are unknown-until-apply under
-  # `command = plan` -- same documented limitation as aws_eip.drone.public_ip
-  # and aws_sns_topic.budget_alerts.arn above. Those checks live in the
+  # `command = plan` -- same documented limitation as
+  # aws_sns_topic.budget_alerts.arn above. Those checks live in the
   # `command = apply` run block below instead (safe under mock_provider,
   # since nothing real gets created).
 
@@ -538,10 +436,8 @@ run "plan_succeeds" {
     error_message = "aws_ebs_volume.mysql_data_v2.availability_zone must come from var.availability_zone -- the same pinned source that selects aws_instance.domain_service's subnet, never a separately-computed AZ"
   }
 
-  # Regression guard, mirrored from the equivalent Drone assertion but with
-  # the opposite polarity: unlike Drone (provisioned out-of-band, must NEVER
-  # replace), the domain-service box MUST keep replacing on user_data edits
-  # -- that's what makes this task's own acceptance criterion (apply twice,
+  # Regression guard: the domain-service box MUST keep replacing on user_data
+  # edits -- that's what makes this task's own acceptance criterion (apply twice,
   # prove the database survives replacement) a real test rather than a no-op.
   assert {
     condition     = aws_instance.domain_service.user_data_replace_on_change == true
@@ -560,8 +456,7 @@ run "plan_succeeds" {
 
   # aws_volume_attachment.mysql_data.volume_id/.instance_id and
   # aws_ebs_volume.mysql_data_v2.id are unknown-until-apply under `command =
-  # plan` (same documented limitation as aws_s3_bucket.backup.arn and
-  # aws_eip.drone.public_ip above), and targeting them for a `command =
+  # plan` (same documented limitation as aws_s3_bucket.backup.arn above), and targeting them for a `command =
   # apply` run pulls in aws_instance.domain_service -> its user_data ->
   # aws_cloudfront_distribution.frontend, which is the exact combination
   # already confirmed (see the backup_iam_scoping run's own comment) to fail
@@ -581,14 +476,9 @@ run "plan_succeeds" {
 # computed and unknown-until-apply, so the assertions that actually prove
 # IAM scoping (the ones a reviewer will check hardest) need an applied plan
 # to have concrete values to compare -- same rationale as the O7/N5 comments
-# above. mock_provider makes an apply of these two resources safe -- EXCEPT
-# that an unscoped/full-module apply would also create
-# null_resource.jenkins_provision (ci.tf), whose local-exec provisioner
-# shells out to real `aws ssm` commands regardless of the AWS provider being
-# mocked (confirmed empirically: it ran for real and only failed because the
-# mock instance ID doesn't exist). plan_options.target below restricts this
-# run to exactly the two backup resources and their dependencies, so
-# aws_instance.drone / null_resource.jenkins_provision are never reached.
+# above. mock_provider makes an apply of these two resources safe -- and
+# plan_options.target below restricts this run to exactly the two backup
+# resources and their dependencies.
 run "backup_iam_scoping" {
   command = apply
 
@@ -637,1221 +527,6 @@ run "backup_iam_scoping" {
   # (invalid mock ARN format rejected by aws_cloudfront_function's
   # function_association). The wiring is covered by `terraform validate` +
   # code review instead of an assertion here.
-}
-
-# ---------------------------------------------------------------------------
-# T-019 -- on-demand CI host. The doorbell is an unauthenticated public
-# endpoint that can start EC2 instances, so most of what follows is about
-# proving the blast radius stays small when someone edits this later.
-# ---------------------------------------------------------------------------
-run "ci_on_demand" {
-  command = plan
-
-  # --- The size wall, now enforced at T-009's threshold ---------------------
-  # Tightened from 16,384 to 8,192 once T-009 moved jenkins-provision.sh to S3:
-  # the render dropped from 16,104 B (98.3%) to roughly 3 KB, so an 8 KB ceiling
-  # leaves generous room while still failing long BEFORE the real EC2 limit.
-  # Exceeding 16,384 is not caught by fmt, validate or a mocked plan -- it
-  # surfaces as an apply-time API rejection on the live CI host, which is a far
-  # worse place to discover it than a red test.
-  assert {
-    condition = length(join("\n", [
-      templatefile("${path.module}/templates/drone-user-data.sh", {
-        aws_region     = var.aws_region
-        project_name   = var.project_name
-        environment    = var.environment
-        ci_hostname    = "203.0.113.10"
-        admin_username = var.drone_admin_username
-      }),
-      templatefile("${path.module}/templates/jenkins-bootstrap.sh", {
-        aws_region      = var.aws_region
-        project_name    = var.project_name
-        environment     = var.environment
-        artifact_bucket = "test-bucket"
-        artifact_key    = "jenkins-provision.sh"
-      }),
-    ])) < 8192
-    error_message = "Rendered user_data for aws_instance.drone exceeds 8 KB. The provisioning script already lives in S3 (T-009), so something substantial has been inlined back into user_data -- move it out rather than trimming comments to fit."
-  }
-
-  # Ruling 1: the periodic scan is what makes the doorbell able to stay a pure
-  # doorbell. Delete it and every cold start silently builds nothing.
-  assert {
-    condition = length(regexall("periodicFolderTrigger", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 2
-    error_message = "Both multibranch jobs must carry a periodicFolderTrigger -- without it a push that arrives while the CI host is stopped is never built (T-019 ruling 1)"
-  }
-
-  # --- T-034 phase 2 + T-033 (case 10): Caddyfile routing parity with the old
-  # nginx config, checked against the actual rendered template content, not a
-  # separate hand-copied fixture. ---------------------------------------------
-  assert {
-    condition = length(regexall("handle /jenkins/\\* \\{[^}]*reverse_proxy jenkins:8080", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The Caddyfile must route /jenkins/* to jenkins:8080 via `handle` (not `handle_path`, which would strip the prefix --prefix=/jenkins expects)"
-  }
-
-  assert {
-    condition = length(regexall("reverse_proxy drone-server:80", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The Caddyfile must route everything else (GitHub /hook, Drone OAuth) to drone-server:80, unchanged from the old nginx `location /`"
-  }
-
-  # --- Case 11: the HTTP->HTTPS redirect is explicit, not left implicit -----
-  assert {
-    condition = length(regexall("redir https://\\{host\\}\\{uri\\} permanent", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The Caddyfile must carry an explicit permanent HTTP->HTTPS redirect, not rely on Caddy's implicit default going ungrepped"
-  }
-
-  # --- Certs/state persist on the host, not the container's own filesystem --
-  assert {
-    condition = length(regexall("-v /var/lib/caddy-data:/data", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "ci-proxy must bind-mount its Let's Encrypt cert storage onto the host -- otherwise every stop/start (T-019) or reboot re-issues a certificate, and LE's production CA rate-limits duplicate certs to 5/week"
-  }
-
-  # --- Review round 1, finding 1: a catch-all answers non-2xx to any Host
-  # that isn't ci_hostname ----------------------------------------------------
-  assert {
-    condition = length(regexall(":443 \\{[^}]*respond 421", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The Caddyfile must answer a mismatched-Host request on :443 with a non-2xx (421) -- otherwise a misdirected delivery looks like success to GitHub instead of a failure the doorbell would redeliver"
-  }
-
-  assert {
-    condition = length(regexall(":80 \\{[^}]*respond 421", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The Caddyfile must answer a mismatched-Host request on :80 with a non-2xx (421) too"
-  }
-
-  # --- Review round 1, finding 6: no manual header_up lines left -----------
-  assert {
-    condition = length(regexall("header_up", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 0
-    error_message = "No manual header_up lines should remain in the Caddyfile -- Caddy's reverse_proxy defaults already set X-Forwarded-For/Proto/Host correctly"
-  }
-
-  # --- Review round 1, finding 2: the re-run timer is present and enabled --
-  assert {
-    condition = length(regexall("ci-dns-updater\\.timer", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 2 # the unit file is written under its own name, and "systemctl enable --now ci-dns-updater.timer" enables it
-    error_message = "ci-dns-updater.timer must be written and enabled, re-running the updater periodically (not just once at boot)"
-  }
-
-  assert {
-    condition = length(regexall("StartLimitIntervalSec=600", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "ci-dns-updater.service must set a start limit (StartLimitIntervalSec, in [Unit]) alongside Restart=on-failure"
-  }
-
-  assert {
-    condition = length(regexall("OnUnitActiveSec=5min", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The timer must re-run every 5 minutes"
-  }
-
-  # --- Review round 1, finding 3: Restart=on-failure with a start limit, and
-  # the boot-time enable is not allowed to abort the rest of provisioning --
-  assert {
-    condition = length(regexall("Restart=on-failure", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "ci-dns-updater.service must set Restart=on-failure"
-  }
-
-  assert {
-    condition = length(regexall("if ! systemctl enable --now ci-dns-updater\\.service", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "the boot-time `systemctl enable --now ci-dns-updater.service` must be guarded (an `if !`) so a failure logs loudly but does not abort the rest of provisioning under set -e"
-  }
-
-  # --- Review round 2, finding 2(a): the ExecStop sentinel unit ------------
-  assert {
-    condition = length(regexall("ExecStop=/usr/local/bin/ci-dns-sentinel\\.sh", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "ci-dns-sentinel.service must run scripts/ci-dns-sentinel.sh on ExecStop"
-  }
-
-  assert {
-    condition = length(regexall("RemainAfterExit=yes", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "ci-dns-sentinel.service must set RemainAfterExit=yes -- otherwise it's never 'active' for ExecStop to fire against"
-  }
-
-  # --- T-041: ExecStop must not race networking down. systemd stops units in
-  # the REVERSE of their start order, so After=network-online.target on this
-  # unit keeps networkd/resolved up until ExecStop (scripts/ci-dns-sentinel.sh)
-  # returns -- Before=docker.service alone only governed START order. Scoped
-  # to the ci-dns-sentinel.service block specifically (not just "somewhere in
-  # the file"): ci-dns-updater.service already carries the same two lines, so
-  # an unscoped count would pass even if this unit never got them.
-  assert {
-    condition = length(regexall("Description=UPSERT ci\\.example\\.test to a sentinel on shutdown[^\\n]*\\nWants=network-online\\.target\\nAfter=network-online\\.target\\nBefore=docker\\.service", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "ci-dns-sentinel.service must set Wants=network-online.target and After=network-online.target (in that order, ahead of Before=docker.service) so ExecStop runs before networking is torn down (T-041)"
-  }
-
-  # --- Review round 2, finding 4: the local, never-proxied health path -----
-  assert {
-    condition = length(regexall("http://localhost \\{[^}]*__ci_proxy_health", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The Caddyfile must serve /__ci_proxy_health on the Host: localhost block, never proxied, so the routing probe has zero TLS/cert/DNS dependency"
-  }
-
-  assert {
-    condition = length(regexall("-H \"Host: localhost\" \"http://127\\.0\\.0\\.1/__ci_proxy_health\"", templatefile("${path.module}/templates/jenkins-provision.sh", {
-      aws_region             = var.aws_region
-      project_name           = var.project_name
-      environment            = var.environment
-      ci_hostname            = "ci.example.test"
-      route53_zone_id        = "Z00000000000000000000"
-      admin_username         = var.drone_admin_username
-      jenkins_admin_username = var.jenkins_admin_username
-      dns_updater_script     = "#!/usr/bin/env bash\necho fixture\n"
-      dns_sentinel_script    = "#!/usr/bin/env bash\necho sentinel-fixture\n"
-      dns_sentinel_ip        = "192.0.2.1"
-    }))) == 1
-    error_message = "The routing probe must hit the local health path over plain HTTP with an explicit Host header, not the TLS/--resolve-based /jenkins/login probe (which depends on a certificate existing)"
-  }
-
-  # --- T-009: the fetch-and-execute path ------------------------------------
-  # The script is executed as root on a host mounting the docker socket, so a
-  # publicly readable bucket would be a direct route to controlling what that
-  # host runs.
-  assert {
-    condition = (aws_s3_bucket_public_access_block.ci_artifacts.block_public_acls &&
-      aws_s3_bucket_public_access_block.ci_artifacts.block_public_policy &&
-      aws_s3_bucket_public_access_block.ci_artifacts.ignore_public_acls &&
-    aws_s3_bucket_public_access_block.ci_artifacts.restrict_public_buckets)
-    error_message = "The CI artifact bucket must block public access on all four flags -- it holds a script executed as root on the CI host"
-  }
-
-  # It must never be staged in the bucket CloudFront serves to the internet.
-  assert {
-    condition     = aws_s3_bucket.ci_artifacts.bucket != aws_s3_bucket.frontend.bucket
-    error_message = "The provisioning script must NOT be staged in the public frontend bucket"
-  }
-
-  # NOT asserted, and worth saying why rather than leaving the gap silent:
-  # that the S3 object and the SSM-pushed script carry identical bytes, and
-  # that the SSM checksum is the hash of what was uploaded. Both are true by
-  # construction -- all three read local.jenkins_provision_script, the single
-  # expression that renders the script -- but neither is checkABLE here,
-  # because that local embeds aws_eip.drone.public_ip and is therefore unknown
-  # under `command = plan` (the limitation this file documents in several other
-  # places). The real proof is the boot itself: a mismatch makes the bootstrap
-  # stub abort with "checksum mismatch" and the box comes up with no Jenkins,
-  # which stage 4 exercises directly.
-
-  # Single object, not the bucket, not s3:*.
-  assert {
-    condition     = join(",", local.drone_provision_s3_actions) == "s3:GetObject"
-    error_message = "The CI host's new S3 grant must be s3:GetObject only -- it is read-only access to one artifact"
-  }
-
-  # --- Ruling 3: the security boundary -------------------------------------
-  # authorization_type = NONE is forced (GitHub cannot sign SigV4), so this
-  # assertion is not "NONE is fine" -- it pins the fact that the HMAC check in
-  # the handler is the ONLY thing standing in front of ec2:StartInstances.
-  assert {
-    condition     = aws_lambda_function_url.ci_doorbell.authorization_type == "NONE"
-    error_message = "The doorbell Function URL must be NONE (GitHub cannot sign SigV4); its authentication is the HMAC check in lambda/ci_doorbell/index.py"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["WEBHOOK_SECRET_PARAM"] == aws_ssm_parameter.github_webhook_secret.name
-    error_message = "The doorbell must read its HMAC secret from the SSM parameter, never from a literal"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.github_webhook_secret.type == "SecureString"
-    error_message = "The GitHub webhook secret must be a SecureString"
-  }
-
-  # The permission whose ABSENCE made the whole deployment inert: without an
-  # unconditioned lambda:InvokeFunction grant, this account's default Lambda
-  # public-access block makes the Function URL answer 403 and the handler is
-  # never reached. Every other assertion in this file passed while that was
-  # broken, which is why it gets one of its own.
-  #
-  # Review round 1 (0567f6a) tried narrowing this to lambda:InvokeFunctionUrl
-  # (finding 1(a)); round 2 (driver review) reverted it -- T-019 (bd65353)
-  # verified LIVE that InvokeFunctionUrl alone is insufficient on this
-  # account. Pinned to InvokeFunction here so a future edit fails THIS
-  # assertion at review time instead of silently 403ing the doorbell on the
-  # next apply. Finding 1's real fix is the async task's own HMAC (see
-  # lambda/ci_doorbell/index.py's _async_task_signature_ok).
-  assert {
-    condition     = aws_lambda_permission.ci_doorbell_public_invoke.action == "lambda:InvokeFunction"
-    error_message = "The doorbell needs an unconditioned lambda:InvokeFunction grant or its Function URL returns 403 without ever invoking the handler (verified live 2026-08-19, T-019 bd65353; re-verified round 2 of T-034's review -- do not narrow this to InvokeFunctionUrl without a live test)"
-  }
-
-  assert {
-    condition     = aws_lambda_permission.ci_doorbell_public_invoke.principal == "*"
-    error_message = "The public invoke grant must be Principal=* -- the auth boundary is the HMAC check in index.py (both the webhook body signature and, for the async task, its own signature), not this permission"
-  }
-
-  # The doorbell may START the one instance and nothing else.
-  #
-  # NOT asserted on the rendered policy JSON, and this is a real limitation
-  # rather than laziness: the documents interpolate computed ARNs (the instance
-  # id, the SSM parameter ARNs), so under `command = plan` the whole string is
-  # unknown and jsondecode cannot run on it. The unlike-for-unlike case already
-  # in this file (mysql_backup_upload) works only because S3 bucket ARNs ARE
-  # known at plan time. The action lists are therefore lifted into named locals
-  # in ci-on-demand.tf, which is where the security property actually lives and
-  # is what these assertions pin. Resource scoping is covered by code review
-  # and by stage-4 verification against the live policy.
-  assert {
-    condition     = join(",", local.ci_doorbell_ec2_actions) == "ec2:StartInstances"
-    error_message = "The doorbell role must grant StartInstances only -- no terminate, modify, or run (T-019 ruling 3)"
-  }
-
-  assert {
-    condition     = join(",", local.ci_reaper_ec2_actions) == "ec2:StopInstances"
-    error_message = "The reaper role must grant StopInstances only"
-  }
-
-  # The check that actually catches a careless edit: whatever the action lists
-  # grow into, they may never intersect the destructive set.
-  assert {
-    condition = length(setintersection(
-      toset(concat(local.ci_doorbell_ec2_actions, local.ci_reaper_ec2_actions)),
-      toset(local.ci_forbidden_ec2_actions)
-    )) == 0
-    error_message = "Neither CI Lambda may grant terminate/modify/run on EC2 -- the worst a compromised public endpoint should manage is turning the CI box on or off"
-  }
-
-  # --- Ruling 2: the reaper -------------------------------------------------
-  assert {
-    condition     = aws_cloudwatch_event_rule.ci_reaper.schedule_expression == "rate(5 minutes)"
-    error_message = "The reaper must run on a schedule; without it the host never stops and the task saves nothing"
-  }
-
-  # Asserted by rule name, not by ARN: Lambda ARNs are computed, so an
-  # ARN-to-ARN comparison is unknown under `command = plan` (same limitation
-  # documented throughout this file).
-  assert {
-    condition     = aws_cloudwatch_event_target.ci_reaper.rule == aws_cloudwatch_event_rule.ci_reaper.name
-    error_message = "The reaper's schedule target must be attached to the reaper rule"
-  }
-
-  assert {
-    condition     = aws_lambda_permission.ci_reaper_events.function_name == aws_lambda_function.ci_reaper.function_name
-    error_message = "EventBridge must be granted lambda:InvokeFunction on the reaper -- without it the schedule fires and nothing happens"
-  }
-
-  assert {
-    condition     = tonumber(aws_lambda_function.ci_reaper.environment[0].variables["IDLE_WINDOW_MINUTES"]) >= 15
-    error_message = "The idle window must stay long enough that a gap between pipeline stages cannot trip it (T-019 ruling 2)"
-  }
-
-  # The reaper reads Jenkins' password from SSM. Asserted via the Lambda's
-  # env var rather than the policy document, for the unknown-ARN reason above:
-  # the parameter NAME is known at plan time, the ARN is not.
-  assert {
-    condition     = aws_lambda_function.ci_reaper.environment[0].variables["JENKINS_PASSWORD_PARAM"] == aws_ssm_parameter.jenkins_admin_password.name
-    error_message = "The reaper must read the Jenkins admin password from SSM, never from a literal or an env var baked at apply"
-  }
-
-  # Cost guard: this task exists to save money, so it must not add a billed
-  # always-on resource. A Function URL is free; an API Gateway in front of the
-  # same Lambda would not be. Asserting the URL is attached to the doorbell is
-  # the plan-time proxy for "no gateway was introduced".
-  #
-  # NOT asserted, same unknown-until-apply limitation already documented above
-  # for aws_eip.drone.public_ip: aws_lambda_function_url.ci_doorbell.function_url
-  # itself is computed at apply, so its value cannot be checked under
-  # `command = plan`. Do not add a `command = apply` run block to force it --
-  # that would create real AWS resources from a test suite that is meant to run
-  # offline. The URL is verified for real at stage 4, by ringing it.
-  assert {
-    condition     = aws_lambda_function_url.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
-    error_message = "The Function URL must be attached to the doorbell Lambda -- an API Gateway would add cost this task cannot justify"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# T-034 H1 correction -- the doorbell redelivers Drone's own (previously
-# GitHub-signed) webhook deliveries for erfeamor/cv-admin-react instead of
-# forwarding the payload itself, and self-invokes (InvocationType=Event) to
-# do the slow work (start the box, wait for /healthz, call GitHub) outside
-# GitHub's 10-second webhook budget. Cases 12-14 of the plan; case 13's IAM
-# resource scoping (Resource = aws_lambda_function.ci_doorbell.arn) is NOT
-# checkable here -- same unknown-until-apply limitation as every other IAM
-# policy assertion in this file (the ARN is computed) -- and is covered by
-# scripts/check-static.sh instead (case 15).
-# ---------------------------------------------------------------------------
-run "t034_doorbell_redelivery" {
-  command = plan
-
-  # --- Case 12: the hooks token lives outside ci/*, as a SecureString ------
-  assert {
-    condition     = aws_ssm_parameter.github_hooks_token.type == "SecureString"
-    error_message = "The GitHub hooks token must be a SecureString"
-  }
-
-  assert {
-    condition     = startswith(aws_ssm_parameter.github_hooks_token.name, "/${var.project_name}/${var.environment}/doorbell/")
-    error_message = "github_hooks_token must live outside ci/* -- the CI host's role only reads ci/*, and this token must stay unreadable from a build container running on it (same reasoning as drone_deploy's key, iam.tf)"
-  }
-
-  # --- Case 13: self-invoke is InvokeFunction only, and only the doorbell's
-  # own actions grow to include it (never the reaper's) ---------------------
-  assert {
-    condition     = join(",", local.ci_doorbell_lambda_actions) == "lambda:InvokeFunction"
-    error_message = "The doorbell's self-invoke grant must be InvokeFunction only"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["GITHUB_HOOKS_TOKEN_PARAM"] == aws_ssm_parameter.github_hooks_token.name
-    error_message = "The doorbell must read the hooks token from SSM by name, never from a literal"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["SELF_FUNCTION_NAME"] == aws_lambda_function.ci_doorbell.function_name
-    error_message = "The doorbell must self-invoke by its OWN function name -- a literal or mismatched name would either fail at runtime or (worse) target a different function"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["REDELIVER_REPOS"] == "erfeamor/cv-admin-react"
-    error_message = "Only erfeamor/cv-admin-react gets the redeliver path (H1) -- Drone verifies each webhook against its own per-repo secret, so nothing this handler could send it directly would pass that check, and the Jenkins repos already have periodicFolderTrigger discovery"
-  }
-
-  # --- Case 14: the waiting invocation's timeout ----------------------------
-  # Review round 1, finding 4 replaced the bare ">= 540" with the actual
-  # budget the timeout is built from (local.ci_doorbell_healthz_timeout_seconds
-  # + local.ci_doorbell_github_work_budget_seconds, ci-on-demand.tf) -- see
-  # the t034_review_round1 run below for the budget's own assertions.
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.timeout == local.ci_doorbell_timeout_seconds
-    error_message = "aws_lambda_function.ci_doorbell.timeout must come from local.ci_doorbell_timeout_seconds, not a bare literal that could silently drift from the healthz+GitHub-work budget it represents"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# T-034 review round 1 (0567f6a) findings 4, 7 -- async retries are disabled,
-# the timeout budget is named and bounded, and the reaper's grace variable is
-# actually wired to the Lambda that reads it. Finding 1(a) (the public invoke
-# permission) was tried here as lambda:InvokeFunctionUrl-only and REVERTED in
-# round 2 (driver review) -- T-019 (bd65353) verified live that this account
-# needs the unconditioned InvokeFunction grant; that assertion now lives back
-# in the "ci_on_demand" run above, pinned to InvokeFunction. Finding 1's real
-# fix is the async task's own HMAC signature -- see the
-# t034_async_task_signature run in test_ci_doorbell.py (code-level, not
-# Terraform: the signature covers repo+wake_time, not any IAM-visible
-# property). Finding 10 (one local for the CI host's public address) is a
-# text-level property (aws_eip.drone.public_ip is unknown under
-# `command = plan`, same limitation this file documents throughout) and is
-# covered by scripts/check-static.sh instead, not here.
-# ---------------------------------------------------------------------------
-run "t034_review_round1" {
-  command = plan
-
-  # --- Finding 4: async retries disabled, and the timeout budget -----------
-  assert {
-    condition     = aws_lambda_function_event_invoke_config.ci_doorbell.function_name == aws_lambda_function.ci_doorbell.function_name
-    error_message = "The event-invoke config must target the doorbell function"
-  }
-
-  assert {
-    condition     = aws_lambda_function_event_invoke_config.ci_doorbell.maximum_retry_attempts == 0
-    error_message = "Async retries must stay disabled -- a Lambda-initiated retry of the wake+redeliver task would re-run redeliver_failed_deliveries, defeating findings 2/3's single-pass dedup guarantees"
-  }
-
-  # Review round 3, finding 6: the budget grew from two named pieces to four
-  # -- the original sum undercounted the worst-case async-task path (a
-  # `stopping` instance waited out, THEN the full healthz wait; plus one
-  # healthz probe's own request-level overshoot). Review round 2, finding
-  # 2(b) added a fifth: the DNS-convergence wait now runs before healthz
-  # too. See the locals' comment in ci-on-demand.tf for what each piece
-  # mirrors in lambda/ci_doorbell/index.py.
-  assert {
-    condition = local.ci_doorbell_timeout_seconds == (
-      local.ci_doorbell_stopping_wait_seconds +
-      local.ci_doorbell_dns_wait_seconds +
-      local.ci_doorbell_healthz_timeout_seconds +
-      local.ci_doorbell_healthz_probe_timeout_seconds +
-      local.ci_doorbell_github_work_budget_seconds
-    )
-    error_message = "local.ci_doorbell_timeout_seconds must equal the sum of all five named pieces -- a bare override would hide the budget this number is supposed to make legible"
-  }
-
-  assert {
-    condition     = local.ci_doorbell_dns_wait_seconds == 120
-    error_message = "The DNS-convergence wait budget drifted from the documented 120s (doubled from 60s, live failure 2026-09-30: a cold Lambda's resolver cache outlasted the old 60s ceiling)"
-  }
-
-  assert {
-    condition     = local.ci_doorbell_timeout_seconds <= 900
-    error_message = "900s is Lambda's hard ceiling on any function timeout; the budget must never exceed it"
-  }
-
-  # --- Finding 7: the reaper's grace variable is actually wired ------------
-  assert {
-    condition     = aws_lambda_function.ci_reaper.environment[0].variables["POST_START_GRACE_MINUTES"] == tostring(var.ci_post_start_grace_minutes)
-    error_message = "POST_START_GRACE_MINUTES must be wired from var.ci_post_start_grace_minutes -- the variable existed but was never actually passed to the reaper Lambda (review round 1, finding 7), so it silently did nothing"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# T-034 phase 2 + T-033: a stable DNS name (dns.tf) replaces the EIP, and
-# Caddy replaces nginx to terminate TLS. Cases 1, 3, 5, 6 of the plan.
-# Case 2 (the DNS-update IAM statement's exact shape: one action, the zone
-# ARN, all three conditions) is a check-static.sh check (check 10) instead,
-# per the plan -- even though data.aws_route53_zone.ci.arn is a MOCKED data
-# source (genuinely known here, unlike every computed resource ARN
-# elsewhere in this file), for consistency with how every other IAM
-# exactness check in this module is done. Case 4 (the SG) needed no new
-# assertion -- the existing "exactly 2 ingress rules" assertion above
-# already covers "unchanged". Case 7 (no aws_eip.drone reference anywhere)
-# only makes sense AFTER the EIP-removal commit; asserting it here, while
-# aws_eip.drone still legitimately exists (dns.tf's initial `records`
-# value), would be checking the wrong commit.
-# ---------------------------------------------------------------------------
-run "t034_phase2_dns_tls" {
-  command = plan
-
-  # --- Case 1: the record's shape -------------------------------------------
-  assert {
-    condition     = aws_route53_record.ci.zone_id == data.aws_route53_zone.ci.zone_id
-    error_message = "The CI A record must live in the zone dns.tf reads, not a literal zone id"
-  }
-
-  assert {
-    condition     = aws_route53_record.ci.name == var.ci_hostname
-    error_message = "The CI A record's name must be var.ci_hostname, not a second literal that could drift from it"
-  }
-
-  assert {
-    condition     = aws_route53_record.ci.type == "A"
-    error_message = "The CI record must be an A record -- the boot updater UPSERTs an IPv4 address"
-  }
-
-  assert {
-    condition     = aws_route53_record.ci.ttl == 60
-    error_message = "TTL must be 60s -- short enough that a stop/start's new IP propagates quickly, per H1"
-  }
-
-  # ignore_changes = [records] is NOT visible here (a lifecycle
-  # meta-argument, like aws_instance.drone's own ignore_changes elsewhere in
-  # this file) -- covered by scripts/check-static.sh check 10 instead.
-
-  # Review round 1, finding 4: without allow_overwrite = true, creating this
-  # record would fail outright if one already existed at this name/type
-  # (e.g. a manual record from before Terraform managed it) -- UPSERT
-  # semantics all the way down, matching the boot updater's own.
-  assert {
-    condition     = aws_route53_record.ci.allow_overwrite == true
-    error_message = "aws_route53_record.ci must set allow_overwrite = true"
-  }
-
-  # --- Review round 1, finding 5: the read-only IAM additions --------------
-  assert {
-    condition     = join(",", local.ci_dns_read_actions) == "route53:ListResourceRecordSets"
-    error_message = "The updater's idempotency check needs exactly route53:ListResourceRecordSets"
-  }
-
-  assert {
-    condition     = join(",", local.ci_dns_get_change_actions) == "route53:GetChange"
-    error_message = "The updater's INSYNC wait needs exactly route53:GetChange"
-  }
-
-  assert {
-    condition     = join(",", local.ci_dns_get_change_resources) == "arn:aws:route53:::change/*"
-    error_message = "route53:GetChange has no zone- or record-scoped ARN -- change/* is the narrowest Resource this action can ever take (documented in iam.tf)"
-  }
-
-  # --- Case 3: no wildcard names/types/zone in the DNS-update IAM grant ----
-  assert {
-    condition     = join(",", local.ci_dns_update_record_names) == var.ci_hostname
-    error_message = "The DNS-update IAM condition must name exactly var.ci_hostname, never a wildcard"
-  }
-
-  assert {
-    condition     = join(",", local.ci_dns_update_record_types) == "A"
-    error_message = "The DNS-update IAM condition must allow only the A record type"
-  }
-
-  assert {
-    condition     = join(",", local.ci_dns_update_actions_types) == "UPSERT"
-    error_message = "The DNS-update IAM condition must allow only UPSERT, never DELETE or CREATE"
-  }
-
-  # --- Case 5: ci_public_host is the hostname; URLs are https --------------
-  assert {
-    condition     = local.ci_public_host == var.ci_hostname
-    error_message = "local.ci_public_host must be var.ci_hostname now that the EIP is gone -- see ci-on-demand.tf"
-  }
-
-  assert {
-    condition     = startswith(aws_lambda_function.ci_doorbell.environment[0].variables["DRONE_HEALTHZ_URL"], "https://")
-    error_message = "DRONE_HEALTHZ_URL must be https:// now that Caddy terminates TLS (T-033)"
-  }
-
-  assert {
-    condition     = startswith(aws_lambda_function.ci_reaper.environment[0].variables["JENKINS_BASE_URL"], "https://")
-    error_message = "JENKINS_BASE_URL must be https:// now that Caddy terminates TLS (T-033)"
-  }
-
-  # --- Case 6: outputs are https --------------------------------------------
-  # Knowable here (unlike before phase 2): drone_server_url no longer
-  # embeds aws_eip.drone.public_ip, so it's no longer unknown-until-apply.
-  assert {
-    condition     = output.drone_server_url == "https://${var.ci_hostname}"
-    error_message = "drone_server_url must be https and must use the DNS name, not the (now-removed) EIP"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# T-034 phase 2 review round 2: the DNS sentinel (finding 2) and the
-# doorbell's DNS-convergence wait (finding 2(b)). The reaper's new grant
-# reuses iam.tf's drone_dns_update locals (already asserted exact there);
-# what's new here is that ci_reaper's OWN policy actually includes a
-# statement built from them, and both Lambdas' new env vars are wired.
-# ---------------------------------------------------------------------------
-run "t034_phase2_dns_sentinel" {
-  command = plan
-
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["CI_HOSTNAME"] == var.ci_hostname
-    error_message = "The doorbell must read CI_HOSTNAME from var.ci_hostname, never a literal, for its DNS-convergence wait"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["DNS_WAIT_TIMEOUT_SECONDS"] == tostring(local.ci_doorbell_dns_wait_seconds)
-    error_message = "DNS_WAIT_TIMEOUT_SECONDS must come from the named budget local, not a second literal"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_reaper.environment[0].variables["CI_HOSTNAME"] == var.ci_hostname
-    error_message = "The reaper must read CI_HOSTNAME from var.ci_hostname for its post-stop sentinel UPSERT"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_reaper.environment[0].variables["ROUTE53_ZONE_ID"] == data.aws_route53_zone.ci.zone_id
-    error_message = "The reaper must read ROUTE53_ZONE_ID from the zone data source, never a literal"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_reaper.environment[0].variables["DNS_SENTINEL_IP"] == local.ci_dns_sentinel_ip
-    error_message = "The reaper's sentinel value must be local.ci_dns_sentinel_ip -- the same one dns.tf's placeholder and the ExecStop unit use"
-  }
-
-  assert {
-    condition     = local.ci_dns_sentinel_ip == "192.0.2.1"
-    error_message = "The DNS sentinel must be TEST-NET-1 (192.0.2.1, RFC 5737) -- guaranteed never to route anywhere real"
-  }
-
-  # The reaper's new statement itself, in the same style as the doorbell
-  # Caddyfile-parity checks: assert against the ACTUAL rendered policy is
-  # not possible (data.aws_route53_zone.ci.arn is a computed-looking
-  # reference even though mocked -- same reasoning iam.tf's own comment
-  # documents), so this reuses the SAME named locals iam.tf's grant already
-  # asserts exactly elsewhere in this file; what matters here is only that
-  # ci_reaper's policy resource references them at all, which check-static
-  # (check 15) verifies textually.
-
-  # --- Live failure, 2026-09-30: the doorbell's own authoritative-DNS read -
-  # (wait_for_dns_to_match_instance now reads Route 53 directly instead of
-  # trusting the Lambda's own, cacheable, local resolver). The grant's exact
-  # shape (one read-only action, the zone ARN only, no wildcard) is
-  # scripts/check-static.sh's job (same "unknown until apply" limitation the
-  # comment above already explains for the reaper's own grant) -- what's
-  # asserted here is only that the doorbell actually has ROUTE53_ZONE_ID
-  # wired from the zone data source, never a literal.
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["ROUTE53_ZONE_ID"] == data.aws_route53_zone.ci.zone_id
-    error_message = "The doorbell must read ROUTE53_ZONE_ID from the zone data source, never a literal -- it needs this for its own authoritative-DNS read (live failure, 2026-09-30)"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# T-034 phase 2 review round 1, finding 10: var.ci_hostname's validation
-# block, checked the way `terraform test` checks any validation -- a `plan`
-# run whose variables are EXPECTED to fail, asserted via `expect_failures`.
-# ---------------------------------------------------------------------------
-run "t034_ci_hostname_validation" {
-  command = plan
-
-  variables {
-    ci_hostname = "CI.Erfeamor.com" # uppercase -- must be rejected
-  }
-
-  expect_failures = [var.ci_hostname]
-}
-
-run "t034_ci_hostname_validation_trailing_dot" {
-  command = plan
-
-  variables {
-    ci_hostname = "ci.erfeamor.com." # trailing dot -- must be rejected
-  }
-
-  expect_failures = [var.ci_hostname]
-}
-
-run "t034_ci_hostname_validation_single_label" {
-  command = plan
-
-  variables {
-    ci_hostname = "localhost" # single label, not a valid FQDN here -- must be rejected
-  }
-
-  expect_failures = [var.ci_hostname]
-}
-
-# ---------------------------------------------------------------------------
-# T-007 -- CI host replaced onto a plain AL2023 AMI with a measured root,
-# IMDSv2 hardening, and DRONE_DATABASE_SECRET. Cases 1-3 and 6 are knowable
-# under `command = plan`: the AMI filter, root_block_device and
-# metadata_options are all explicit config on aws_instance.drone (not
-# AWS-computed), and the rendered user_data is a pure function of the
-# templatefile() inputs. Case 4 (the SSM param's value) needs `command =
-# apply` -- random_password.result is generated at Create time, so it is
-# unknown-until-apply even under mock_provider (same class of limitation as
-# aws_eip.drone.public_ip elsewhere in this file). Case 5 (lifecycle
-# ignore_changes) and case 8 (the Lambda env vars, which reference
-# aws_instance.drone.id -- a genuinely AWS-computed attribute, unknown at
-# plan for a not-yet-created instance) aren't visible to `terraform test` at
-# all -- both are covered by scripts/check-static.sh instead, which checks
-# the source text for exactly this class of gap.
-# ---------------------------------------------------------------------------
-run "t007_ci_host_hardening" {
-  command = plan
-
-  # Case 1: the premise correction (2026-09-25) established that ci.tf's
-  # aws_instance.drone already resolves data.aws_ami.al2023 -- the SAME
-  # plain-AL2023 data source domain_service uses -- and that ignore_changes
-  # alone is what has kept the live host on the old ECS-optimized image.
-  # Nothing about the filter itself needed to change; this pins that so a
-  # future edit can't silently point either instance back at an
-  # ECS-optimized filter without failing here.
-  # data.aws_ami.al2023.filter is a set of objects (no addressable index),
-  # so every check below flattens across the whole set rather than indexing
-  # element 0.
-  assert {
-    condition     = anytrue([for f in data.aws_ami.al2023.filter : f.name == "name"])
-    error_message = "data.aws_ami.al2023 must filter on the AMI name"
-  }
-
-  assert {
-    condition     = alltrue(flatten([for f in data.aws_ami.al2023.filter : [for v in f.values : !can(regex("ecs", v))]]))
-    error_message = "data.aws_ami.al2023's filter values must not match the ECS-optimized AMI variant"
-  }
-
-  assert {
-    condition     = contains(flatten([for f in data.aws_ami.al2023.filter : f.values]), "al2023-ami-2023.*-x86_64")
-    error_message = "data.aws_ami.al2023 must keep the plain AL2023 filter -- a looser pattern also matches the ECS-optimized variant"
-  }
-
-  assert {
-    condition     = aws_instance.drone.ami == data.aws_ami.al2023.id
-    error_message = "aws_instance.drone must resolve its AMI from the plain AL2023 data source"
-  }
-
-  # Case 2: explicit, measured root -- not the plain AMI's 8 GB default.
-  assert {
-    condition     = aws_instance.drone.root_block_device[0].volume_size == 20
-    error_message = "aws_instance.drone's root volume must be sized to 20 GB (T-007 H1 decision 2, from the ~17 GiB measured in use) -- the plain AL2023 AMI defaults to 8 GB, which would not fit today's contents"
-  }
-
-  assert {
-    condition     = aws_instance.drone.root_block_device[0].volume_type == "gp3"
-    error_message = "aws_instance.drone's root volume must be gp3, matching the rest of this module's convention"
-  }
-
-  assert {
-    condition     = aws_instance.drone.root_block_device[0].encrypted == true
-    error_message = "aws_instance.drone's root volume must be encrypted at rest"
-  }
-
-  # Case 3: IMDSv2 required, hop limit 1 (T-007 H1 decision 3 / T-005).
-  assert {
-    condition     = aws_instance.drone.metadata_options[0].http_tokens == "required"
-    error_message = "aws_instance.drone must require IMDSv2 tokens"
-  }
-
-  assert {
-    condition     = aws_instance.drone.metadata_options[0].http_put_response_hop_limit == 1
-    error_message = "aws_instance.drone's metadata hop limit must be 1, so a container cannot reach IMDS through a Docker network hop"
-  }
-
-  # Case 4 (plan-time half): the parameter exists, is a SecureString, and
-  # lives under ci/drone/ -- the value itself (traced to random_password,
-  # not a literal) needs `command = apply`, see the run below.
-  assert {
-    condition     = aws_ssm_parameter.drone_database_secret.type == "SecureString"
-    error_message = "DRONE_DATABASE_SECRET must be stored as a SecureString"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.drone_database_secret.name == "/${var.project_name}/${var.environment}/ci/drone/database-secret"
-    error_message = "DRONE_DATABASE_SECRET must live at ci/drone/database-secret -- under ci/*, so the Drone host's own instance role (drone_read_ci_parameters) can read it, matching every other Drone boot secret"
-  }
-
-  # Case 6 and case 7 (review round 1, finding 9: dropped from here, not
-  # duplicated): the <8 KB user_data wall against this exact templatefile()
-  # call is already asserted once, in "ci_on_demand" above -- re-asserting
-  # the identical computed value under a second name proves nothing extra
-  # and doubles the maintenance cost of the 8192 constant. Likewise
-  # `aws_instance.drone.user_data_replace_on_change != true` is already
-  # asserted in "plan_succeeds" above. Both keep working unchanged by this
-  # task; see those two run blocks instead of repeating them here.
-
-  # Review round 1, finding 9 -- RED FIRST: DRONE_DATABASE_SECRET must
-  # actually reach the drone-server container (not just exist in SSM), and
-  # the param() path it's read from must be the exact path segment that
-  # builds aws_ssm_parameter.drone_database_secret.name above
-  # ("drone/database-secret", under the ci/ prefix param() always
-  # prepends) -- a typo in either place would pass every other assertion in
-  # this run and still leave DRONE_DATABASE_SECRET unset or fetched from
-  # the wrong SSM path at boot.
-  assert {
-    condition = length(regexall("-e DRONE_DATABASE_SECRET=", templatefile("${path.module}/templates/drone-user-data.sh", {
-      aws_region     = var.aws_region
-      project_name   = var.project_name
-      environment    = var.environment
-      ci_hostname    = "203.0.113.10"
-      admin_username = var.drone_admin_username
-    }))) == 1
-    error_message = "templates/drone-user-data.sh must pass -e DRONE_DATABASE_SECRET to the drone-server container exactly once"
-  }
-
-  assert {
-    condition = length(regexall("param drone/database-secret", templatefile("${path.module}/templates/drone-user-data.sh", {
-      aws_region     = var.aws_region
-      project_name   = var.project_name
-      environment    = var.environment
-      ci_hostname    = "203.0.113.10"
-      admin_username = var.drone_admin_username
-    }))) == 1
-    error_message = "templates/drone-user-data.sh must read DRONE_DATABASE_SECRET via `param drone/database-secret` -- the same ci/drone/database-secret path aws_ssm_parameter.drone_database_secret.name builds"
-  }
-
-  # Review round 1, finding 9 -- RED FIRST: the prune timer must run the
-  # PO-decided commands (image/build-cache only, age-filtered, never
-  # containers/networks), never the broader `docker system prune`.
-  # Anchored on the literal `ExecStart=` prefix, not a bare substring search
-  # -- this script's own explanatory comments quote these exact commands by
-  # name (both the wanted ones and, in the "deliberately NOT" sentence, the
-  # unwanted one), so a substring-only search would double-count against
-  # the comment text and could never legitimately assert "0 occurrences" of
-  # the forbidden command below.
-  assert {
-    condition = (
-      length(regexall("ExecStart=/usr/bin/docker image prune -af --filter until=168h", templatefile("${path.module}/templates/drone-user-data.sh", {
-        aws_region     = var.aws_region
-        project_name   = var.project_name
-        environment    = var.environment
-        ci_hostname    = "203.0.113.10"
-        admin_username = var.drone_admin_username
-      }))) == 1 &&
-      length(regexall("ExecStart=/usr/bin/docker builder prune -af --filter until=168h", templatefile("${path.module}/templates/drone-user-data.sh", {
-        aws_region     = var.aws_region
-        project_name   = var.project_name
-        environment    = var.environment
-        ci_hostname    = "203.0.113.10"
-        admin_username = var.drone_admin_username
-      }))) == 1
-    )
-    error_message = "docker-prune.service must run `docker image prune -af --filter until=168h` and `docker builder prune -af --filter until=168h` as ExecStart lines (PO decision, review round 1 finding 3)"
-  }
-
-  assert {
-    condition = length(regexall("ExecStart=.*docker system prune", templatefile("${path.module}/templates/drone-user-data.sh", {
-      aws_region     = var.aws_region
-      project_name   = var.project_name
-      environment    = var.environment
-      ci_hostname    = "203.0.113.10"
-      admin_username = var.drone_admin_username
-    }))) == 0
-    error_message = "docker-prune.service must not run `docker system prune` -- it also removes stopped containers and unused networks, not just images/build cache (review round 1, finding 3)"
-  }
-
-  assert {
-    condition = (
-      length(regexall("After=docker.service", templatefile("${path.module}/templates/drone-user-data.sh", {
-        aws_region     = var.aws_region
-        project_name   = var.project_name
-        environment    = var.environment
-        ci_hostname    = "203.0.113.10"
-        admin_username = var.drone_admin_username
-      }))) == 1 &&
-      length(regexall("Requires=docker.service", templatefile("${path.module}/templates/drone-user-data.sh", {
-        aws_region     = var.aws_region
-        project_name   = var.project_name
-        environment    = var.environment
-        ci_hostname    = "203.0.113.10"
-        admin_username = var.drone_admin_username
-      }))) == 1
-    )
-    error_message = "docker-prune.service must declare After=docker.service and Requires=docker.service"
-  }
-}
-
-# Case 4 (value half): random_password.result is generated at apply, so this
-# needs `command = apply` -- safe under mock_provider (aws_ssm_parameter's
-# create is mocked; random_password computes locally, no network either
-# way). Scoped to just these two resources so null_resource.jenkins_provision
-# (ci.tf) -- whose local-exec shells out to real `aws ssm` regardless of the
-# AWS provider being mocked -- is never reached, same rationale as
-# "backup_iam_scoping" above.
-run "t007_drone_database_secret_value" {
-  command = apply
-
-  plan_options {
-    target = [
-      aws_ssm_parameter.drone_database_secret,
-    ]
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.drone_database_secret.value == random_password.drone_database_secret.result
-    error_message = "aws_ssm_parameter.drone_database_secret must store random_password.drone_database_secret.result, not a tfvars literal or a separately-typed value"
-  }
-
-  assert {
-    condition     = length(random_password.drone_database_secret.result) == 32
-    error_message = "random_password.drone_database_secret must generate a 32-character (32-byte ASCII) secret -- the format Drone's DRONE_DATABASE_SECRET expects"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# T-008 -- the drone-deploy IAM user's own access key moves into Terraform +
-# SSM (iam.tf, ssm.tf), so the CI host's Drone SQLite stops being the only
-# copy of this credential. Everything here is known at plan time: the user's
-# `name` is a plain variable interpolation (no AWS-generated ARN involved),
-# and the two SSM parameter names/types are literal too.
-# ---------------------------------------------------------------------------
-run "drone_deploy_credentials" {
-  command = plan
-
-  # Case 1, RED FIRST: the access key attaches to the SAME existing user
-  # that already carries the frontend-deploy policy -- not a new/parallel
-  # IAM identity.
-  assert {
-    condition     = aws_iam_access_key.drone_deploy.user == aws_iam_user.drone_deploy.name
-    error_message = "aws_iam_access_key.drone_deploy must attach to aws_iam_user.drone_deploy, not a different or new IAM user"
-  }
-
-  # Case 2, RED FIRST: both parameters are SecureStrings...
-  assert {
-    condition     = aws_ssm_parameter.drone_deploy_access_key_id.type == "SecureString"
-    error_message = "The drone-deploy access key ID must be stored as a SecureString"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.drone_deploy_secret_access_key.type == "SecureString"
-    error_message = "The drone-deploy secret access key must be stored as a SecureString"
-  }
-
-  # ...at the deploy/ path...
-  assert {
-    condition     = aws_ssm_parameter.drone_deploy_access_key_id.name == "/${var.project_name}/${var.environment}/deploy/drone-deploy/access-key-id"
-    error_message = "The access key ID parameter must live at the deploy/drone-deploy path"
-  }
-
-  assert {
-    condition     = aws_ssm_parameter.drone_deploy_secret_access_key.name == "/${var.project_name}/${var.environment}/deploy/drone-deploy/secret-access-key"
-    error_message = "The secret access key parameter must live at the deploy/drone-deploy path"
-  }
-
-  # ...NOT under ci/ -- that's what the Drone host's own instance role can
-  # read, and build containers on that host can reach it until T-007/T-005.
-  assert {
-    condition = (
-      !can(regex("/ci/", aws_ssm_parameter.drone_deploy_access_key_id.name)) &&
-      !can(regex("/ci/", aws_ssm_parameter.drone_deploy_secret_access_key.name))
-    )
-    error_message = "Neither drone-deploy SSM parameter may live under the ci/ prefix -- that's what the Drone host's own instance role can read"
-  }
-
-  # Negative half of case 2, the CI-host role: aws_iam_role_policy.
-  # drone_read_ci_parameters is scoped to ci/* only -- pin its Resource
-  # string exactly (fully known at plan, built only from variables, no
-  # AWS-generated ARN involved) so a later widening (e.g. to deploy/* or
-  # the whole tree) fails here instead of silently handing a build
-  # container its own deploy key.
-  assert {
-    condition     = jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement[0].Resource == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
-    error_message = "aws_iam_role_policy.drone_read_ci_parameters must stay scoped to ci/* -- widening it would let a build container on the Drone host read its own deploy key out of SSM"
-  }
-
-  # --- Security review round 2 (Medium, accepted): the APP host's own role
-  # is NOT isolated from deploy/ the same way -- aws_iam_role_policy.
-  # read_parameters (iam.tf) grants ssm:GetParameter* on the WHOLE
-  # /${project}/* tree (it legitimately needs db/, cognito/, observability/,
-  # etc across the tree), which already covered deploy/drone-deploy/* before
-  # this fix, and this host has no metadata_options (IMDSv1 on) and runs
-  # containers reachable by SSRF/RCE. "Outside ci/*" alone only isolates the
-  # CI host's role; this pair of assertions is what actually isolates the
-  # app host's role too, via an explicit Deny (which IAM always evaluates
-  # ahead of any Allow, regardless of statement order). Since T-005 the
-  # Allow is also narrowed (below); the Deny stays as defense in depth. ---
-  # T-005: the Allow is now the exact set of parameters the app host reads
-  # (bootstrap stub, provision script / cv-app.sh param(), backup script),
-  # one ARN each -- no tree-wide or prefix wildcard. Names are known at plan,
-  # so no apply is needed.
-  assert {
-    condition = toset(flatten([
-      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
-      s.Resource if s.Effect == "Allow"
-      ])) == toset([
-      for p in ["app/provision-sha256", "db/password", "cognito/issuer-uri", "bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope", "app/cors-allowed-origins"] :
-      "arn:aws:ssm:${var.aws_region}:123456789012:parameter/${var.project_name}/${var.environment}/${p}"
-    ])
-    error_message = "read_parameters must Allow exactly the 7 parameters the app host reads, by full ARN (T-005)"
-  }
-
-  assert {
-    condition = alltrue([
-      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
-      s.Effect == "Deny" || (
-        !anytrue([for r in flatten([try(s.Resource, [])]) : strcontains(r, "*")]) &&
-        !contains(s.Action, "ssm:GetParametersByPath")
-      )
-    ])
-    error_message = "read_parameters Allow must carry no wildcard Resource and no GetParametersByPath (T-005)"
-  }
-
-  assert {
-    condition = anytrue([
-      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
-      s.Effect == "Deny" && contains(s.Action, "ssm:GetParameter") && try(s.Resource, "") == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/deploy/*"
-    ])
-    error_message = "aws_iam_role_policy.read_parameters must explicit-Deny ssm:GetParameter* on the deploy/ prefix -- otherwise the app host's own role (IMDSv1, no metadata_options) can read the frontend deploy key via an SSRF/RCE in the domain service (T-008 security review round 2)"
-  }
-
-  # T-005 round 1: AmazonSSMManagedInstanceCore (attached to both roles) grants
-  # ssm:GetParameter(s) on "*", so the inline Allows alone narrow nothing.
-  # Each role therefore carries an explicit Deny + NotResource on the four
-  # read actions: everything outside the role's own parameter set is denied.
-  assert {
-    condition = anytrue([
-      for s in jsondecode(aws_iam_role_policy.read_parameters.policy).Statement :
-      s.Effect == "Deny" && try(s.Resource, null) == null &&
-      toset(s.Action) == toset(["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory"]) &&
-      toset(flatten([try(s.NotResource, [])])) == toset([
-        for p in ["app/provision-sha256", "db/password", "cognito/issuer-uri", "bff/service-client-id", "bff/service-client-secret", "bff/token-url", "bff/token-scope", "app/cors-allowed-origins"] :
-        "arn:aws:ssm:${var.aws_region}:123456789012:parameter/${var.project_name}/${var.environment}/${p}"
-      ])
-    ])
-    error_message = "read_parameters must Deny the four ssm read actions with NotResource = exactly the app host's 7 parameter ARNs (the managed AmazonSSMManagedInstanceCore grants GetParameter on * otherwise) (T-005 round 1)"
-  }
-
-  assert {
-    condition = anytrue([
-      for s in jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement :
-      s.Effect == "Deny" && try(s.Resource, null) == null &&
-      toset(s.Action) == toset(["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory"]) &&
-      toset(flatten([try(s.NotResource, [])])) == toset(["arn:aws:ssm:${var.aws_region}:123456789012:parameter/${var.project_name}/${var.environment}/ci/*"])
-    ])
-    error_message = "drone_read_ci_parameters must Deny the four ssm read actions with NotResource = exactly the ci/* parameter ARN (T-005 round 1)"
-  }
-
-  # No Allow was widened by the fix: the CI host's Allow stays ci/* only.
-  assert {
-    condition = alltrue([
-      for s in jsondecode(aws_iam_role_policy.drone_read_ci_parameters.policy).Statement :
-      s.Effect == "Deny" || try(s.Resource, "") == "arn:aws:ssm:${var.aws_region}:*:parameter/${var.project_name}/${var.environment}/ci/*"
-    ])
-    error_message = "drone_read_ci_parameters Allow must stay ci/* only (T-005 round 1)"
-  }
-
-  # Ties the Deny's literal Resource pattern to the REAL parameter names
-  # created in ssm.tf, rather than trusting two independently-typed string
-  # literals to agree with each other -- a Deny on the wrong prefix would
-  # still pass the assertion above (both sides are just string literals)
-  # without actually covering these parameters.
-  assert {
-    condition = (
-      startswith(aws_ssm_parameter.drone_deploy_access_key_id.name, "/${var.project_name}/${var.environment}/deploy/") &&
-      startswith(aws_ssm_parameter.drone_deploy_secret_access_key.name, "/${var.project_name}/${var.environment}/deploy/")
-    )
-    error_message = "The Deny's deploy/ prefix must actually cover both drone-deploy SSM parameter names"
-  }
-
-  # Case 4/5 (the part checkable under `command = plan`): aws_iam_user_policy.
-  # drone_deploy is NOT reasserted here -- its Resource fields embed
-  # aws_s3_bucket.frontend.arn / aws_cloudfront_distribution.frontend.arn,
-  # which are unknown-until-apply under `command = plan` (same documented
-  # limitation as aws_s3_bucket.backup.arn and aws_eip.drone.public_ip
-  # elsewhere in this file; confirmed empirically the same way). This task
-  # does not touch that resource at all -- verified by code review (git
-  # diff shows no edit to its block) and by scripts/check-static.sh,
-  # which fails if the policy widens beyond its exact least-privilege action
-  # set, effects and frontend-only resources.
 }
 
 # T-022 scoped 8080 to CloudFront's prefix list; T-068 removes the public
@@ -1994,7 +669,7 @@ run "bff_node_registry_and_edge" {
   # vpc_security_group_ids carries BOTH groups. Both referenced security
   # groups are new resources in this plan, so their .id (and therefore the
   # instance's set attribute built from them) is unknown-until-apply --
-  # same documented class of limitation as aws_eip.drone.public_ip and
+  # same documented class of limitation as
   # aws_s3_bucket.backup.arn elsewhere in this file (confirmed empirically:
   # `terraform test` errors "Condition expression could not be evaluated").
   # Covered by `terraform validate` + code review (compute.tf's
@@ -2054,18 +729,16 @@ run "bff_node_registry_and_edge" {
 # ---------------------------------------------------------------------------
 # T-014 -- the rendered app-host user_data: the BFF container block, the
 # Flyway pin, and the 16,384-byte EC2 limit. Rendered directly via
-# templatefile() with fixture values (same pattern the drone/jenkins size
-# checks above use) because aws_instance.domain_service's OWN user_data
+# templatefile() with fixture values because aws_instance.domain_service's OWN user_data
 # embeds cloudfront_domain (aws_cloudfront_distribution.frontend.domain_name),
-# unknown-until-apply under `command = plan` -- same documented limitation as
-# aws_eip.drone.public_ip elsewhere in this file.
+# unknown-until-apply under `command = plan`.
 # ---------------------------------------------------------------------------
 run "app_host_user_data" {
   command = plan
 
   # H1 refresh item 4 / N2, RED FIRST: EC2's hard user_data limit is 16,384
   # bytes. T-044: the full script no longer rides in user_data (it is an S3
-  # object, like T-009's Jenkins script), so this guard on the SCRIPT is only a
+  # object), so this guard on the SCRIPT is only a
   # sanity bound; the real user_data wall is guarded on the stub below.
   assert {
     condition = length(templatefile("${path.module}/templates/domain-service-provision.sh", {
@@ -2600,9 +1273,8 @@ run "app_host_bootstrap_stub" {
   }
 }
 
-# Applied (mocked) and scoped with plan_options.target to the IAM policy so
-# null_resource.jenkins_provision's real local-exec is never reached -- same
-# rationale as backup_iam_scoping.
+# Applied (mocked) and scoped with plan_options.target to the IAM policy --
+# same rationale as backup_iam_scoping.
 run "app_host_provision_iam_scoping" {
   command = apply
 
@@ -2635,8 +1307,7 @@ run "app_host_provision_iam_scoping" {
 # ---------------------------------------------------------------------------
 # T-014 ruling 4 -- /metrics and /health must never rewrite to the SPA shell.
 # functions/spa-router.js is plain JS read via file(), not a resource
-# attribute, so this is a text assertion (same class as the CI Caddyfile
-# regex checks above), not a CloudFront-function-execution test (CloudFront
+# attribute, so this is a text assertion (a regex over the source), not a CloudFront-function-execution test (CloudFront
 # Functions don't run under mock_provider).
 # ---------------------------------------------------------------------------
 run "spa_router_excludes_metrics_and_health" {
@@ -2779,8 +1450,7 @@ run "bff_service_token" {
 # T-045 -- GitHub Actions OIDC provider + the cv-public-vanilla deploy role.
 # ---------------------------------------------------------------------------
 # Applied under mock_provider, scoped with plan_options.target to the
-# role/policy/provider so null_resource.jenkins_provision (real `aws ssm`
-# local-exec) is never reached -- same rationale as "backup_iam_scoping". The
+# role/policy/provider -- same rationale as "backup_iam_scoping". The
 # bucket, distribution and provider ARNs are unknown at plan, which would make
 # both policy documents unknown strings; under apply the mock fills them in,
 # so the decoded policy JSON is compared against the resource ARNs by
@@ -2881,15 +1551,9 @@ run "t035_app_host_graviton" {
     error_message = "aws_instance.domain_service must plan as t4g.micro"
   }
 
-  # The app host and the CI host use DIFFERENT AMI lookups: the CI host stays x86.
   assert {
     condition     = aws_instance.domain_service.ami == data.aws_ami.al2023_arm64.id
     error_message = "the app host must use the arm64 AMI lookup (data.aws_ami.al2023_arm64)"
-  }
-
-  assert {
-    condition     = aws_instance.drone.ami == data.aws_ami.al2023.id && data.aws_ami.al2023.id != data.aws_ami.al2023_arm64.id
-    error_message = "the CI host must keep the x86 lookup (data.aws_ami.al2023), distinct from the app host's"
   }
 
   assert {
@@ -2900,11 +1564,6 @@ run "t035_app_host_graviton" {
   assert {
     condition     = alltrue(flatten([for f in data.aws_ami.al2023_arm64.filter : [for v in f.values : !can(regex("ecs", v))]]))
     error_message = "the arm64 lookup must not match the ECS-optimized variant"
-  }
-
-  assert {
-    condition     = contains(flatten([for f in data.aws_ami.al2023.filter : f.values]), "al2023-ami-2023.*-x86_64")
-    error_message = "the CI host's lookup must stay x86_64"
   }
 
   # T-005's app-host half: IMDSv2 only, hop limit 1 (a bridge container is one hop away).
@@ -2938,8 +1597,7 @@ run "t035_arch_mismatch_rejected" {
 # ---------------------------------------------------------------------------
 # T-047: GitHub OIDC deploy roles for cv-domain-service and cv-bff-node, and one
 # parameterless SSM document per service that runs only `cv-redeploy <svc>`.
-# Apply is scoped with plan_options.target (as the T-045 run above), so
-# null_resource.jenkins_provision's local-exec is never reached.
+# Apply is scoped with plan_options.target (as the T-045 run above).
 # ---------------------------------------------------------------------------
 run "t047_ci_deploy_roles" {
   command = apply
@@ -3333,55 +1991,6 @@ run "t049_database_migrate" {
     error_message = "database_migrate_document output must be the document name (T-049)"
   }
 }
-
-# --- T-048: the doorbell marks a push on an already-running CI host -------
-# The policy JSON embeds the computed instance ARN, so (as for the other CI
-# grants) the security-relevant pieces are named locals asserted here; the
-# Resource scoping and ignore_changes are guarded by scripts/check-static.sh.
-run "t048_push_tag" {
-  command = plan
-
-  assert {
-    condition     = local.ci_push_tag_key == "CILastPush"
-    error_message = "The push-marker tag key must be CILastPush (the operational tag the reaper reads)"
-  }
-
-  assert {
-    condition     = join(",", local.ci_doorbell_tag_actions) == "ec2:CreateTags"
-    error_message = "The doorbell's tagging grant must be ec2:CreateTags and nothing else (no DeleteTags, no wildcard)"
-  }
-
-  assert {
-    condition     = jsonencode(local.ci_doorbell_tag_condition) == jsonencode({ "ForAllValues:StringEquals" = { "aws:TagKeys" = ["CILastPush"] } })
-    error_message = "ec2:CreateTags must be conditioned on ForAllValues:StringEquals aws:TagKeys = [CILastPush] and nothing else -- the doorbell may stamp that one tag key, never any other"
-  }
-
-  assert {
-    condition     = length(setintersection(local.ci_doorbell_tag_actions, local.ci_forbidden_ec2_actions)) == 0
-    error_message = "The doorbell's tag grant intersects the forbidden destructive set"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_doorbell.environment[0].variables["PUSH_TAG"] == local.ci_push_tag_key
-    error_message = "PUSH_TAG must be wired to the doorbell from local.ci_push_tag_key"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_reaper.environment[0].variables["PUSH_TAG"] == local.ci_push_tag_key
-    error_message = "PUSH_TAG must be wired to the reaper from local.ci_push_tag_key (same key the doorbell writes)"
-  }
-
-  assert {
-    condition     = aws_lambda_function.ci_reaper.environment[0].variables["PUSH_GRACE_MINUTES"] == "10"
-    error_message = "PUSH_GRACE_MINUTES must be 10 on the reaper (T-048 H1)"
-  }
-
-  assert {
-    condition     = join(",", local.ci_reaper_ec2_actions) == "ec2:StopInstances"
-    error_message = "The reaper needs no new EC2 grant for T-048: it reads CILastPush from DescribeInstances"
-  }
-}
-
 # T-050: ECR retention. Both repos come from one local (identical by
 # construction). Rule 1 claims :latest (exact match), rule 2 keeps
 # ecr_keep_tagged tagged images (`*` matches :latest too, so latest + 4 previous

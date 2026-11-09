@@ -6,30 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    # T-002: null_resource.jenkins_provision (ci.tf) drives the out-of-band
-    # SSM provisioning step; local_file stages its rendered script on disk
-    # so it can be handed to the AWS CLI without nested-heredoc quoting
-    # hazards.
-    null = {
-      source  = "hashicorp/null"
-      version = "~> 3.2"
-    }
-    local = {
-      source  = "hashicorp/local"
-      version = "~> 2.4"
-    }
-    # T-019: zips the on-demand CI Lambda sources (ci-on-demand.tf). Source
-    # lives in lambda/ as readable .py rather than a committed binary zip.
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.4"
-    }
-    # T-007: random_password.drone_database_secret (ssm.tf) generates
-    # DRONE_DATABASE_SECRET so it never has to be typed into tfvars by hand.
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.6"
-    }
   }
 
   # T-004 part 2: bootstrap/ (its own local state) creates this bucket and

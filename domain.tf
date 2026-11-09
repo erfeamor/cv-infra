@@ -35,8 +35,8 @@ resource "aws_acm_certificate" "site" {
     # The records below go in dns.tf's zone, which is a fixed zone ID: a
     # var.public_domain that zone doesn't serve would hang ACM validation.
     precondition {
-      condition     = trimsuffix(data.aws_route53_zone.ci.name, ".") == var.public_domain
-      error_message = "var.public_domain (${var.public_domain}) is not the domain of the Route 53 zone in dns.tf (${data.aws_route53_zone.ci.name})."
+      condition     = trimsuffix(data.aws_route53_zone.public.name, ".") == var.public_domain
+      error_message = "var.public_domain (${var.public_domain}) is not the domain of the Route 53 zone in dns.tf (${data.aws_route53_zone.public.name})."
     }
   }
 
@@ -60,7 +60,7 @@ locals {
 resource "aws_route53_record" "site_cert_validation" {
   for_each = toset(local.site_cert_names)
 
-  zone_id         = data.aws_route53_zone.ci.zone_id
+  zone_id         = data.aws_route53_zone.public.zone_id
   name            = try(local.site_cert_options[each.key].resource_record_name, "_pending.${each.key}")
   type            = try(local.site_cert_options[each.key].resource_record_type, "CNAME")
   records         = [try(local.site_cert_options[each.key].resource_record_value, "pending.invalid")]
@@ -86,7 +86,7 @@ resource "aws_route53_record" "site_alias" {
     "www-AAAA"  = { name = local.public_www, type = "AAAA" }
   }
 
-  zone_id         = data.aws_route53_zone.ci.zone_id
+  zone_id         = data.aws_route53_zone.public.zone_id
   name            = each.value.name
   type            = each.value.type
   allow_overwrite = true
@@ -103,7 +103,7 @@ resource "aws_route53_record" "site_alias" {
 resource "aws_route53_record" "auth_alias" {
   for_each = toset(["A", "AAAA"])
 
-  zone_id = data.aws_route53_zone.ci.zone_id
+  zone_id = data.aws_route53_zone.public.zone_id
   name    = local.public_auth
   type    = each.key
 
@@ -117,7 +117,7 @@ resource "aws_route53_record" "auth_alias" {
 # react.<apex> -> the Vercel project serving cv-public-react (T-410). The target
 # is the one Vercel shows in Settings -> Domains for this project.
 resource "aws_route53_record" "react" {
-  zone_id         = data.aws_route53_zone.ci.zone_id
+  zone_id         = data.aws_route53_zone.public.zone_id
   name            = "react.${var.public_domain}"
   type            = "CNAME"
   ttl             = 300

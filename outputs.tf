@@ -19,12 +19,6 @@ output "frontend_cloudfront_domain" {
   value = aws_cloudfront_distribution.frontend.domain_name
 }
 
-output "drone_server_url" {
-  # T-034 phase 2: https, and the stable DNS name (local.ci_public_host,
-  # ci-on-demand.tf) instead of the EIP that phase 2's second commit removes.
-  value = "https://${local.ci_public_host}"
-}
-
 output "frontend_cloudfront_distribution_id" {
   value = aws_cloudfront_distribution.frontend.id
 }
@@ -38,17 +32,6 @@ output "cognito_hosted_ui_domain" {
   # is still attached until T-306 moves the admin build.
   value = aws_cognito_user_pool_domain.custom.domain
 }
-
-output "ci_doorbell_url" {
-  description = "T-019: Function URL to register as the GitHub webhook on cv-domain-service, cv-database and cv-admin-react. Until the hooks point here, the automation is inert."
-  value       = aws_lambda_function_url.ci_doorbell.function_url
-}
-
-# T-008: deliberately NO output for aws_iam_access_key.drone_deploy (its
-# .id or .secret). It leaves this module only via the two SecureStrings in
-# ssm.tf; `terraform output` / `terraform show` must never be the thing
-# that prints it. scripts/check-static.sh enforces that any future
-# output referencing that resource is marked sensitive = true.
 
 output "public_vanilla_deploy_role_arn" {
   description = "T-045: role the cv-public-vanilla GitHub workflow assumes via OIDC (master only). Not a secret; set it as a GitHub repo variable for T-403."

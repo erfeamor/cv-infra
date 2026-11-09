@@ -1,5 +1,5 @@
-# T-047: CI deploy from GitHub Actions. No deploy credential lives on the CI
-# host (Jenkins/Drone mount docker.sock, so any build is root there; T-005).
+# T-047: CI deploy from GitHub Actions. No long-lived deploy credential exists
+# anywhere (the CI host and its static deploy key were deleted in T-064).
 # Each service repo's workflow assumes its own OIDC role (the provider is
 # aws_iam_openid_connect_provider.github_actions, github-oidc.tf), pushes a
 # multi-arch image to its own ECR repo, then runs ITS OWN parameterless SSM

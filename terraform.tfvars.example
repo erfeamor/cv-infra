@@ -8,19 +8,6 @@ db_password = "REPLACE_ME"
 
 domain_service_instance_type = "t4g.micro" # Graviton/arm64 AMI (T-035); must be a *g family
 
-# t3.small (T-002, H1 decision 2): a Free Tier exception, net ~+$8/mo
-# (~$16.60 vs ~$8.30) -- see variables.tf for the full accounting. Needed
-# for Jenkins + Maven headroom alongside Drone; the docs correction is T-003.
-drone_instance_type        = "t3.small"
-drone_admin_username       = "erfeamor"
-drone_rpc_secret           = "REPLACE_ME" # openssl rand -hex 16
-drone_github_client_id     = "REPLACE_ME"
-drone_github_client_secret = "REPLACE_ME"
-
-jenkins_admin_username = "erfeamor"
-jenkins_admin_password = "REPLACE_ME" # openssl rand -base64 24
-github_pat_ci          = "REPLACE_ME" # repo:status scope only (classic) or fine-grained Commit-statuses:read/write on cv-domain-service + cv-database
-
 # T-011: two budget alarms, both tracking gross usage (include_credit =
 # false, see budgets.tf) -- they answer two different questions and must
 # never share a limit variable OR a thresholds variable (both sharings were
@@ -63,7 +50,3 @@ budget_monthly_thresholds = [100, 120, 150]
 
 budget_notification_emails = ["REPLACE_ME@example.com"]
 
-# T-019: shared secret for the GitHub webhook -> ci-doorbell Lambda HMAC check.
-# Generate with: openssl rand -hex 32
-# Set the SAME value in each repo's webhook (Settings -> Webhooks -> Secret).
-github_webhook_secret = "REPLACE_ME"

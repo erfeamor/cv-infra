@@ -1,11 +1,10 @@
 # T-044: the app host's provisioning script lives in S3, not in user_data.
 #
-# user_data had reached ~14.6 KB of EC2's 16,384-byte cap. Same fix as the CI
-# host's (T-009, ci-provision.tf): the real script is a private S3 object in
-# aws_s3_bucket.ci_artifacts, checked against a hash in SSM, run by a tiny stub
-# (templates/domain-service-bootstrap.sh).
+# user_data had reached ~14.6 KB of EC2's 16,384-byte cap. The real script is
+# a private S3 object in aws_s3_bucket.ci_artifacts (storage.tf), checked
+# against a hash in SSM, run by a tiny stub (templates/domain-service-bootstrap.sh).
 #
-# Difference from T-009, by H1 decision: the stub EMBEDS the script's SHA-256.
+# Design choice (H1 decision): the stub EMBEDS the script's SHA-256.
 # A script edit therefore changes user_data and replaces the host, which is the
 # app host's long-standing behavior (user_data_replace_on_change = true,
 # compute.tf). What no longer needs a host replacement is a new IMAGE or a new
@@ -72,8 +71,7 @@ resource "aws_ssm_parameter" "app_host_provision_sha256" {
   }
 }
 
-# Exactly the one object -- not the bucket, not a wildcard. (The CI host's role
-# has the same shape for its own key, ci-provision.tf.)
+# Exactly the one object -- not the bucket, not a wildcard.
 resource "aws_iam_role_policy" "app_read_provision_script" {
   name = "${var.project_name}-app-read-provision-script"
   role = aws_iam_role.domain_service.id

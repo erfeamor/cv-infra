@@ -6,21 +6,6 @@ data "aws_vpc" "default" {
   default = true
 }
 
-# Only the VPC's default subnets (public IPv4 on launch). Without the
-# default-for-az filter this also lists aws_subnet.app_private (T-068), which
-# sorted first and moved the CI host (ci.tf, ids[0]) into a subnet with no
-# IPv4 route: it could not have reached GitHub or Docker Hub.
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-  filter {
-    name   = "default-for-az"
-    values = ["true"]
-  }
-}
-
 # T-068: the app host has no public IPv4 (the EIP is gone; every public IPv4
 # bills $3.60/month). It lives in its own subnet of the default VPC, in the
 # AZ of its EBS volume, reachable by CloudFront through VPC origins and
@@ -131,53 +116,6 @@ resource "aws_security_group" "domain_service" {
     cidr_blocks = ["0.0.0.0/0"]
     # T-068: the host reaches AWS, Docker Hub and Cognito over IPv6 only.
     ipv6_cidr_blocks = ["::/0"]
-  }
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-resource "aws_security_group" "drone" {
-  name = "${var.project_name}-drone"
-  # Deliberately still says "Drone CI host" even though Jenkins now sits behind
-  # the same rule: aws_security_group.description is ForceNew (AWS has no
-  # modify-description API) and this group has no create_before_destroy, so
-  # editing this string alone would destroy a group still attached to
-  # aws_instance.drone -- DependencyViolation, mid-apply, on a live CI box. The
-  # comment below carries the meaning instead. Do not "fix" this wording.
-  description = "Allows inbound HTTP(S) from GitHub (webhooks, OAuth callback) to the Drone CI host"
-  vpc_id      = data.aws_vpc.default.id
-
-  # T-002: since the reverse proxy went in (templates/jenkins-provision.sh),
-  # this single rule fronts both Drone (/) and Jenkins (/jenkins/). No new
-  # rule and no new internet-facing port were added for Jenkins -- it is
-  # reachable only via the proxy over the internal "drone" docker network,
-  # never on its own port.
-  ingress {
-    description = "Drone + Jenkins web UI / webhooks, via the on-host reverse proxy"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS (when TLS is added in front of Drone)"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # No SSH ingress: shell access goes through SSM Session Manager, same as the
-  # domain service instance.
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
   }
 
   tags = {

@@ -248,8 +248,8 @@ terraform plan   # must show no changes -- confirms every attribute the import
 
 ## Rotation decision (T-004 part 3)
 
-**Accept, no rotation.** `db_password`, `drone_rpc_secret`, and
-`drone_github_client_secret` have been sitting in local state at `0664`
+**Accept, no rotation.** `db_password` (and the since-deleted `drone_rpc_secret` and
+`drone_github_client_secret`) have been sitting in local state at `0664`
 until 2026-08-24, then `0600` since. Single-user machine, gitignored
 files, and the exposure window is closed -- H1 (2026-09-28) judged the
 practical risk low enough not to rotate now. This keeps T-021

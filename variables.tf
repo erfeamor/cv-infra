@@ -68,61 +68,6 @@ variable "availability_zone" {
   }
 }
 
-variable "drone_instance_type" {
-  # T-002 (H1, ratified 2026-08-04): Free Tier already covers one t3.micro
-  # (this account runs two -> domain_service + drone -> so ~710 h/month was
-  # already billable before this change, ~$8/mo). t3.micro (1 GB) cannot
-  # host Jenkins + Maven alongside Drone without OOM risk, so this box is
-  # sized up. t3.small (2 GB) ~= $16.60/mo, a net +$8/mo over today. This is
-  # a deliberate, recorded exception to the workspace's Free-Tier-only rule
-  # for this resource only (see terraform.tfvars.example and the T-002 PR
-  # body for the same figure) -- the docs correction itself is T-003.
-  description = "EC2 instance type for the Drone + Jenkins CI host"
-  type        = string
-  default     = "t3.small"
-}
-
-variable "drone_admin_username" {
-  description = "GitHub username granted Drone admin and allowed to log in"
-  type        = string
-  default     = "erfeamor"
-}
-
-variable "drone_rpc_secret" {
-  description = "Shared secret between the Drone server and runner (openssl rand -hex 16)"
-  type        = string
-  sensitive   = true
-}
-
-variable "drone_github_client_id" {
-  description = "Client ID of the GitHub OAuth app used by Drone"
-  type        = string
-}
-
-variable "drone_github_client_secret" {
-  description = "Client secret of the GitHub OAuth app used by Drone"
-  type        = string
-  sensitive   = true
-}
-
-variable "jenkins_admin_username" {
-  description = "Local Jenkins admin username configured via JCasC on first boot (not a secret, mirrors drone_admin_username)"
-  type        = string
-  default     = "erfeamor"
-}
-
-variable "jenkins_admin_password" {
-  description = "Local Jenkins admin password, read from SSM by the provisioning script and injected via env var only -- never written to a file on the host or committed to tfvars (openssl rand -base64 24)"
-  type        = string
-  sensitive   = true
-}
-
-variable "github_pat_ci" {
-  description = "GitHub PAT Jenkins uses to check out branches and post commit statuses on cv-domain-service and cv-database. Least privilege: repo:status (classic) or fine-grained Commit-statuses:read/write scoped to just those two repos -- never bare 'repo' scope."
-  type        = string
-  sensitive   = true
-}
-
 # T-011: budget alarm that fires on gross usage, not net-of-credit cost --
 # see budgets.tf for the include_credit = false crux this task exists for.
 #
@@ -308,74 +253,6 @@ variable "budget_notification_emails" {
   validation {
     condition     = length(var.budget_notification_emails) > 0
     error_message = "budget_notification_emails must not be empty -- a budget alarm with no subscriber notifies nobody."
-  }
-}
-
-# T-019 -----------------------------------------------------------------
-
-variable "github_webhook_secret" {
-  description = "Shared secret for GitHub webhook HMAC validation (ruling 4). Set the same value in each repo's webhook config. No default: an empty secret would make the doorbell's signature check pass for anyone."
-  type        = string
-  sensitive   = true
-}
-
-variable "ci_idle_window_minutes" {
-  description = "How long the CI host must be quiet before the reaper stops it. Long enough that a gap between pipeline stages never trips it."
-  type        = number
-  default     = 20
-}
-
-variable "ci_cpu_busy_percent" {
-  description = "Peak CPU over the idle window at or above which the host counts as busy. A veto only — Jenkins' own queue/executor state is the authoritative signal (T-019 ruling 2)."
-  type        = number
-  default     = 10
-}
-
-# T-034 -----------------------------------------------------------------
-
-variable "ci_post_start_grace_minutes" {
-  description = "Minimum time after a start before the reaper will consider stopping the instance at all (finding 2026-09-27: a single post-boot CPU datapoint was seen satisfying the idle window seconds after a cold start, stopping the box while a just-queued Drone build sat pending)."
-  type        = number
-  default     = 15
-}
-
-variable "github_hooks_token" {
-  # H1 correction, same day: the existing CI token (github_pat_ci) was
-  # checked against the GitHub API and cannot manage webhooks -- 403,
-  # repository_hooks=read required. This is a SEPARATE, narrower token: the
-  # human creates a fine-grained PAT limited to erfeamor/cv-admin-react,
-  # Webhooks read/write only. No default: an empty token would make every
-  # redelivery call fail 401, silently disabling the whole path with no
-  # signal beyond a CloudWatch log line.
-  description = "Fine-grained GitHub PAT, scoped to erfeamor/cv-admin-react + Webhooks read/write only, that the doorbell uses to find Drone's hook and redeliver its failed deliveries after a cold start (T-034 H1 correction)."
-  type        = string
-  sensitive   = true
-}
-
-# T-034 phase 2 + T-033 ---------------------------------------------------
-
-variable "ci_hostname" {
-  # H1: a CI subdomain in the human's registered zone (erfeamor.com, hosted
-  # zone Z0608270B7WND031GVOW -- see dns.tf's data source), not the apex.
-  # A variable rather than a bare local literal, per the plan ("a variable
-  # is ok") -- this is the ONE place the hostname itself is spelled out;
-  # local.ci_public_host (ci-on-demand.tf) and dns.tf's record both read it
-  # from here, never a second literal.
-  description = "The CI host's stable DNS name (replaces the EIP as of T-034 phase 2). Must be a subdomain of the zone dns.tf reads, never the apex."
-  type        = string
-  default     = "ci.erfeamor.com"
-
-  # Review round 1, finding 10. Lowercase and no trailing dot specifically
-  # because iam.tf's route53:ChangeResourceRecordSetsNormalizedRecordNames
-  # condition compares against this value VERBATIM -- Route 53 normalizes
-  # the record's OWN name (lowercases it, appends a trailing dot) before
-  # evaluating the condition, so if this variable ever carried a different
-  # case or a trailing dot, the updater's every UPSERT would be silently
-  # denied by its own IAM policy, not merely mismatched. The character
-  # class/label-length limits below are RFC 1035's, not invented here.
-  validation {
-    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", var.ci_hostname))
-    error_message = "var.ci_hostname must be a lowercase hostname with no trailing dot, at least two labels (e.g. ci.erfeamor.com) -- got \"${var.ci_hostname}\"."
   }
 }
 

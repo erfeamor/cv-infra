@@ -108,3 +108,48 @@ resource "aws_volume_attachment" "mysql_data" {
   # exists to prevent.
   stop_instance_before_detaching = true
 }
+
+# Private artifact bucket: the app host provisioning script lives here
+# (app-host-provision.tf). Kept under its historical name and Terraform address
+# (cv-project-ci-artifacts-dev) so no replace happens; the CI host is gone (T-064).
+resource "aws_s3_bucket" "ci_artifacts" {
+  bucket        = "${var.project_name}-ci-artifacts-${var.environment}"
+  force_destroy = true
+
+  tags = {
+    Name    = "${var.project_name}-ci-artifacts"
+    Project = var.project_name
+  }
+}
+
+# Explicit, not inherited. This bucket holds a script that is executed as root
+# on a host mounting the docker socket; public read would be a direct path to
+# tampering with what that host runs.
+resource "aws_s3_bucket_public_access_block" "ci_artifacts" {
+  bucket                  = aws_s3_bucket.ci_artifacts.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "ci_artifacts" {
+  bucket = aws_s3_bucket.ci_artifacts.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# Versioning earns its keep here: if a bad provisioning script is uploaded and
+# a box boots against it, the previous object is still retrievable. Costs
+# nothing at this size.
+resource "aws_s3_bucket_versioning" "ci_artifacts" {
+  bucket = aws_s3_bucket.ci_artifacts.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}

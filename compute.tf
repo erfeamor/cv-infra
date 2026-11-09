@@ -6,18 +6,6 @@
 # The name pattern must pin the *standard* AL2023 image: a looser
 # "al2023-ami-*" also matches the ECS-optimized variant
 # (al2023-ami-ecs-hvm-…), which does not run our cloud-init user_data.
-#
-# This x86_64 lookup is the CI host's (ci.tf). The app host is arm64 and uses
-# data.aws_ami.al2023_arm64 below -- do not point either at the other's lookup.
-data "aws_ami" "al2023" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-2023.*-x86_64"]
-  }
-}
 
 # T-035: the app host's arm64 AL2023 AMI. Same plain-AL2023 name rule (not the
 # ECS-optimized variant), plus an explicit architecture filter so the name
@@ -40,7 +28,7 @@ data "aws_ami" "al2023_arm64" {
 }
 
 resource "aws_instance" "domain_service" {
-  # T-035: arm64 AMI (the CI host keeps the x86 lookup).
+  # T-035: arm64 AMI.
   ami           = data.aws_ami.al2023_arm64.id
   instance_type = var.domain_service_instance_type
 

@@ -1,6 +1,6 @@
 # T-045: GitHub Actions -> AWS trust via OIDC, so a GitHub workflow can deploy
-# without a long-lived access key (T-005 argues against copying the drone-deploy
-# static key into a second CI system). One provider per account; further roles
+# without a long-lived access key (T-005 argued against static deploy keys; the
+# old Drone one is deleted, T-064). One provider per account; further roles
 # (T-203, the BFF deploy) reuse aws_iam_openid_connect_provider.github_actions.
 
 locals {
@@ -89,7 +89,7 @@ resource "aws_iam_role_policy" "public_vanilla_deploy" {
 # T-063: the cv-admin-react deploy role, the mirror image of the above. The
 # admin app lives under admin/ in the same bucket, so this role may write
 # ONLY there (no Deny needed: nothing outside admin/* is ever allowed).
-# Replaces Drone's static key (T-008) once T-305 moves the workflow over.
+# Replaced Drone's static key (T-008), deleted in T-064.
 resource "aws_iam_role" "admin_deploy" {
   name = "${var.project_name}-admin-deploy"
 

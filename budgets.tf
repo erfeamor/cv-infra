@@ -18,8 +18,9 @@
 #
 # So a $30 monthly limit against a ~$21/month rate is now a working DEVIATION
 # alarm, and it fires on precisely the one behaviour worth being told about:
-# the CI host being left running, which adds ~$17/month and moves credit
-# exhaustion forward by ~8 weeks. Retuning the limit down to hug the current
+# a resource being left running (the CI host, deleted in T-064, was the
+# case that taught this: ~$17/month, credit exhaustion ~8 weeks sooner).
+# Retuning the limit down to hug the current
 # rate would trade that signal for noise.
 #
 # The credit_runway limit stays at $160 for the reason cv-infra#14 recorded and

@@ -46,7 +46,7 @@ aws ssm send-command --region eu-west-3 --document-name cv-redeploy-migrate \
   --query Command.CommandId --output text
 ```
 
-Operators can send the same documents by hand (instead of `AWS-RunShellScript` above); poll with `get-command-invocation` or `list-command-invocations --command-id <id> --details`. The workflows' OIDC roles can send only their own document and only to instances tagged `Name=cv-project-domain-service`; no deploy credential exists on the CI host.
+Operators can send the same documents by hand (instead of `AWS-RunShellScript` above); poll with `get-command-invocation` or `list-command-invocations --command-id <id> --details`. The workflows' OIDC roles can send only their own document and only to instances tagged `Name=cv-project-domain-service`; no static deploy credential exists anywhere.
 
 Poll `get-command-invocation` until `Status` is `Success` (or `Failed`). The output contains the old and new image ids; keep them (see Rollback).
 
@@ -57,7 +57,7 @@ Poll `get-command-invocation` until `Status` is `Success` (or `Failed`). The out
    aws ecr describe-images --region eu-west-3 --repository-name cv-project-domain-service \
      --query 'sort_by(imageDetails,&imagePushedAt)[].[imageDigest,imageTags]' --output text
    ```
-2. Build and push to `:latest` from the service repo, **multi-arch** because the app host is arm64 (t4g.micro, T-035) while the CI host is x86: `docker buildx build --platform linux/amd64,linux/arm64 --push -t <repo>:latest .` (needs QEMU once per boot: `docker run --privileged --rm tonistiigi/binfmt --install arm64`). An amd64-only push breaks the host at the next pull. (`<acct>.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service` or `cv-project-bff-node`; log in with `aws ecr get-login-password | docker login --username AWS --password-stdin <registry>`).
+2. Build and push to `:latest` from the service repo, **multi-arch** because the app host is arm64 (t4g.micro, T-035) (CI runners are amd64, so the buildx/QEMU step is needed): `docker buildx build --platform linux/amd64,linux/arm64 --push -t <repo>:latest .` (needs QEMU once per boot: `docker run --privileged --rm tonistiigi/binfmt --install arm64`). An amd64-only push breaks the host at the next pull. (`<acct>.dkr.ecr.eu-west-3.amazonaws.com/cv-project-domain-service` or `cv-project-bff-node`; log in with `aws ecr get-login-password | docker login --username AWS --password-stdin <registry>`).
 3. `cv-redeploy domain-service` or `cv-redeploy bff-node` via SSM as above.
 4. **Verify**: the digest printed as `new=` differs from `old=`; `docker ps` shows the container up (via a second send-command, or Session Manager); then hit it: `curl -s localhost:3000/health` on the host, and `https://<cloudfront domain>/bff/api/v1/people/1` returns 200 from outside.
 

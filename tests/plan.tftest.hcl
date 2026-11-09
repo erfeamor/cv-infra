@@ -2238,6 +2238,11 @@ run "t061_custom_domain" {
   }
 
   assert {
+    condition     = aws_ssm_parameter.cors_allowed_origins.value == "https://erfeamor.com"
+    error_message = "CORS allows the apex only (no cloudfront.net origin, T-306)"
+  }
+
+  assert {
     condition     = aws_ssm_parameter.cors_allowed_origins.name == "/cv-project/dev/app/cors-allowed-origins"
     error_message = "the CORS parameter lives under app/ like provision-sha256"
   }
@@ -2308,8 +2313,7 @@ run "t061_domain_must_match_the_zone" {
 }
 
 # T-062: Cognito serves its hosted UI and token endpoint from auth.<apex>. The
-# prefix domain stays beside it until T-306 moves the admin build (a pool can
-# hold both).
+# prefix domain is gone since T-306.
 run "t062_cognito_custom_domain" {
   command = plan
 
@@ -2322,8 +2326,11 @@ run "t062_cognito_custom_domain" {
   }
 
   assert {
-    condition     = aws_cognito_user_pool_domain.cv.domain == "${var.project_name}-${var.environment}"
-    error_message = "the prefix domain stays until T-306 moves the admin build"
+    condition = (
+      toset(aws_cognito_user_pool_client.admin_react.callback_urls) == toset(["http://localhost:5173/admin/", "https://${var.public_domain}/admin/"]) &&
+      toset(aws_cognito_user_pool_client.admin_react.logout_urls) == toset(["http://localhost:5173/admin/", "https://${var.public_domain}/admin/"])
+    )
+    error_message = "the admin client's callback and logout URLs are localhost and the apex only (no cloudfront.net, T-306)"
   }
 
   assert {

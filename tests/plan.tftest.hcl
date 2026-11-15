@@ -99,7 +99,7 @@ variables {
   # T-011: no default on budget_credit_grant_amount by design (see
   # variables.tf) -- test value only, never a number that could pass for a
   # real measured figure. budget_monthly_limit_amount is given a distinct
-  # test value too (rather than relying on its real default of "30") so a
+  # test value too (rather than relying on its real default of "17") so a
   # regression that wires the SAME variable into both budgets' limit_amount
   # -- a real bug this scope amendment fixed -- makes the identity
   # assertions below fail instead of coincidentally matching. Same trick
@@ -2425,5 +2425,30 @@ run "t070_migration_sql_through_s3" {
   assert {
     condition     = output.migration_sql_bucket == "${aws_s3_bucket.backup.bucket}/${local.migration_sql_key}"
     error_message = "the migration_sql_bucket output must name bucket/key for cv-database's repo variable (T-071)"
+  }
+}
+
+run "t069_artifacts_bucket_expires_noncurrent_versions_only" {
+  command = plan
+
+  assert {
+    condition = (
+      aws_s3_bucket_lifecycle_configuration.ci_artifacts.bucket == aws_s3_bucket.ci_artifacts.id &&
+      length(aws_s3_bucket_lifecycle_configuration.ci_artifacts.rule) == 1 &&
+      one(aws_s3_bucket_lifecycle_configuration.ci_artifacts.rule).status == "Enabled" &&
+      one(one(aws_s3_bucket_lifecycle_configuration.ci_artifacts.rule).noncurrent_version_expiration).noncurrent_days == 30 &&
+      one(one(aws_s3_bucket_lifecycle_configuration.ci_artifacts.rule).abort_incomplete_multipart_upload).days_after_initiation == 7
+    )
+    error_message = "the artifacts bucket expires noncurrent versions after 30 days and aborts incomplete multipart uploads after 7 (T-069)"
+  }
+
+  assert {
+    condition     = length(one(aws_s3_bucket_lifecycle_configuration.ci_artifacts.rule).expiration) == 0
+    error_message = "the lifecycle rule must never expire CURRENT versions (the app host's provision script lives here) (T-069)"
+  }
+
+  assert {
+    condition     = aws_s3_bucket.ci_artifacts.bucket == "${var.project_name}-ci-artifacts-${var.environment}"
+    error_message = "the artifacts bucket keeps its historical name (T-069)"
   }
 }

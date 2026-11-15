@@ -608,4 +608,20 @@ else
   fi
 fi
 
+# --- T-069. The artifacts bucket's lifecycle rule expires noncurrent versions only
+# An `expiration` block (or a Disabled->Enabled flip of one) would delete the
+# CURRENT provision script the app host boots from.
+lc=$(extract_block '^resource[ \t]+"aws_s3_bucket_lifecycle_configuration"[ \t]+"ci_artifacts"[ \t]*{' <storage.tf)
+problems=""
+[ -n "$lc" ] || problems="$problems missing"
+grep -qE '^[ \t]*expiration[ \t]*{' <<<"$lc" && problems="$problems current-version-expiration"
+grep -qE '^[ \t]*noncurrent_version_expiration[ \t]*{' <<<"$lc" || problems="$problems no-noncurrent-expiry"
+grep -qE '^[ \t]*noncurrent_days[ \t]*=[ \t]*30[ \t]*$' <<<"$lc" || problems="$problems noncurrent-days-not-30"
+[ "$(grep -cE '^[ \t]*rule[ \t]*{' <<<"$lc")" = 1 ] || problems="$problems not-exactly-one-rule"
+if [ -z "$problems" ]; then
+  ok "the artifacts bucket lifecycle expires noncurrent versions (30 d) and never current ones (T-069)"
+else
+  bad "storage.tf ci_artifacts lifecycle:$problems"
+fi
+
 exit $fail

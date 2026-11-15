@@ -104,17 +104,30 @@ Re-run step 2's row counts: they must equal the baseline exactly, and the CV has
 
 ## 6. Retire the old volume (after a few days of the new one being fine)
 
-It costs about $0.74/month while it exists. It is detached (`available`); snapshot it, then delete it:
+It costs about $0.74/month while it exists. It is detached (`available`); snapshot it, then delete it. Status 2026-11-15 (T-069): the old volume is `vol-092113db466c84bc1` and its snapshot `snap-06959e64ad62b3259` already exists (taken 2026-11-15), so only the deletion is left. Deleting is irreversible: do it only after the human's explicit OK.
 
 ```bash
-OLD=vol-xxxxxxxxxxxxxxxxx   # from step 2
+OLD=vol-092113db466c84bc1
+SNAP=snap-06959e64ad62b3259
+# 1. the volume is still the detached 8 GiB one, and the snapshot is complete and belongs to it
 aws ec2 describe-volumes --region eu-west-3 --volume-ids "$OLD" --query 'Volumes[0].[State,Size]' --output text   # available 8
-SNAP=$(aws ec2 create-snapshot --region eu-west-3 --volume-id "$OLD" --description "T-066 final snapshot of the 8 GiB MySQL volume" --query SnapshotId --output text)
-aws ec2 wait snapshot-completed --region eu-west-3 --snapshot-ids "$SNAP"
+aws ec2 describe-snapshots --region eu-west-3 --snapshot-ids "$SNAP" --query 'Snapshots[0].[State,VolumeId,VolumeSize]' --output text   # completed vol-092113db466c84bc1 8
+# 2. delete the volume
 aws ec2 delete-volume --region eu-west-3 --volume-id "$OLD"
+# 3. confirm it is gone (InvalidVolume.NotFound) and the snapshot remains
+aws ec2 describe-volumes --region eu-west-3 --volume-ids "$OLD"
+aws ec2 describe-snapshots --region eu-west-3 --snapshot-ids "$SNAP" --query 'Snapshots[0].State' --output text
 ```
 
-Then delete the `removed` block in `storage.tf` (nothing refers to it any more) in a small PR. The snapshot is billed by stored data (cents); delete it later.
+(To snapshot a different volume instead: `aws ec2 create-snapshot --volume-id "$OLD" --description "..."` then `aws ec2 wait snapshot-completed --snapshot-ids ...`.)
+
+The snapshot is billed by stored data (cents). Delete it a few weeks later, about 2026-12-15, once nobody needs the rollback:
+
+```bash
+aws ec2 delete-snapshot --region eu-west-3 --snapshot-id snap-06959e64ad62b3259
+```
+
+Once the volume is gone, the `removed { from = aws_ebs_volume.mysql_data }` block in `storage.tf` has nothing left to forget and can be dropped in a small PR (it is harmless until then; a plan with or without it is the same).
 
 ## Rollback
 

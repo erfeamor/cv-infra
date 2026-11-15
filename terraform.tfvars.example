@@ -35,7 +35,7 @@ budget_credit_grant_amount = "REPLACE_ME_MEASURED_USD"
 # since it's a ratified design figure over an already-measured baseline,
 # not a value needing a fresh console read -- override here only if the
 # baseline burn rate changes materially.
-budget_monthly_limit_amount = "30"
+budget_monthly_limit_amount = "17"
 
 # budget_credit_runway_thresholds: aws_budgets_budget.credit_runway's OWN
 # thresholds -- genuine milestones on the way to credit depletion.

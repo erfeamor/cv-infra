@@ -157,17 +157,23 @@ variable "budget_monthly_limit_amount" {
   # overridable, and still validated the same way so a bad override fails
   # at plan, not at CreateBudget.
   #
-  # $30 (was $35): burn is back under $1/day after the RDS teardown, so $30
-  # now represents expected monthly spend rather than a margin above it --
-  # see budget_monthly_thresholds below, which is what turns "expected" into
+  # T-069: $17 (was $30). Measured 2026-11-15 in Cost Explorer
+  # (RECORD_TYPE=Usage): a steady $0.287/day for each full day 2026-11-10..13
+  # (app host $0.226, EBS $0.056, S3 and Cognito tokens ~$0.005), ~$0.28/day
+  # once the old detached 8 GB volume is deleted = ~$8.5/month. $17 is twice
+  # that: an anomaly detector, not a ceiling to hug. The CI host (T-064), the
+  # app host's EIP (T-068) and the 8 GB data volume (T-066) are gone from the
+  # rate. The real value lives in the gitignored terraform.tfvars, which wins
+  # over this default; the human sets it to "17" there.
+  # See budget_monthly_thresholds below, which is what turns "expected" into
   # an anomaly detector now that the limit itself IS the expectation.
-  description = "Monthly gross-usage budget limit, in USD (aws_budgets_budget.gross_usage.limit_amount) -- represents expected monthly spend (burn is back under $1/day after the RDS teardown). aws_budgets_budget.gross_usage's own thresholds (budget_monthly_thresholds, not the shared 50/80/100) are what make this an anomaly detector: 100% of this limit is already 'as expected', not a milestone. Independent of budget_credit_grant_amount on purpose: the two budgets must never share a limit variable."
+  description = "Monthly gross-usage budget limit, in USD (aws_budgets_budget.gross_usage.limit_amount) -- represents expected monthly spend (~$8.5/month measured 2026-11-15, doubled). aws_budgets_budget.gross_usage's own thresholds (budget_monthly_thresholds, not the shared 50/80/100) are what make this an anomaly detector: 100% of this limit is already 'as expected', not a milestone. Independent of budget_credit_grant_amount on purpose: the two budgets must never share a limit variable."
   type        = string
-  default     = "30"
+  default     = "17"
 
   validation {
     condition     = can(tonumber(var.budget_monthly_limit_amount)) ? tonumber(var.budget_monthly_limit_amount) > 0 : false
-    error_message = "budget_monthly_limit_amount must be a positive number encoded as a string (e.g. \"30\"), not a placeholder."
+    error_message = "budget_monthly_limit_amount must be a positive number encoded as a string (e.g. \"17\"), not a placeholder."
   }
 }
 
@@ -211,10 +217,10 @@ variable "budget_credit_runway_thresholds" {
 variable "budget_monthly_thresholds" {
   # New (human-ratified, stage 4): gross_usage's OWN thresholds, deliberately
   # different from credit_runway's 50/80/100. budget_monthly_limit_amount
-  # ($30) now represents EXPECTED spend, not a ceiling with headroom, so
+  # ($17) now represents EXPECTED spend, not a ceiling with headroom, so
   # crossing it at all is the anomaly signal: 100% = over expectation,
   # 120% = materially over, 150% = something is wrong. At steady state
-  # (~$21/month measured burn against $30 expected -- T-020) this produces ZERO
+  # (~$8.5/month measured burn against $17 expected -- T-069) this produces ZERO
   # notifications -- the opposite of the shared-thresholds bug this
   # variable exists to fix (see budget_credit_runway_thresholds).
   description = "Ascending, strictly increasing list of percentage-of-limit thresholds for aws_budgets_budget.gross_usage ONLY (notification.threshold, threshold_type = PERCENTAGE). budget_monthly_limit_amount represents expected spend, so these mark deviation from it, not progress toward it: 100/120/150 by default. Independent of budget_credit_runway_thresholds on purpose -- the two budgets must never share a thresholds variable."

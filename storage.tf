@@ -153,3 +153,30 @@ resource "aws_s3_bucket_versioning" "ci_artifacts" {
     status = "Enabled"
   }
 }
+
+# T-069: versioning keeps every upload of the provisioning script forever.
+# Expire only NONCURRENT versions (30 days is ample to roll back a bad
+# upload) and abandoned multipart uploads. There is deliberately no
+# `expiration` block: the current version of an object must never expire,
+# or the app host's provision script would vanish (scripts/check-static.sh
+# guards this). Depends on versioning so the rule is applied to a versioned bucket.
+resource "aws_s3_bucket_lifecycle_configuration" "ci_artifacts" {
+  bucket = aws_s3_bucket.ci_artifacts.id
+
+  rule {
+    id     = "expire-noncurrent-versions"
+    status = "Enabled"
+
+    filter {}
+
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.ci_artifacts]
+}

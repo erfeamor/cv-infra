@@ -1,32 +1,24 @@
 # T-011: a budget alarm that fires on GROSS usage, not on the invoice.
 #
-# T-020 §4, decided 2026-08-19: LEAVE THESE LIMITS ALONE. Recorded here because
-# "we looked and deliberately changed nothing" is otherwise indistinguishable
-# from "nobody looked".
+# T-069 (2026-11-15) retuned the monthly limit; T-020 §4 had decided to leave
+# it alone at $30 when the measured rate was ~$21/month. Both numbers are stale:
+# the CI host (T-064), the app host's EIP (T-068) and the 8 GB data volume
+# (T-066) are gone. Measured in Cost Explorer (RECORD_TYPE=Usage): a steady
+# $0.287/day for each full day 2026-11-10..13, ~$0.28/day once the old detached
+# volume is deleted = ~$8.5/month. The $30 limit would now sit at ~28% of
+# expected spend and could not fire on anything short of a disaster.
 #
-# The board expected this file to need retuning: at the $37.30/month rate the
-# 2026-08-08 CI-host resize produced, the $30 monthly limit was structurally
-# exceeded (~124%), so its 100/120% thresholds would have fired every month
-# from September onward -- and an alarm that always fires stops being a signal,
-# which is the exact failure that made the deleted $5 console budget useless.
+# So the default is $17, twice the measured rate: still a DEVIATION alarm, and
+# it fires on precisely the behaviour worth being told about -- a resource left
+# running or created by mistake (the CI host, ~$17/month, was the case that
+# taught this). Hugging the rate any tighter would trade that signal for noise,
+# since the Route 53 zone fee posts once a month and usage wobbles a little.
+# The real value lives in the gitignored terraform.tfvars, which overrides the
+# variables.tf default.
 #
-# That premise expired before it was acted on. Measured 2026-08-19, with the CI
-# host now stopped between builds (T-019), the real rate is ~$0.68/day ≈
-# $21/month: September projects to ~68% of this limit, not 124%. August still
-# breaches once (~$34.68, 116%) on the strength of its first half, which is
-# history rather than a trend.
-#
-# So a $30 monthly limit against a ~$21/month rate is now a working DEVIATION
-# alarm, and it fires on precisely the one behaviour worth being told about:
-# a resource being left running (the CI host, deleted in T-064, was the
-# case that taught this: ~$17/month, credit exhaustion ~8 weeks sooner).
-# Retuning the limit down to hug the current
-# rate would trade that signal for noise.
-#
-# The credit_runway limit stays at $160 for the reason cv-infra#14 recorded and
-# T-010 verified: raising it to $200 pushes the 100% alert past the date the
-# account is paused, so the alarm would stay green until it could no longer
-# help. That reasoning is unaffected by the new numbers.
+# The credit_runway limit stays at $160 (cv-infra#14, T-010). T-069: at
+# ~$0.28/day the credits no longer run out before they expire on 2027-07-12,
+# so that budget is now informational only; retire it after that date.
 #
 # The crux (H1 DoR decision 1, non-negotiable): aws_budgets_budget's
 # cost_types block defaults include_credit = true, which makes the budget's
@@ -54,7 +46,7 @@
 # questions, both tracking gross usage (the crux applies to both):
 #   - aws_budgets_budget.gross_usage   (MONTHLY, below)  -- "did this
 #     month's burn exceed expectations?" Limit is expected monthly spend
-#     (var.budget_monthly_limit_amount, $30), with its own thresholds
+#     (var.budget_monthly_limit_amount, $17), with its own thresholds
 #     (var.budget_monthly_thresholds, 100/120/150) that fire on deviation,
 #     not on progress toward a ceiling.
 #   - aws_budgets_budget.credit_runway (ANNUALLY, further below) -- "are we
@@ -68,7 +60,7 @@
 # budget never fires); sharing thresholds was caught AT stage 4 against the
 # live account -- a console-created $5 budget with the shared 50/80/100 set
 # sat permanently in ALARM, because ordinary burn (~$28/month as measured
-# then; ~$21/month now) crosses both 50% and 80% of $5 every month. An alarm that always fires is one nobody
+# then; ~$21/month on 2026-08-19) crosses both 50% and 80% of $5 every month. An alarm that always fires is one nobody
 # reads, which is exactly the failure this file exists to prevent, from the
 # opposite direction.
 
@@ -155,8 +147,8 @@ resource "aws_budgets_budget" "gross_usage" {
   name        = "${var.project_name}-${var.environment}-gross-usage"
   budget_type = "COST"
   # Scope amendment: this is now an ANOMALY DETECTOR, not the credit-runway
-  # tracker -- its limit is var.budget_monthly_limit_amount ($30, expected
-  # monthly spend now that burn is back under $1/day post-RDS-teardown),
+  # tracker -- its limit is var.budget_monthly_limit_amount ($17, twice the
+  # ~$8.5/month measured 2026-11-15, T-069),
   # deliberately NOT var.budget_credit_grant_amount. See the file header
   # for why sharing a limit variable between this and credit_runway (below)
   # was a real bug.
@@ -178,8 +170,8 @@ resource "aws_budgets_budget" "gross_usage" {
 
   # Own thresholds (var.budget_monthly_thresholds via
   # local.gross_usage_notifications, NOT credit_runway's) -- 100/120/150 by
-  # default: at $30 expected spend, only exceeding it is news. Steady-state
-  # burn (~$21/month, measured 2026-08-19) produces zero notifications here.
+  # default: at $17 limit, only exceeding it is news. Steady-state
+  # burn (~$8.5/month, measured 2026-11-15) produces zero notifications here.
   dynamic "notification" {
     for_each = local.gross_usage_notifications
     content {
@@ -200,6 +192,9 @@ resource "aws_budgets_budget" "gross_usage" {
   depends_on = [aws_sns_topic_policy.budget_alerts]
 }
 
+# T-069: with ~$0.28/day the credits no longer run out before they expire on
+# 2027-07-12, so this budget is informational only; retire it after that date.
+# Thresholds untouched.
 # Scope amendment (H1, ratified 2026-08-09): the credit-runway tracker.
 # Answers a different question than gross_usage above -- not "did this
 # month's burn accelerate?" but "are we about to run out of credit?". Same
